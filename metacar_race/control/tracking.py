@@ -12,6 +12,7 @@ import math
 
 from metacar_race.config import (
     ACCEL_LIMIT_MS2,
+    UPSHIFT_SPEED_THRESHOLD,
     LOOKAHEAD_M,
     MAX_STEER_RAD,
     TRACK_SPEED_MS,
@@ -102,14 +103,21 @@ class SpeedController:
         self._throttle = 0.0
         self._brake = 0.0
         self._a_f = 0.0           # 滤波后的实测加速度
+        self._stuck_t = 0.0       # 卡在低挡位累计时间
+        self._kick_left = 0.0     # 升挡 kick 剩余时间
+        self._v_prev = 0.0
 
     def reset(self, v_now=0.0):
         self.v_cmd = float(v_now)
         self._throttle = 0.0
         self._brake = 0.0
         self._a_f = 0.0
+        self._stuck_t = 0.0
+        self._kick_left = 0.0
+        self._v_prev = float(v_now)
 
-    def update(self, v_now: float, dt: float, v_ceiling=None, a_now=0.0):
+    def update(self, v_now: float, dt: float, v_ceiling=None, a_now=0.0,
+               allow_kick=False):
         """返回 (throttle, brake)。v_ceiling 用于终点前限速。"""
         if dt is None or dt <= 0.0:
             dt = 1e-3
@@ -137,6 +145,28 @@ class SpeedController:
             # 全油门约 10 m/s²，这里限制到 0.40 把加速度压在 5 以内
             self._throttle = max(0.0, min(0.40, self._throttle))
             brake_cmd = 0.0
+
+        # 5.5) 升挡 kick：低挡位下油门再大也上不去（实测卡 17.2 km/h），
+        #      需要短暂顶满油门触发换挡，再回落到闭环。
+        if self._kick_left > 0.0:
+            self._kick_left -= dt
+            self._throttle = 1.0
+            self._brake = 0.0
+            self._stuck_t = 0.0
+            return self._throttle, self._brake
+
+        if (allow_kick and v_now < UPSHIFT_SPEED_THRESHOLD
+                and self.v_cmd > UPSHIFT_SPEED_THRESHOLD + 0.8):
+            if abs(v_now - self._v_prev) < 0.03:
+                self._stuck_t += dt
+            else:
+                self._stuck_t = 0.0
+            if self._stuck_t > 0.8:
+                self._kick_left = 0.8
+                self._stuck_t = 0.0
+        else:
+            self._stuck_t = 0.0
+        self._v_prev = v_now
 
         # 6) 刹车也要斜坡，避免点头
         self._brake += max(-0.10, min(0.10, brake_cmd - self._brake))

@@ -31,6 +31,8 @@ def main() -> int:
     parser.add_argument("--drive", action="store_true", help="直接给油（调试）")
     parser.add_argument("--throttle", type=float, default=0.35, help="油门 0~1")
     parser.add_argument("--seconds", type=float, default=60.0, help="运行时长上限")
+    parser.add_argument("--speed", type=float, default=None, help="循迹目标速度 m/s（默认取 config）")
+    parser.add_argument("--kick", action="store_true", help="强制允许顶满油门升挡（会牺牲加速度加分）")
     args = parser.parse_args()
 
     print("连接仿真场景（要先开场景，这里会一直等）...")
@@ -44,7 +46,7 @@ def main() -> int:
     print(f"VLA 场景: {'是' if static.vla_extension else '否'}")
 
     pursuit = PurePursuit(route) if args.track and len(route) >= 2 else None
-    speed = SpeedController()
+    speed = SpeedController() if args.speed is None else SpeedController(v_target=args.speed)
     speed.reset(0.0)
 
     start = time.time()
@@ -75,7 +77,13 @@ def main() -> int:
             left = distance_left(route, pose.pos_x, pose.pos_y, pursuit.idx)
             # 终点前按剩余距离收敛，避免冲过头
             v_ceiling = max(0.0, 0.55 * left)
-            throttle, brake = speed.update(v, dt, v_ceiling=v_ceiling, a_now=accel)
+            # 只有按当前速度赶不上时限时才允许升挡 kick，否则宁可慢一点保住加速度加分
+            remaining = max(1.0, status.time_limit - status.used_time)
+            eta = left / max(v, 1.0)
+            allow_kick = args.kick or (eta > 0.55 * remaining)
+            throttle, brake = speed.update(
+                v, dt, v_ceiling=v_ceiling, a_now=accel, allow_kick=allow_kick
+            )
             vc.gear = GearMode.DRIVE
             vc.throttle = throttle
             vc.brake = brake

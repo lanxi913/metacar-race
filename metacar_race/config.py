@@ -52,3 +52,5 @@ ACCEL_LIMIT_MS2 = 2.5     # 速度指令斜坡上限，留出余量保证 |a| < 
 MAX_STEER_RAD = 0.6       # 前轮最大转角（估），用于把转角归一化到 -1~1
 WHEELBASE_M = 2.6         # 轴距（估），纯跟踪用
 
+
+UPSHIFT_SPEED_THRESHOLD = 4.9   # 低于这个速度说明还在一挡（17.2 km/h 附近），需要 kick 升挡
