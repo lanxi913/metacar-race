@@ -33,6 +33,8 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=60.0, help="运行时长上限")
     parser.add_argument("--speed", type=float, default=None, help="循迹目标速度 m/s（默认取 config）")
     parser.add_argument("--kick", action="store_true", help="强制允许顶满油门升挡（会牺牲加速度加分）")
+    parser.add_argument("--slow-end", action="store_true", help="到终点前减速（元素题冲线即结束，默认不减速）")
+    parser.add_argument("--cruise", type=float, default=None, help="恒油门循迹模式（例如 0.5），不跑速度环")
     args = parser.parse_args()
 
     print("连接仿真场景（要先开场景，这里会一直等）...")
@@ -72,11 +74,17 @@ def main() -> int:
         vc = VehicleControl()
         left = 0.0
 
-        if pursuit is not None:
+        if pursuit is not None and args.cruise is not None:
+            # 恒油门循迹：最简控制，实测这种跑法拿到过 110 分
+            vc.gear = GearMode.DRIVE
+            vc.throttle = max(0.0, min(1.0, args.cruise))
+            vc.brake = 0.0
+            vc.steering = pursuit.steering(pose.pos_x, pose.pos_y, pose.ori_z)
+        elif pursuit is not None:
             steering = pursuit.steering(pose.pos_x, pose.pos_y, pose.ori_z)
             left = distance_left(route, pose.pos_x, pose.pos_y, pursuit.idx)
-            # 终点前按剩余距离收敛，避免冲过头
-            v_ceiling = max(0.0, 0.55 * left)
+            # 元素题冲过终点就结束，不需要减速；只有 --slow-end 才收敛
+            v_ceiling = max(0.0, 0.35 * left) if args.slow_end else None
             # 只有按当前速度赶不上时限时才允许升挡 kick，否则宁可慢一点保住加速度加分
             remaining = max(1.0, status.time_limit - status.used_time)
             eta = left / max(v, 1.0)
