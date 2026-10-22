@@ -1,0 +1,118 @@
+# AGENTS.md — 给 AI 助手的项目说明
+
+> 本文件面向 AI 编码助手（Codex / Claude Code / Cursor / Copilot 等）。
+> 人类队友看 [README.md](README.md) 和 `docs/`。
+> 你在这个仓库里做任何改动前，先读完本文件。
+
+---
+
+## 1. 项目是什么
+
+2026 智能无人系统算法挑战赛的参赛工程。用 Python 控制「元动力（MetaCar）」仿真平台里的车辆，
+完成三类赛题：城市道路、VLA（读牌 + 文本提交）、港口迷雾（四车协同）。
+
+- 比赛：2026-11-01，报名 2026-10-25 截止
+- 平台：<https://www.i-mylab.com/icv/>
+- 语言：**中文注释与文档**，代码标识符用英文
+- Python：**3.12.4**（必须 ≥3.10，SDK 硬要求）
+
+---
+
+## 2. 环境（已存在，不要重建）
+
+| 项 | 值 |
+|---|---|
+| 解释器 | `<repo>/.venv/Scripts/python.exe` |
+| 依赖 | `metacar==0.4.0`、`metacar-multiagent==0.1.0`（PyPI 上有，勿改版本） |
+| 场景包 | `D:\元动力场景`（用户目录下的 `car` 是指向它的 junction） |
+
+**运行任何脚本都必须用 `.venv/Scripts/python.exe`**，不要用系统 `python`，不要 `pip install` 到全局。
+
+```powershell
+# 安装依赖（只在 .venv 缺失时做）
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 自检
+.venv\Scripts\python.exe check_env.py
+```
+
+---
+
+## 3. 怎么跑（顺序是硬性的）
+
+`metacar.SceneAPI` 是**服务端**：脚本监听 `127.0.0.1:5061`（JSON）和 `5063`（视频），
+场景（Unity 进程）主动连上来。所以：
+
+```powershell
+# 1) 先在终端跑脚本，它会阻塞在 connect
+.venv\Scripts\python.exe -u main.py
+
+# 2) 再去客户端点「启动场景」
+# 3) 终端开始刷 [xx.xs] pos=... v=... 即成功
+```
+
+反了就永远「加载中」。多车场景用 `ScenarioTaskAPI(port=9100)`。
+
+---
+
+## 4. 代码约定
+
+- 入口 `main.py` 只由 A（工程）改；其他人改自己子包：
+  - `metacar_race/control/` → B（循迹、PID、泊车）
+  - `metacar_race/perception/` → C（OCR、编号识别、文本拆分）
+  - `metacar_race/multiagent/` → D（四车状态机）
+  - `docs/` → E
+- 所有可调参数放 `metacar_race/config.py`，不要散落魔法数字。
+- **禁止写死**场景坐标、验证码、`object_id`、泊位号：正式赛题是训练题的泛化版，
+  这些必须从 `get_scene_static_data()` / `get_observation()` / `get_task_state()` 读。
+- 每个控制循环都必须发控制指令（港口迷雾 1 秒心跳，超时安全停车）。
+- 退出前 `brake=1.0, gear=PARKING` 刹停。
+- 新增依赖要更新 `requirements.txt` 并在 PR 里说明理由。
+
+---
+
+## 5. 评分规则关键数字（写算法时会用到）
+
+| 场景 | 限速 | 时限 | 要点 |
+|---|---|---|---|
+| 场景元素 | 60 km/h | 100 s / 200 s | 到达终点即满分；`|a|≤5 m/s²` 每题 +10；压线 −10/−20；碰撞 −5×v |
+| 连续场景 | 60 km/h | 基准 180–810 s | 时间附加分 = `0.1×(基准−实际)`，权重很低，**别为抢时间压线** |
+| VLA | 30 km/h | 100 s/任务 | 文本 400 + 完成 600；违规检测是 F1；标点用英文、不换行 |
+| 港口迷雾 | 20 km/h | 600 s | 8 项成果 240+160+200+400；三条一票归零 |
+
+港口迷雾硬阈值：观测 30 m / 前方 120°；读码 7 m；扫描 10 m；路口申请 12 m；
+互斥区 6 m；泊位 3 m；观测凭证 30 s 有效。
+
+**实测结论：油门 0.5 时速度卡在 17.2 km/h（低挡位），给到 1.0 才会升挡继续加速。**
+
+---
+
+## 6. 提交与协作
+
+- 不直接改 `main`：建 `feat/*` 分支 → PR → 至少 1 人 review。
+- 提交信息：`feat|fix|docs|chore(scope): 说明`。
+- 不提交：`.venv/`、`__pycache__/`、场景包、`*.exe`、录屏（`.gitignore` 已挡）。
+- 改完必须本地验证：`check_env.py` 通过 + 你的脚本能跑通。
+
+---
+
+## 7. 排错（AI 优先看这张表）
+
+| 现象 | 原因 | 动作 |
+|---|---|---|
+| 一直「加载中」 | 先开场景后跑脚本 | 关场景 → 跑脚本 → 再开场景 |
+| `ModuleNotFoundError: metacar` | 用了系统 python | 换 `.venv\Scripts\python.exe` |
+| 端口 5061/5063 被占用 | 上次脚本没退干净 | 结束残留 `python.exe` |
+| 速度卡 17.2 km/h | 低挡位 | 油门给 1.0 等升挡 |
+| `granted=False` | 距离/角色/阶段不满足 | 读 `result.message`，对照阈值表 |
+| 场景中途退出 | 超时或触发归零 | 查该场景时限与三条红线 |
+
+---
+
+## 8. 你不该做的事
+
+- 不要重新发明环境（别装 conda 环境、别升级 SDK、别改 `requirements.txt` 版本）。
+- 不要在无场景运行时反复重试 `connect()`——它本来就会一直阻塞。
+- 不要提交二进制大文件。
+- 不要把训练用的固定坐标/验证码写进代码。

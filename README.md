@@ -1,0 +1,109 @@
+# metacar-race · 2026 智能无人系统算法挑战赛
+
+元动力仿真平台的自动驾驶 / VLA / 多车协同算法工程。五人小队共用一套代码、一套环境、一个进度看板。
+
+- 比赛时间：**2026-11-01**（报名 10-25 截止）
+- 平台：<https://www.i-mylab.com/icv/>
+- 本仓库：算法代码 + 环境文档 + 任务看板
+
+---
+
+## 1. 新队友 15 分钟上手
+
+```bat
+git clone https://github.com/lanxi913/metacar-race.git
+cd metacar-race
+
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+
+.venv\Scripts\python.exe check_env.py
+```
+
+check_env 三项全绿后，按「**先脚本、后场景**」跑一次：
+
+```bat
+:: 终端 A：先跑脚本，它会卡在 connect 等待
+.venv\Scripts\python.exe -u main.py
+
+:: 然后在客户端点「启动场景」，终端开始刷状态即成功
+```
+
+更细的步骤（含客户端安装、场景下载、目录搬到 D 盘、端口说明、报错对照表）见
+[docs/01-environment.md](docs/01-environment.md)。
+
+---
+
+## 2. 目录结构
+
+```
+metacar-race/
+├─ main.py                 单车入口（连接 → 读状态 → 发控制）
+├─ check_env.py            环境自检
+├─ requirements.txt        metacar==0.4.0 / metacar-multiagent==0.1.0
+├─ metacar_race/           可复用模块（每人认领一个子包，减少冲突）
+│  ├─ config.py            全局常量（限速、端口、超时）
+│  ├─ control/             规划控制：纯跟踪、PID、泊车
+│  ├─ perception/          感知与 VLA：OCR、编号识别、文本生成
+│  └─ multiagent/          港口迷雾：四车状态机
+├─ docs/                   环境、规则、协作、路线图
+└─ tools/                  一键脚本
+```
+
+**分工原则**：谁负责哪块，就只改自己那个子包；`main.py` 只有一个人动。
+
+---
+
+## 3. 五人分工
+
+| 角色 | 负责 | 主要产出 |
+|---|---|---|
+| A 工程/平台 | 环境、入口脚本、日志、打包、录制 | `main.py`、`check_env.py`、可复现环境 |
+| B 规划控制 | 循迹、速度环、泊车 | `metacar_race/control/` |
+| C 感知/VLA | OCR、编号识别、三要素文本 | `metacar_race/perception/` |
+| D 多车协同 | 港口迷雾状态机、路口与泊位 | `metacar_race/multiagent/` |
+| E 测试/记录 | 成绩归档、复盘、规则核对、文档 | 成绩表、`docs/` |
+
+> 三人队：把 A 和 E 合并，C 并入 B。
+
+---
+
+## 4. 进度看板
+
+- 任务全部记在 **Issues**，按 Label 过滤：`P0` `P1` `P2`、`env` `control` `vla` `multiagent` `docs`
+- 每人每天只认领 1 个 `P0`/`P1`，做完关掉再领
+- 每日站会三问：今天拿了几分？明天攻哪个？现在卡在哪？
+
+---
+
+## 5. 关键约定
+
+1. **不直接推 main**：开 `feat/xxx` 分支 → PR → 至少一人 review → 合并。
+   详见 [docs/03-workflow.md](docs/03-workflow.md)。
+2. **不提交场景包、不提交 `.venv`**：已在 `.gitignore` 里。
+3. **坐标、验证码、object_id 一律不许写死**：正式赛题是训练题的泛化版。
+4. **提交前跑 `check_env.py` 和你自己的脚本**，能跑通再提 PR。
+
+---
+
+## 6. 常见坑（先看这里）
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| 场景一直「加载中」 | 顺序反了 | 先跑脚本（卡在 connect），再点启动 |
+| 黑屏 1–2 秒退出 | 显卡不够 | 换独显机器 |
+| `ModuleNotFoundError: metacar` | 解释器不对 | 用 `.venv\Scripts\python.exe`，别用系统 python |
+| 速度卡在 **17.2 km/h** | 卡在低挡位 | 油门给到 1.0 顶到升挡；详见 docs/01 |
+| 脚本跑了场景没反应 | 程序已异常退出 | 先看终端最后 20 行 |
+
+---
+
+## 7. 相关资料
+
+- [环境搭建（可复现）](docs/01-environment.md)
+- [赛题规则速查](docs/02-rules.md)
+- [协作流程](docs/03-workflow.md)
+- [10 天路线图](docs/04-roadmap.md)
+- 参赛作战手册：`docs/2026智能无人系统算法挑战赛-参赛作战手册.docx`

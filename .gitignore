@@ -1,0 +1,30 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 工具
+.vscode/
+.idea/
+.DS_Store
+
+# 运行产物
+logs/
+out/
+recordings/
+*.mp4
+*.avi
+*.zip
+
+# 客户端 / 场景包（体积大，绝不入库）
+scenes/
+*.exe
+
+# 本地配置
+.env
+*.local
