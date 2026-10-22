@@ -72,8 +72,19 @@ metacar-race/
 
 ## 4. 进度看板
 
-- 任务全部记在 **Issues**，按 Label 过滤：`P0` `P1` `P2`、`env` `control` `vla` `multiagent` `docs`
+任务全在 Issues，用 Label 过滤：
+
+| 看板 | 链接 |
+|---|---|
+| 全部任务 | <https://github.com/lanxi913/metacar-race/issues> |
+| P0 今天必做 | <https://github.com/lanxi913/metacar-race/issues?q=is%3Aissue+is%3Aopen+label%3AP0> |
+| 我的任务 | <https://github.com/lanxi913/metacar-race/issues/assigned/lanxi913> |
+| 环境类 | <https://github.com/lanxi913/metacar-race/issues?q=is%3Aissue+is%3Aopen+label%3Aenv> |
+
+规则：
+
 - 每人每天只认领 1 个 `P0`/`P1`，做完关掉再领
+- 认领 = 把 Issue assign 给自己，避免撞车
 - 每日站会三问：今天拿了几分？明天攻哪个？现在卡在哪？
 
 ---
