@@ -45,3 +45,10 @@ TARGET_SPEED_MS = 8.0
 LOOKAHEAD_M = 6.0
 STEER_GAIN = 1.8
 THROTTLE_GAIN = 0.12
+
+# ---- 循迹（feat/control-tracking 标定中）----
+TRACK_SPEED_MS = 10.0     # 直行目标速度，限速 60 km/h 下留足余量
+ACCEL_LIMIT_MS2 = 2.5     # 速度指令斜坡上限，留出余量保证 |a| < 5
+MAX_STEER_RAD = 0.6       # 前轮最大转角（估），用于把转角归一化到 -1~1
+WHEELBASE_M = 2.6         # 轴距（估），纯跟踪用
+
