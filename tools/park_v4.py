@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
 PARKING_SLOT_TYPE = 30
-ARC_RADIUS = 4.2          # 满舵实测半径
+ARC_RADIUS = 5.26         # 倒车满舵实测半径（probe_reverse）
 STAGE_SPEED = 0.28
 REVERSE_SPEED = 0.13
 TARGET_TOL = 0.30
