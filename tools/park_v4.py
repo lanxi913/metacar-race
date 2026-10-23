@@ -62,6 +62,7 @@ def main() -> int:
     t0 = time.time()
     hold_t = 0.0
     last = 0.0
+    prev_d = 99.0
 
     for msg, _f in api.main_loop():
         pose = msg.pose_gnss
@@ -73,7 +74,8 @@ def main() -> int:
             if slot is None:
                 api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
                 continue
-            stage = (pose.pos_x, slot.pos_y + ARC_RADIUS)
+            # 倒车左转会往 +y 方向退，所以起点要放在车位「下方」R 处
+            stage = (pose.pos_x, slot.pos_y - ARC_RADIUS)
             print(f"车位({slot.pos_x:.2f},{slot.pos_y:.2f})  R={ARC_RADIUS}  "
                   f"圆弧起点({stage[0]:.2f},{stage[1]:.2f})")
 
@@ -108,7 +110,8 @@ def main() -> int:
             api.set_vehicle_control(vc)
 
         elif phase == "straight":
-            if d_center < TARGET_TOL:
+            # 越接近车位越慢，避免冲过中心
+            if d_center < TARGET_TOL or (prev_d < 0.9 and d_center > prev_d + 0.10):
                 phase = "hold"
                 hold_t = now
                 print(f"入库：中心 {d_center:.2f} m 航向 {dyaw:.1f}°")
@@ -117,9 +120,12 @@ def main() -> int:
                 # 直退的同时用陀螺仪修正朝向
                 err = wrap(heading_rad(slot.ori_z) - heading_rad(pose.ori_z))
                 steer = max(-0.4, min(0.4, 1.2 * err))
-                vc = VehicleControl(gear=GearMode.REVERSE, throttle=REVERSE_SPEED, steering=steer)
-                if abs(v) > 0.8:
-                    vc.throttle, vc.brake = 0.0, 0.35
+                thr = min(REVERSE_SPEED, 0.02 + 0.035 * d_center)
+                vc = VehicleControl(gear=GearMode.REVERSE, throttle=thr, steering=steer)
+                if d_center < 1.0:
+                    vc.brake = 0.25
+                if abs(v) > 0.6:
+                    vc.throttle, vc.brake = 0.0, 0.5
                 api.set_vehicle_control(vc)
 
         else:
@@ -137,6 +143,8 @@ def main() -> int:
         if now - t0 > 90:
             print("超时")
             break
+
+        prev_d = d_center
 
     try:
         api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
