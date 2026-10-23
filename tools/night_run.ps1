@@ -1,4 +1,4 @@
-﻿# 通宵自动跑分：逐场景跑 -> 读分 -> 记录 -> 定时降温 -> 清理窗口
+# 通宵自动跑分：逐场景跑 -> 读分 -> 记录 -> 定时降温 -> 清理窗口
 param(
     [int]$RunTimeoutSec = 240,
     [double]$CooldownMinutes = 90,
@@ -26,7 +26,7 @@ $Scenes = @(
     @{ Title = "匝道行驶";        Slug = "zadaoxingshi";      Arg = @("tools\track_bonus.py", "--offset", "0.8") },
     @{ Title = "限速行驶";        Slug = "xiansuxingshi";     Arg = @("tools\track_bonus.py", "--offset", "0.8") },
     @{ Title = "车辆变道";        Slug = "cheliangbiandao";   Arg = @("tools\track_bonus.py", "--offset", "0.8") },
-    @{ Title = "环岛驶入、驶出";  Slug = "huandaoshirushichu"; Arg = @("tools\track_bonus.py", "--offset", "1.0") },
+    @{ Title = "环岛驶入、驶出";  Slug = "huandaoshirushichu"; Arg = @("tools\track_bonus.py", "--offset", "1.0") }
 )
 
 function Close-Windows {
