@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 <#
 .SYNOPSIS
-    Start a python control script, then click the "start scene" button of a specific
-    scenario row in the client UI, then wait for the python process to exit.
+    Launch a python script, then click the "start scene" button of one specific
+    scenario card in the meta-power client, then wait for the python process.
 
 .DESCRIPTION
-    ASCII-only on purpose: Windows PowerShell 5.1 parses .ps1 as ANSI without a BOM,
-    so literal CJK here would be mangled. UI strings are built from code points.
+    ASCII-only on purpose: Windows PowerShell 5.1 parses .ps1 as ANSI when there is
+    no BOM, and the editor writes UTF-8 without BOM. Literal CJK here gets mangled
+    and can even swallow the next line of code, so all UI strings are built from
+    code points.
 
-    -SceneCp receives the scenario name as comma separated hex code points,
-    e.g. 平行车道泊车 = 5E73,884C,8F66,9053,6CCA,8F66
-
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\auto_scene.ps1 -Script probe.py -SceneCp "5E73,884C,8F66,9053,6CCA,8F66"
+    -SceneCp takes the scenario name as comma separated hex code points:
+        平行车道泊车 = 5E73,884C,8F66,9053,6CCA,8F66
+        限速行驶     = 9650,901F,884C,9A76
+        直角转弯     = 76F4,89D2,8F6C,5F2F
+        车辆直行     = 8F66,8F86,76F4,884C
 #>
 param(
     [string]$PythonArgs = "",
@@ -55,7 +57,7 @@ if ($SceneCp) {
 function Stop-Leftovers {
     Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*straight_full*" -or $_.CommandLine -like "*main.py*" -or $_.CommandLine -like "*probe*" -or $_.CommandLine -like "*parking*" } |
+        Where-Object { $_.CommandLine -match 'main\.py|probe' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
 }
@@ -99,15 +101,16 @@ $win = Get-ClientWindow
 Start-Sleep -Milliseconds 800
 Write-Host "client: $($win.Current.Name)"
 
-$all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-
 if (-not $SkipAuto) {
-    $auto = $all | Where-Object { $_.Current.Name -eq $U_AUTO } | Select-Object -First 1
+    $all0 = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    $auto = $all0 | Where-Object { $_.Current.Name -eq $U_AUTO } | Select-Object -First 1
     Invoke-El $auto | Out-Null
     Start-Sleep -Milliseconds 1500
 }
 
-# 页面是 virtual list，切页后元素会重建，这里重试等它稳定
+# Walk pages until the scenario card is found. Card layout: the start button sits
+# to the lower-right of the title (measured dx ~ +175, dy ~ +258), so candidates
+# are filtered by that offset before picking the closest one.
 $target = $null
 for ($page = 0; $page -le 4 -and -not $target; $page++) {
     for ($try = 1; $try -le 6; $try++) {
@@ -116,31 +119,35 @@ for ($page = 0; $page -le 4 -and -not $target; $page++) {
 
         if (-not $sceneName) {
             if ($btns.Count -gt 0) { $target = $btns[0]; break }
-        } else {
+        }
+        else {
             $label = $all | Where-Object { $_.Current.Name -eq $sceneName } | Select-Object -First 1
             if ($label) {
-            # 卡片里标题在上、按钮在下，不能按行高匹配；取欧氏距离最近的启动按钮
-            $lx = $label.Current.BoundingRectangle.X
-            $ly = $label.Current.BoundingRectangle.Y
-            $best = $null; $bestD = 1e9
-            foreach ($b in $btns) {
-                $bx = $b.Current.BoundingRectangle.X
-                $by = $b.Current.BoundingRectangle.Y
-                $d = [Math]::Sqrt([Math]::Pow($bx - $lx, 2) + [Math]::Pow($by - $ly, 2))
-                if ($d -lt $bestD) { $bestD = $d; $best = $b }
-            }
-            if ($best -and $bestD -lt 400) {
-                $target = $best
-                Write-Host ("found row: label({0},{1}) -> button({2},{3}) d={4:N0} on try {5}" -f `
-                    [int]$lx, [int]$ly, [int]$best.Current.BoundingRectangle.X, [int]$best.Current.BoundingRectangle.Y, $bestD, $try)
-                break
+                $lx = $label.Current.BoundingRectangle.X
+                $ly = $label.Current.BoundingRectangle.Y
+                $best = $null
+                $bestD = 1e9
+                foreach ($b in $btns) {
+                    $dx = $b.Current.BoundingRectangle.X - $lx
+                    $dy = $b.Current.BoundingRectangle.Y - $ly
+                    if ($dx -lt 20) { continue }
+                    if ($dx -gt 320) { continue }
+                    if ($dy -lt 80) { continue }
+                    if ($dy -gt 420) { continue }
+                    $d = [Math]::Sqrt($dx * $dx + $dy * $dy)
+                    if ($d -lt $bestD) { $bestD = $d; $best = $b }
+                }
+                if ($best) {
+                    $target = $best
+                    Write-Host ("found card: label({0},{1}) -> button({2},{3}) d={4:N0}" -f `
+                        [int]$lx, [int]$ly, [int]$best.Current.BoundingRectangle.X, [int]$best.Current.BoundingRectangle.Y, $bestD)
+                    break
+                }
             }
         }
-    }
-    Start-Sleep -Milliseconds 700
+        Start-Sleep -Milliseconds 700
     }
 
-    # not on this page -> go to next page and retry
     if (-not $target -and $sceneName) {
         $next = $all | Where-Object {
             $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq 'Next page'
@@ -149,16 +156,18 @@ for ($page = 0; $page -le 4 -and -not $target; $page++) {
             Write-Host "page $page : not found, going next"
             Invoke-El $next | Out-Null
             Start-Sleep -Milliseconds 1200
-        } else {
+        }
+        else {
             Write-Host "page $page : not found, no next page"
             break
         }
     }
 }
 
-if (-not $target -and $sceneName) {
-    $names = @($all | ForEach-Object { $_.Current.Name } | Where-Object { $_ })
-    Write-Host "!! scene label not found: $sceneName (page has $($names.Count) named elements)"
+if (-not $target) {
+    Write-Host "!! target scene not found; nothing launched"
+    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    exit 2
 }
 
 $ok = Invoke-El $target
