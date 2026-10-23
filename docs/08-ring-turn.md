@@ -1,8 +1,11 @@
 # 环形转弯
 
-更新时间：2026-10-23  
-场景：`环形转弯`  
-正式入口：`tools/ring_turn_run.py`  
+更新时间：2026-10-23
+
+场景：`环形转弯`
+
+正式入口：`tools/ring_turn_run.py`
+
 控制模块：`metacar_race/control/ring_turn.py`
 
 ## 1. 结果
