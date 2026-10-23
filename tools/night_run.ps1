@@ -31,7 +31,10 @@ $Scenes = @(
 function Close-Windows {
     Get-Process -Name msedge -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 2
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*track_*" -or $_.CommandLine -like "*stop_run*" -or $_.CommandLine -like "*main.py*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 3
 }
 
 function Go-PageOne {
