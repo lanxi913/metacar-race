@@ -49,6 +49,29 @@ def folder_size(p: pathlib.Path) -> int:
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
 
+def flatten(scene_dir: pathlib.Path) -> bool:
+    """有些 zip 会多包一层同名目录（stop/stop/SmartCar.exe），压平它。"""
+    import shutil
+
+    entries = list(scene_dir.iterdir())
+    if any(p.is_file() and p.name.lower() == "smartcar.exe" for p in entries):
+        return False
+    dirs = [p for p in entries if p.is_dir()]
+    files = [p for p in entries if p.is_file()]
+    if len(dirs) != 1 or files:
+        return False
+    inner = dirs[0]
+    if not any(p.name.lower() == "smartcar.exe" for p in inner.iterdir()):
+        return False
+    tmp = scene_dir.parent / (scene_dir.name + "__tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    inner.rename(tmp)
+    scene_dir.rmdir()
+    tmp.rename(scene_dir)
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=None, help="只下名字里包含该关键字的场景")
@@ -104,6 +127,7 @@ def main() -> int:
             dest.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(tmp) as zf:
                 zf.extractall(dest)
+            flatten(dest)
             print(f"       解压完成 {folder_size(dest) / 1e6:.0f} MB")
         except Exception as exc:  # noqa: BLE001
             print(f"[err ] {slug} 解压失败: {exc}")
