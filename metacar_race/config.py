@@ -54,3 +54,10 @@ WHEELBASE_M = 2.6         # 轴距（估），纯跟踪用
 
 
 UPSHIFT_SPEED_THRESHOLD = 4.9   # 低于这个速度说明还在一挡（17.2 km/h 附近），需要 kick 升挡
+
+# ---- 泊车（垂直车道泊车标定中）----
+PARK_APPROACH_SPEED_MS = 0.35   # 接近对位点的油门开度（低速）
+PARK_REVERSE_SPEED_MS = 0.30    # 倒车油门开度
+PARK_STAGING_BACK_M = 6.0       # 对位点距车位中心的前向距离
+PARK_TARGET_TOL_M = 0.30        # 入库判定：中心误差
+PARK_HEADING_TOL_DEG = 5.0      # 入库判定：航向误差
