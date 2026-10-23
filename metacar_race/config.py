@@ -70,3 +70,24 @@ STOP_STEER_LOCK_DISTANCE_M = 2.5 # 终点附近回正，避免越过目标后继
 # ---- 直角转弯标定（feat/control-calibration）----
 TURN_THROTTLE_COMMAND = 0.01     # 与停车题相同，稳态约 4.78 m/s
 TURN_LOOKAHEAD_M = 3.0           # 匹配题目的 3 m 曲率，避免大前视切弯
+
+# ---- 垂直车道泊车标定（feat/templates-zyyxnjydhcg，2026-10-23 实测 210 分）----
+# 场景：车位 (-7.80,-0.12)、朝向 0、5.5 x 2.5，车道到车位横向 5.64 m
+PARKING_SLOT_TYPE = 30           # 障碍物里车位对象的 type 值
+PARKING_STAGING_EXTRA_M = 1.0    # staging 比横向距离再多走 1 m，给圆弧留余量
+PARKING_APPROACH_ACCEL = 0.8     # 前进段规划减速度（m/s²），远低于 5 的加分门槛
+PARKING_APPROACH_MAX_MS = 4.8    # 前进巡航速度上限
+PARKING_STOP_GAP_M = 0.15        # 距 staging 这么近就切刹停
+PARKING_BRAKE_CMD = 0.10         # 唯一使用的刹车值（≈2.7 m/s²；0.15 会到 15 m/s²）
+PARKING_ARC_STEER = 0.70         # 倒车圆弧舵角：tanδ=L/R=2.6/5.64 → 0.72
+PARKING_ARC_STEER_RAMP_S = 0.8   # 舵角从 0 斜坡到满舵的时间，避免满舵起步卡死
+PARKING_YAW_TOL_DEG = 3.0        # 车身与车位平行判定
+PARKING_REVERSE_MAX_MS = 0.9     # 倒车限速
+PARKING_BACK_ACCEL = 0.4         # 直线倒车段规划减速度
+PARKING_BACK_STOP_GAP_M = 0.08   # 距车位中心 0.08 m 切收尾
+PARKING_THROTTLE_MAX = 0.010     # 油门指令最小有效值
+PARKING_THROTTLE_START_MS = 0.35 # 低于这个速度先给连续油门破静摩擦
+PARKING_PWM_PERIOD = 4           # 占空比周期（帧），30 Hz 下 4 帧 = 0.133 s
+PARKING_PWM_LAUNCH_DUTY = 0.5    # 前进占空比上限：连续 0.01 会在挂挡瞬间窜到 7 m/s²
+PARKING_SETTLE_SPEED_MS = 0.06   # 滑行到这个速度以下再刹，避免一帧打停的 6 m/s²
+PARKING_SETTLE_HOLD_S = 5.0      # 停稳保持时间（题目要求）
