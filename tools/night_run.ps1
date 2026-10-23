@@ -22,7 +22,7 @@ $Scenes = @(
     @{ Title = "直角转弯";        Slug = "rightangleturn";    Arg = @("tools\track_bonus.py") },
     @{ Title = "u型弯";           Slug = "uxingwan";          Arg = @("tools\track_bonus.py", "--offset", "0.8") },
     @{ Title = "连续转弯";        Slug = "lianxuzhuanwan";    Arg = @("tools\track_bonus.py", "--offset", "1.3", "--cruise", "3.4", "--nobrake") },
-    @{ Title = "环形转弯";        Slug = "huanxingzhuanwan";  Arg = @("tools\track_bonus.py") },
+    @{ Title = "环形转弯";        Slug = "huanxingzhuanwan";  Arg = @("tools\track_soft.py", "--vmax", "4.6") },
     @{ Title = "匝道行驶";        Slug = "zadaoxingshi";      Arg = @("tools\track_bonus.py") },
     @{ Title = "限速行驶";        Slug = "xiansuxingshi";     Arg = @("tools\track_bonus.py") },
     @{ Title = "车辆变道";        Slug = "cheliangbiandao";   Arg = @("tools\track_bonus.py") },
