@@ -47,7 +47,8 @@ def speed_cmd(v, vt, thr_max=0.62, brk_max=0.30):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cruise", type=float, default=5.8)
+    ap.add_argument("--cruise", type=float, default=4.0)
+    ap.add_argument("--thr", type=float, default=0.45)
     args = ap.parse_args()
 
     print("等待场景连接...")
@@ -147,13 +148,13 @@ def main() -> int:
 
         vt = args.cruise
         if max_turn > math.radians(55):
-            vt = min(vt, 2.4)
+            vt = min(vt, 1.8)
         elif max_turn > math.radians(35):
-            vt = min(vt, 3.2)
+            vt = min(vt, 2.4)
         elif max_turn > math.radians(20):
-            vt = min(vt, 4.2)
+            vt = min(vt, 3.2)
         elif max_turn > math.radians(8):
-            vt = min(vt, 5.2)
+            vt = min(vt, 4.0)
         # 当前打角大时也压速
         if abs(steer) > 0.6:
             vt = min(vt, 2.2)
@@ -174,7 +175,7 @@ def main() -> int:
             vt = vt_prev - max_step
         vt_prev = vt
 
-        thr, brk = speed_cmd(v, vt)
+        thr, brk = speed_cmd(v, vt, thr_max=args.thr)
         send(VehicleControl(gear=GearMode.DRIVE, throttle=thr, brake=brk, steering=steer))
 
         if now - last > 0.5:
