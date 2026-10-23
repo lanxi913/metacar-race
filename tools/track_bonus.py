@@ -25,6 +25,7 @@ from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
 LOOKAHEAD = 5.0
 XTRACK_K = 0.0        # 横向误差增益
+XTRACK_OFFSET = 0.0   # 参考路径横向偏置（米），正=向左
 SLOW_LOOKAHEAD = 12.0
 MAX_SECONDS = 200
 
@@ -53,6 +54,7 @@ def speed_cmd(v, vt, thr_max=0.45, brk_max=0.30):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cruise", type=float, default=4.0)
+    ap.add_argument("--offset", type=float, default=0.0)
     args = ap.parse_args()
 
     print("等待场景连接...")
@@ -102,6 +104,15 @@ def main() -> int:
             if math.hypot(route[j][0] - pose.pos_x, route[j][1] - pose.pos_y) >= LOOKAHEAD:
                 tx, ty = route[j]
                 break
+
+        # 参考路径横向偏置：沿当前路段法向平移目标点
+        if abs(args.offset) > 1e-6 and idx + 1 < len(route):
+            sx0, sy0 = route[idx]
+            sx1, sy1 = route[idx + 1]
+            seg_len = max(math.hypot(sx1 - sx0, sy1 - sy0), 1e-6)
+            nx, ny = -(sy1 - sy0) / seg_len, (sx1 - sx0) / seg_len
+            tx += nx * args.offset
+            ty += ny * args.offset
 
         dx, dy = tx - pose.pos_x, ty - pose.pos_y
         d = max(math.hypot(dx, dy), 1e-3)
