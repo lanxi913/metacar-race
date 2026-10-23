@@ -61,3 +61,11 @@ PARK_REVERSE_SPEED_MS = 0.30    # 倒车油门开度
 PARK_STAGING_BACK_M = 6.0       # 对位点距车位中心的前向距离
 PARK_TARGET_TOL_M = 0.30        # 入库判定：中心误差
 PARK_HEADING_TOL_DEG = 5.0      # 入库判定：航向误差
+
+# ---- 车道级循迹 + 换道避让（feat/scenes-page2-zyy，左侧车道超车实测 110）----
+LANE_CRUISE_MS = 4.2       # 巡航目标速度
+LANE_ACCEL_MAX = 1.2       # 规划加速度上限（m/s²）
+LANE_HOLD_SECONDS = 5.0    # 终点停稳保持
+LANE_LAUNCH_HOLD_S = 1.5   # 起步前先驻车的时间，压掉挂挡首帧跳变
+LANE_STEER_LIMIT = 0.8     # 转向限幅，满舵低速会卡死
+LANE_WHEELBASE = 2.6       # 轴距（车辆属性）
