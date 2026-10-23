@@ -26,6 +26,10 @@ ARC_RADIUS = 5.26         # 倒车满舵实测半径（probe_reverse）
 STAGE_SPEED = 0.28
 REVERSE_SPEED = 0.13
 TARGET_TOL = 0.30
+PARK_DEPTH_TOL = 0.15      # 车心与车位中心的 x 偏差（入得够深）
+PARK_LATERAL_TOL = 0.25    # y 偏差（横向不偏）
+PARK_HEADING_TOL = 6.0     # 航向误差
+ARC_END_Y_FIX = 0.75       # 圆弧结束时的 y 欠量补偿（实测）
 HEADING_TOL_DEG = 8.0
 HOLD_SECONDS = 3.0
 
@@ -75,7 +79,7 @@ def main() -> int:
                 api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
                 continue
             # 倒车左转会往 +y 方向退，所以起点要放在车位「下方」R 处
-            stage = (pose.pos_x, slot.pos_y - ARC_RADIUS)
+            stage = (pose.pos_x, slot.pos_y - ARC_RADIUS + ARC_END_Y_FIX)
             print(f"车位({slot.pos_x:.2f},{slot.pos_y:.2f})  R={ARC_RADIUS}  "
                   f"圆弧起点({stage[0]:.2f},{stage[1]:.2f})")
 
@@ -110,11 +114,14 @@ def main() -> int:
             api.set_vehicle_control(vc)
 
         elif phase == "straight":
-            # 越接近车位越慢，避免冲过中心
-            if d_center < TARGET_TOL or (prev_d < 0.9 and d_center > prev_d + 0.10):
+            # 分轴判据：深度（x）要进得够深，横向（y）不能偏，航向要正
+            dx = pose.pos_x - slot.pos_x
+            dy = pose.pos_y - slot.pos_y
+            deep_enough = abs(dx) < PARK_DEPTH_TOL and abs(dy) < PARK_LATERAL_TOL
+            if (abs(dx) < 0.20) or (dx < -0.35) or (prev_d < 0.9 and d_center > prev_d + 0.10):
                 phase = "hold"
                 hold_t = now
-                print(f"入库：中心 {d_center:.2f} m 航向 {dyaw:.1f}°")
+                print(f"入库：dx={dx:+.2f} dy={dy:+.2f} 航向 {dyaw:.1f}°")
                 api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
             else:
                 # 直退的同时用陀螺仪修正朝向
@@ -122,10 +129,11 @@ def main() -> int:
                 steer = max(-0.4, min(0.4, 1.2 * err))
                 thr = min(REVERSE_SPEED, 0.02 + 0.035 * d_center)
                 vc = VehicleControl(gear=GearMode.REVERSE, throttle=thr, steering=steer)
-                if d_center < 1.0:
-                    vc.brake = 0.25
-                if abs(v) > 0.6:
-                    vc.throttle, vc.brake = 0.0, 0.5
+                # 不要在远处就龟速爬行，否则平台会提前判定驻车、车停得太浅
+                if abs(dx) < 0.30:
+                    vc.brake = 0.45
+                if abs(v) > 0.85:
+                    vc.throttle, vc.brake = 0.0, 0.4
                 api.set_vehicle_control(vc)
 
         else:
