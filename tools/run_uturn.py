@@ -20,11 +20,19 @@ import sys
 import time
 from pathlib import Path
 
-from metacar import GearMode, SceneAPI, VehicleControl
+from metacar import GearMode, SceneAPI, VehicleControl, Vector3
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from metacar_race.config import UTURN_LOOKAHEAD_M, UTURN_THROTTLE_COMMAND
+from metacar_race.config import (
+    UTURN_BOTTOM_BAND_M,
+    UTURN_CURVE_SPEED_MS,
+    UTURN_INNER_OFFSET_M,
+    UTURN_LOOKAHEAD_M,
+    UTURN_STRAIGHT_SPEED_MS,
+    UTURN_THROTTLE_COMMAND,
+    UTURN_THROTTLE_RAMP_SECONDS,
+)
 from metacar_race.control.tracking import PurePursuit
 
 
@@ -34,10 +42,53 @@ def _endpoint_distance(endpoint, x: float, y: float) -> float | None:
     return math.hypot(float(endpoint.x) - x, float(endpoint.y) - y)
 
 
+def _route_bounds(route):
+    xs = [float(p.x) for p in route]
+    ys = [float(p.y) for p in route]
+    return min(xs), max(xs), min(ys), max(ys)
+
+
+def _bottom_inner_direction(route):
+    """估算 U 型弯底部向内侧的方向。
+
+    当前训练场景是起终点在上方、弯底在下方；正式不写死坐标，而是用 route
+    首尾中点和 route 包围盒中心判断：从包围盒外侧极值指向首尾中点的一侧就是内侧。
+    """
+    _, _, min_y, max_y = _route_bounds(route)
+    endpoint_mid_y = (float(route[0].y) + float(route[-1].y)) * 0.5
+    center_y = (min_y + max_y) * 0.5
+    return 1.0 if endpoint_mid_y >= center_y else -1.0
+
+
+def _apply_bottom_inner_offset(points, bottom_y, inner_dir, offset, band):
+    if offset == 0.0 or band <= 0.0:
+        return points
+
+    shifted = []
+    for p in points:
+        y = float(p.y)
+        # 离弯底越近，内收越多；离开弯底 band 米后不偏移。
+        depth = abs(y - bottom_y)
+        weight = max(0.0, min(1.0, 1.0 - depth / band))
+        shifted.append(
+            Vector3(
+                float(p.x),
+                y + inner_dir * offset * weight,
+                float(p.z),
+            )
+        )
+    return shifted
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="U 型弯低速实时轨迹循迹")
     parser.add_argument("--throttle", type=float, default=UTURN_THROTTLE_COMMAND)
     parser.add_argument("--lookahead", type=float, default=UTURN_LOOKAHEAD_M)
+    parser.add_argument("--ramp-seconds", type=float, default=UTURN_THROTTLE_RAMP_SECONDS)
+    parser.add_argument("--straight-speed", type=float, default=UTURN_STRAIGHT_SPEED_MS)
+    parser.add_argument("--curve-speed", type=float, default=UTURN_CURVE_SPEED_MS)
+    parser.add_argument("--inner-offset", type=float, default=UTURN_INNER_OFFSET_M)
+    parser.add_argument("--bottom-band", type=float, default=UTURN_BOTTOM_BAND_M)
     parser.add_argument("--max-seconds", type=float, default=100.0)
     args = parser.parse_args()
     args.throttle = max(0.0, min(1.0, args.throttle))
@@ -54,12 +105,25 @@ def main() -> int:
     if len(static_route) < 2:
         print("static route 点不足，无法循迹。", flush=True)
         return 1
-    static_pursuit = PurePursuit(static_route, lookahead=args.lookahead)
+    _, _, route_min_y, route_max_y = _route_bounds(static_route)
+    inner_dir = _bottom_inner_direction(static_route)
+    bottom_y = route_min_y if inner_dir > 0.0 else route_max_y
+    offset_static_route = _apply_bottom_inner_offset(
+        static_route,
+        bottom_y,
+        inner_dir,
+        args.inner_offset,
+        args.bottom_band,
+    )
+    static_pursuit = PurePursuit(offset_static_route, lookahead=args.lookahead)
     endpoint = static.sub_scenes[-1].end_point if static.sub_scenes else None
     print(
         f"子场景: {[s.name for s in static.sub_scenes]}  "
         f"static_route={len(static_route)}  lookahead={args.lookahead:.2f}  "
-        f"throttle={args.throttle:.3f}  终点={endpoint}",
+        f"throttle={args.throttle:.3f}  ramp={args.ramp_seconds:.1f}s  "
+        f"v_straight={args.straight_speed:.1f}  v_curve={args.curve_speed:.1f}  "
+        f"inner_offset={args.inner_offset:.1f}  "
+        f"终点={endpoint}",
         flush=True,
     )
 
@@ -116,6 +180,13 @@ def main() -> int:
 
             trajectory = list(getattr(msg, "trajectory", []) or [])
             if len(trajectory) >= 2:
+                trajectory = _apply_bottom_inner_offset(
+                    trajectory,
+                    bottom_y,
+                    inner_dir,
+                    args.inner_offset,
+                    args.bottom_band,
+                )
                 pursuit = PurePursuit(trajectory, lookahead=args.lookahead)
                 path_source = "trajectory"
             else:
@@ -126,11 +197,23 @@ def main() -> int:
             left = _endpoint_distance(endpoint, x, y)
             if left is not None and left <= 1.5:
                 steering = 0.0
+            throttle = args.throttle
+            if args.ramp_seconds > 0.0:
+                throttle *= min(1.0, status.used_time / args.ramp_seconds)
+            curve_factor = min(1.0, abs(steering) / 0.35)
+            target_speed = (
+                args.straight_speed
+                - curve_factor * (args.straight_speed - args.curve_speed)
+            )
+            brake = 0.0
+            if speed > target_speed:
+                throttle = 0.0
+                brake = min(0.12, 0.05 * (speed - target_speed))
 
             vc = VehicleControl(
                 gear=GearMode.DRIVE,
-                throttle=args.throttle,
-                brake=0.0,
+                throttle=throttle,
+                brake=brake,
                 steering=steering,
             )
             api.set_vehicle_control(vc)
