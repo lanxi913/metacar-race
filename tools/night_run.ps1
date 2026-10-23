@@ -3,7 +3,7 @@ param(
     [int]$RunTimeoutSec = 240,
     [double]$CooldownMinutes = 90,
     [int]$CooldownSleepMin = 15,
-    [string]$Csv = "logs\results.csv"
+    [string]$Csv = "docs\results.csv"
 )
 
 $root = "C:\Users\lanxi\Documents\deepseek-harness\projects\metacar-race"
