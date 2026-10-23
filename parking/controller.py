@@ -84,7 +84,9 @@ class PathFollower:
         i = self._nearest(x, y)
         self._advance_segment()
         s0, s1, d = self.segments[self.seg]
-        s = self.cum[i] + self.lookahead * (1.0 if d > 0 else -1.0)
+        # 前视点永远取「路径前进方向」上的点；d 只决定车头朝向与挡位，
+        # 不能拿 d 去减 lookahead，否则倒车段会盯住已经走过的点。
+        s = self.cum[i] + self.lookahead
         tx, ty, dd = self._point_at(s)
         return tx, ty, d
 
@@ -171,14 +173,15 @@ class ParkingDriver:
 
         if self.state == "path":
             tx, ty, d = self.follower.target(x, y)
+            # 场景 yaw 顺时针为正：yaw = -atan2(dy, dx)（角度制）
             if d > 0:
-                desired = math.atan2(ty - y, tx - x)
-                err = wrap(desired - theta)
-                steer = max(-1.0, min(1.0, -self.kp * err))
-            else:
-                desired = math.atan2(y - ty, x - tx)
-                err = wrap(desired - theta)
+                desired_yaw = math.degrees(math.atan2(-(ty - y), -(tx - x)))
+                err = math.radians((desired_yaw - yaw_deg + 180.0) % 360.0 - 180.0)
                 steer = max(-1.0, min(1.0, self.kp * err))
+            else:
+                desired_yaw = math.degrees(math.atan2(-(y - ty), -(x - tx)))
+                err = math.radians((desired_yaw - yaw_deg + 180.0) % 360.0 - 180.0)
+                steer = max(-1.0, min(1.0, -self.kp * err))
 
             gx, gy = self.goal_xy
             near_goal = math.hypot(gx - x, gy - y) < 1.2

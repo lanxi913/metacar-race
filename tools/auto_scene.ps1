@@ -109,15 +109,16 @@ if (-not $SkipAuto) {
 
 # 页面是 virtual list，切页后元素会重建，这里重试等它稳定
 $target = $null
-for ($try = 1; $try -le 8; $try++) {
-    $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-    $btns = @($all | Where-Object { $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq $U_START })
+for ($page = 0; $page -le 4 -and -not $target; $page++) {
+    for ($try = 1; $try -le 6; $try++) {
+        $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        $btns = @($all | Where-Object { $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq $U_START })
 
-    if (-not $sceneName) {
-        if ($btns.Count -gt 0) { $target = $btns[0]; break }
-    } else {
-        $label = $all | Where-Object { $_.Current.Name -eq $sceneName } | Select-Object -First 1
-        if ($label) {
+        if (-not $sceneName) {
+            if ($btns.Count -gt 0) { $target = $btns[0]; break }
+        } else {
+            $label = $all | Where-Object { $_.Current.Name -eq $sceneName } | Select-Object -First 1
+            if ($label) {
             # 卡片里标题在上、按钮在下，不能按行高匹配；取欧氏距离最近的启动按钮
             $lx = $label.Current.BoundingRectangle.X
             $ly = $label.Current.BoundingRectangle.Y
@@ -137,6 +138,22 @@ for ($try = 1; $try -le 8; $try++) {
         }
     }
     Start-Sleep -Milliseconds 700
+    }
+
+    # not on this page -> go to next page and retry
+    if (-not $target -and $sceneName) {
+        $next = $all | Where-Object {
+            $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq 'Next page'
+        } | Select-Object -First 1
+        if ($next) {
+            Write-Host "page $page : not found, going next"
+            Invoke-El $next | Out-Null
+            Start-Sleep -Milliseconds 1200
+        } else {
+            Write-Host "page $page : not found, no next page"
+            break
+        }
+    }
 }
 
 if (-not $target -and $sceneName) {

@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from parking.controller import ParkingDriver          # noqa: E402
 from parking.planner import Planner, side_line_from_slot, slot_goal  # noqa: E402
+from parking.two_arc import TwoArcParker              # noqa: E402
 
 EGO_L, EGO_W = 4.814, 2.18
 
@@ -34,6 +35,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="平行车道泊车")
     ap.add_argument("--seconds", type=float, default=180.0)
     ap.add_argument("--goal-tol", type=float, default=0.22)
+    ap.add_argument("--mode", default="arc", choices=["arc", "astar"],
+                    help="arc=标准两段定转角倒车（默认）；astar=Hybrid A* 循迹")
     args = ap.parse_args()
 
     print("连接仿真场景（先跑脚本，再点启动场景）...", flush=True)
@@ -86,6 +89,13 @@ def main() -> int:
             handoff_y = slot.pos_y + 3.8
             start = (lane_x, handoff_y, -math.pi / 2)
             goal = slot_goal(slot)
+
+            if args.mode == "arc":
+                driver = TwoArcParker((slot.pos_x, slot.pos_y), lane_x)
+                print("两段定转角倒车参数: " + json.dumps(driver.params(), ensure_ascii=False), flush=True)
+                api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+                continue
+
             print(f"规划: start=({start[0]:.2f},{start[1]:.2f}) goal=({goal[0]:.2f},{goal[1]:.2f})", flush=True)
             tp = time.time()
             path = planner.plan(start, goal, goal_tol=args.goal_tol)
