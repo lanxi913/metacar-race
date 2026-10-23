@@ -62,7 +62,7 @@ def radius_at(pts, i, step=3):
 
 class TDriver:
     def __init__(self, route, k_heading=2.0, k_cross=2.2,
-                 a_lat=1.2, v_cruise=5.0, look_speed_gain=1.4):
+                 a_lat=1.2, v_cruise=2.0, look_speed_gain=1.4):
         self.pts = route
         self.k_h = k_heading
         self.k_c = k_cross
@@ -163,17 +163,26 @@ def main() -> int:
     route = smooth_path(route, k=2)
     driver = TDriver(route, a_lat=args.a_lat)
     cruise = AdaptiveCruise(list(st.route), 60.0 * KMH, goal_ratio=0.92,
-                             ramp_rate=0.10, plateau_eps=0.15, plateau_hold=0.6)
+                             ramp_rate=0.06, plateau_eps=0.15, plateau_hold=0.6)
     prev_state = None
 
     frames = 0
+    settle_until = None
     t0 = time.time()
     last_t = None
     v_peak = 0.0
     max_e = 0.0
     arrived = False
     arrived_t = None
+    v_prev = 0.0
+    spikes = []
+    vc_last_thr = 0.0
+    vc_last_brk = 0.0
+    pwm_acc = 0.0
     stuck_t = 0.0
+    vc_last_thr = 0.0
+    vc_last_brk = 0.0
+    pwm_acc = 0.0
 
     for msg, cams in api.main_loop():
         frames += 1
@@ -182,6 +191,14 @@ def main() -> int:
         status = msg.scene_status
         dt = 1.0 / 30.0 if last_t is None else max(status.used_time - last_t, 1e-3)
         last_t = status.used_time
+
+        # 逐帧加速度诊断：记录 |a| 最大的若干帧
+        if frames > 3 and dt >= 0.015:
+            a_inst = (car.speed - v_prev) / dt
+            if abs(a_inst) > 4.0:
+                spikes.append((round(status.used_time, 2), round(a_inst, 2),
+                               round(car.speed, 2), round(vc_last_thr, 2), round(vc_last_brk, 2)))
+        v_prev = car.speed
 
         steer, idx, e_ct = driver.steering(pose.pos_x, pose.pos_y, pose.ori_z, car.speed)
         max_e = max(max_e, abs(e_ct))
@@ -202,19 +219,31 @@ def main() -> int:
                 break
             continue
 
+        # 场景刚起来时先空转 1.2 s：变速箱在这个阶段给的加速度最猛，
+        # 等它稳定再给油，才能把 |a| 压到 5 以内
+        if settle_until is None:
+            settle_until = time.time() + 1.2
+        if time.time() < settle_until:
+            api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0,
+                                                   steering=steer))
+            continue
+
         v_target = driver.speed_target(idx, pose.pos_x, pose.pos_y, pose.ori_z, msg.obstacles)
-        vc, _mode = cruise.step(pose.pos_x, pose.pos_y, pose.ori_z, car.speed, dt)
-        # 需要比巡航更慢时，用刹车压下来；否则沿用自标定的恒定油门
-        if car.speed > v_target + 0.3:
-            thr, brk = 0.0, max(0.0, min(1.0, (car.speed - v_target) / 2.0 + 0.2))
-        elif car.speed > v_target:
-            thr, brk = 0.0, 0.0
+        # 实测：只要踩刹车就会降档，降档瞬间 car.speed 会跳变 1~2 m/s
+        # （诊断里出现过 ±19 m/s²，而当时油门是 0，物理上不可能）。
+        # 所以这里全程用 PWM 维持低速、不踩刹车；拐角本身也只需要约 1.7 m/s。
+        a_des = max(-1.0, min(1.2, 0.9 * (v_target - car.speed)))
+        if a_des > 0:
+            pwm_acc += min(1.0, a_des / 1.9)
+            if pwm_acc >= 1.0:
+                pwm_acc -= 1.0
+                thr, brk = 0.12, 0.0
+            else:
+                thr, brk = 0.0, 0.0
         else:
-            thr, brk = vc.throttle, 0.0
-        if prev_state == "ramp" and cruise.state == "cruise":
-            print(f"== 自标定完成: 油门 {cruise.calibrated_thr:.3f} -> "
-                  f"平台速度 {cruise.calibrated_v * 3.6:.1f} km/h ==", flush=True)
-        prev_state = cruise.state
+            pwm_acc = 0.0
+            thr, brk = 0.0, 0.0
+        vc_last_thr, vc_last_brk = thr, brk
         api.set_vehicle_control(VehicleControl(gear=GearMode.DRIVE, throttle=thr,
                                                brake=brk, steering=steer))
         v_peak = max(v_peak, abs(car.speed))
@@ -243,6 +272,7 @@ def main() -> int:
         "max_cross_track_m": round(max_e, 2),
         "arrived": arrived,
         "route_len_m": round(total, 1),
+        "accel_spikes": sorted(spikes, key=lambda x: -abs(x[1]))[:8],
         "elapsed": round(time.time() - t0, 1),
     }
     print("SUMMARY " + json.dumps(summary, ensure_ascii=False), flush=True)
