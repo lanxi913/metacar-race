@@ -180,9 +180,6 @@ def main() -> int:
     vc_last_brk = 0.0
     pwm_acc = 0.0
     stuck_t = 0.0
-    vc_last_thr = 0.0
-    vc_last_brk = 0.0
-    pwm_acc = 0.0
 
     for msg, cams in api.main_loop():
         frames += 1
