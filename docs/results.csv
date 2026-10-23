@@ -22,3 +22,4 @@
 2026-10-24 00:24:32,匝道行驶,zadaoxingshi,tools\track_bonus.py,100.00,加速度违规1次(00:24:46)
 2026-10-24 00:26:39,限速行驶,xiansuxingshi,tools\track_bonus.py,76.43,超速/停车位置扣分+加速度违规
 2026-10-24 00:35:05,垂直车道泊车,chunzhichedaoboche,(夜跑误点其他场景),-,夜跑脚本翻页bug，已从夜间列表移除；泊车单独验过210
+2026-10-24 00:50:00,汇总,-,-,-,详见 docs/training-summary.md
