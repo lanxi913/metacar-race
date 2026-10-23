@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
 LOOKAHEAD = 5.0
+XTRACK_K = 0.0        # 横向误差增益
 SLOW_LOOKAHEAD = 12.0
 MAX_SECONDS = 200
 
@@ -112,6 +113,24 @@ def main() -> int:
         else:
             delta = math.atan(2.0 * ly / d)
         steer = max(-1.0, min(1.0, -delta / 0.6))
+
+        # --- 横向误差（Stanley 项）：找最近路线点，算有符号横向距离 ---
+        near_i = idx
+        best_d = 1e9
+        for j in range(max(0, idx - 5), min(len(route), idx + 30)):
+            dj = math.hypot(route[j][0] - pose.pos_x, route[j][1] - pose.pos_y)
+            if dj < best_d:
+                best_d = dj
+                near_i = j
+        if near_i + 1 < len(route):
+            ax, ay = route[near_i]
+            bx, by = route[near_i + 1]
+            seg_x, seg_y = bx - ax, by - ay
+            seg_len = max(math.hypot(seg_x, seg_y), 1e-6)
+            # 车相对该段的横向偏移（左正右负）
+            cross = ((pose.pos_x - ax) * seg_y - (pose.pos_y - ay) * seg_x) / seg_len
+            v_eff = max(v, 0.6)
+            steer = max(-1.0, min(1.0, steer + math.atan(XTRACK_K * cross / v_eff)))
 
         max_turn = 0.0
         acc_len = 0.0
