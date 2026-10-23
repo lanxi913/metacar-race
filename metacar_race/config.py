@@ -70,3 +70,7 @@ STOP_STEER_LOCK_DISTANCE_M = 2.5 # 终点附近回正，避免越过目标后继
 # ---- 直角转弯标定（feat/control-calibration）----
 TURN_THROTTLE_COMMAND = 0.01     # 与停车题相同，稳态约 4.78 m/s
 TURN_LOOKAHEAD_M = 3.0           # 匹配题目的 3 m 曲率，避免大前视切弯
+
+# ---- U 型弯初始标定（待实测）----
+UTURN_THROTTLE_COMMAND = 0.01    # 先复用低速稳态油门，避免为抢时间压线
+UTURN_LOOKAHEAD_M = 2.2          # U 型弯比直角弯更容易切内侧，先缩短前视
