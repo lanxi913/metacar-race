@@ -29,7 +29,7 @@ TARGET_TOL = 0.30
 PARK_DEPTH_TOL = 0.15      # 车心与车位中心的 x 偏差（入得够深）
 PARK_LATERAL_TOL = 0.25    # y 偏差（横向不偏）
 PARK_HEADING_TOL = 6.0     # 航向误差
-ARC_END_Y_FIX = 0.75       # 圆弧结束时的 y 欠量补偿（实测）
+ARC_END_Y_FIX = 0.95       # 圆弧结束时的 y 欠量补偿（实测 dy≈-0.19，抬 0.2 补回）
 HEADING_TOL_DEG = 8.0
 HOLD_SECONDS = 3.0
 
