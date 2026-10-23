@@ -83,10 +83,14 @@ def main() -> int:
     v_prev = 0.0
     t_prev = t0
     peak1s = 0.0
+    peak100 = 0.0
+    peak_raw = 0.0
+    a500 = 0.0             # 0.5 秒窗口加速度（闭环限幅用）
     hist = []
     lim = {"thr": 0.0, "brk": 0.0}
     done = False
     vt_prev = 0.0
+    steer_prev = 0.0
     VT_SLEW = 1.2          # 目标速度变化率上限 m/s²
 
     def send(vc):
@@ -110,6 +114,12 @@ def main() -> int:
             hist.pop(0)
         if hist and now - hist[0][0] >= 0.9:
             peak1s = max(peak1s, abs((v - hist[0][1]) / (now - hist[0][0])))
+        if hist and now - hist[0][0] >= 0.08:
+            peak100 = max(peak100, abs((v - hist[0][1]) / (now - hist[0][0])))
+        if len(hist) >= 2:
+            a500 = (v - hist[0][1]) / max(now - hist[0][0], 1e-3)
+        if dt > 0:
+            peak_raw = max(peak_raw, abs((v - v_prev_c) / dt))
 
         # 推进最近点
         while idx < len(route) - 1:
@@ -148,13 +158,13 @@ def main() -> int:
 
         vt = args.cruise
         if max_turn > math.radians(55):
-            vt = min(vt, 1.8)
+            vt = min(vt, 2.2)
         elif max_turn > math.radians(35):
-            vt = min(vt, 2.4)
+            vt = min(vt, 1.2)
         elif max_turn > math.radians(20):
-            vt = min(vt, 3.2)
+            vt = min(vt, 1.6)
         elif max_turn > math.radians(8):
-            vt = min(vt, 4.0)
+            vt = min(vt, 3.0)
         # 当前打角大时也压速
         if abs(steer) > 0.6:
             vt = min(vt, 2.2)
@@ -175,12 +185,29 @@ def main() -> int:
             vt = vt_prev - max_step
         vt_prev = vt
 
+        # 方向盘变化率限制：避免横向加速度骤变
+        if steer > steer_prev + 0.05:
+            steer = steer_prev + 0.05
+        elif steer < steer_prev - 0.05:
+            steer = steer_prev - 0.05
+        steer_prev = steer
+
         thr, brk = speed_cmd(v, vt, thr_max=args.thr)
+
+        # 起步：不踩刹车，只把油门压在很小值，靠斜率自然爬起来
+        if now - t0 < 2.0:
+            thr = min(thr, 0.02)
+            brk = 0.0
+
+        # 加速度闭环：0.5 秒窗口超过 3.0 m/s2 就收油（只收油，不动刹车）
+        if a500 > 3.0:
+            thr = max(0.0, thr - 0.03)
         send(VehicleControl(gear=GearMode.DRIVE, throttle=thr, brake=brk, steering=steer))
 
         if now - last > 0.5:
             last = now
-            print(f"[{now - t0:5.1f}s] pos=({pose.pos_x:7.2f},{pose.pos_y:7.2f}) "
+            import datetime as _dt
+            print(f"[{_dt.datetime.now():%H:%M:%S} {now - t0:5.1f}s] pos=({pose.pos_x:7.2f},{pose.pos_y:7.2f}) "
                   f"v={v:5.2f} vt={vt:4.1f} steer={steer:+5.2f} idx={idx} left={dist_left:5.1f}")
 
         if dist_left < 0.8 and abs(v) < 0.3:
