@@ -1,0 +1,158 @@
+[
+ {
+  "slug": "straight",
+  "name": "车辆直行"
+ },
+ {
+  "slug": "stop",
+  "name": "车辆停止"
+ },
+ {
+  "slug": "follow",
+  "name": "车辆跟随"
+ },
+ {
+  "slug": "emergencystop",
+  "name": "车辆紧急停止"
+ },
+ {
+  "slug": "rightangleturn",
+  "name": "直角转弯"
+ },
+ {
+  "slug": "uxingwan",
+  "name": "u型弯"
+ },
+ {
+  "slug": "lianxuzhuanwan",
+  "name": "连续转弯"
+ },
+ {
+  "slug": "huanxingzhuanwan",
+  "name": "环形转弯"
+ },
+ {
+  "slug": "zadaoxingshi",
+  "name": "匝道行驶"
+ },
+ {
+  "slug": "xiansuxingshi",
+  "name": "限速行驶"
+ },
+ {
+  "slug": "cheliangbiandao",
+  "name": "车辆变道"
+ },
+ {
+  "slug": "huandaoshirushichu",
+  "name": "环岛驶入、驶出"
+ },
+ {
+  "slug": "zuocechedaochaoche",
+  "name": "左侧车道超车"
+ },
+ {
+  "slug": "fulushirushichu",
+  "name": "辅路驶入、驶出"
+ },
+ {
+  "slug": "fuzalukuangchaoche",
+  "name": "复杂路况超车"
+ },
+ {
+  "slug": "shangxiapotingche",
+  "name": "上下坡驻车"
+ },
+ {
+  "slug": "dingzilukoutongxing",
+  "name": "丁字路口通行"
+ },
+ {
+  "slug": "shizilukoutongxing",
+  "name": "十字路口通行"
+ },
+ {
+  "slug": "wubaohuzuozhuan",
+  "name": "无保护左转"
+ },
+ {
+  "slug": "youxingrenyouzhuan",
+  "name": "有行人右转"
+ },
+ {
+  "slug": "chunzhichedaoboche",
+  "name": "垂直车道泊车"
+ },
+ {
+  "slug": "pingxingchedaoboche",
+  "name": "平行车道泊车"
+ },
+ {
+  "slug": "yixingchedaoboche",
+  "name": "异形车道泊车"
+ },
+ {
+  "slug": "xiepoboche",
+  "name": "斜坡泊车"
+ },
+ {
+  "slug": "lvdengjinxing",
+  "name": "绿灯禁行"
+ },
+ {
+  "slug": "chelianghuiru",
+  "name": "车辆汇入"
+ },
+ {
+  "slug": "cheliangqiechu",
+  "name": "车辆切出"
+ },
+ {
+  "slug": "lianxu",
+  "name": "连续场景1"
+ },
+ {
+  "slug": "lianxu2",
+  "name": "连续场景2"
+ },
+ {
+  "slug": "lianxu3",
+  "name": "连续场景3"
+ },
+ {
+  "slug": "lianxu4",
+  "name": "连续场景4"
+ },
+ {
+  "slug": "lianxu5",
+  "name": "连续场景5"
+ },
+ {
+  "slug": "vla_TextNavParking",
+  "name": "文本导航与规范停车任务"
+ },
+ {
+  "slug": "vla_IllegalParkingDetection",
+  "name": "停车区违规检测任务"
+ },
+ {
+  "slug": "vla_ZoneComplianceCheck",
+  "name": "功能区合规检测任务"
+ },
+ {
+  "slug": "vla_TextNavParking_02",
+  "name": "文本导航与规范停车任务（二）"
+ },
+ {
+  "slug": "vla_IllegalParkingDetection_02",
+  "name": "停车区违规检测任务（二）"
+ },
+ {
+  "slug": "vla_ZoneComplianceCheck_02",
+  "name": "功能区合规检测任务(二）"
+ },
+ {
+  "slug": "PORT-FOG-01",
+  "name": "港口迷雾"
+ }
+]
