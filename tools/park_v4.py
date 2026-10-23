@@ -23,13 +23,13 @@ from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
 PARKING_SLOT_TYPE = 30
 ARC_RADIUS = 5.26         # 倒车满舵实测半径（probe_reverse）
-STAGE_SPEED = 0.28
+STAGE_SPEED = 0.14
 REVERSE_SPEED = 0.13
 TARGET_TOL = 0.30
 PARK_DEPTH_TOL = 0.15      # 车心与车位中心的 x 偏差（入得够深）
 PARK_LATERAL_TOL = 0.25    # y 偏差（横向不偏）
 PARK_HEADING_TOL = 6.0     # 航向误差
-ARC_END_Y_FIX = 0.95       # 圆弧结束时的 y 欠量补偿（实测 dy≈-0.19，抬 0.2 补回）
+ARC_END_Y_FIX = 0.30       # 圆弧结束时的 y 欠量补偿（实测 dy≈-0.19，抬 0.2 补回）
 HEADING_TOL_DEG = 8.0
 HOLD_SECONDS = 3.0
 
@@ -60,10 +60,8 @@ def speed_cmd(v_meas, v_target):
     if abs(err) < 0.06:
         return 0.0, 0.0            # 死区：误差小就滑行，避免油门刹车来回切
     if err > 0:
-        # 油门上限 0.16，实测对应约 3 m/s2
-        return min(0.16, 0.02 + 0.06 * err), 0.0
-    # 刹车上限 0.18，避免一脚下去 -7 m/s2
-    return 0.0, min(0.18, -0.10 * err)
+        return min(0.10, 0.01 + 0.04 * err), 0.0
+    return 0.0, min(0.10, -0.06 * err)
 
 
 def main() -> int:
@@ -83,13 +81,16 @@ def main() -> int:
     t_prev = t0
     accel = 0.0
     peak_raw = 0.0
+    hist = []
+    peak_100ms = 0.0
+    peak_1s = 0.0
     lim = {"thr": 0.0, "brk": 0.0}
 
     def send(vc, dt):
         """油门/刹车限斜率，并用加速度反馈保护 |a| <= 5。"""
         thr, brk = vc.throttle, vc.brake
-        lim["thr"] += max(-0.012, min(0.012, thr - lim["thr"]))
-        lim["brk"] += max(-0.025, min(0.025, brk - lim["brk"]))
+        lim["thr"] += max(-0.0015, min(0.0015, thr - lim["thr"]))
+        lim["brk"] += max(-0.004, min(0.004, brk - lim["brk"]))
         lim["thr"] = max(0.0, min(1.0, lim["thr"]))
         lim["brk"] = max(0.0, min(1.0, lim["brk"]))
         if accel > 3.6:
@@ -110,6 +111,13 @@ def main() -> int:
         v_prev = v
         accel = 0.9 * accel + 0.1 * max(-10.0, min(10.0, a_raw))
         peak_raw = max(peak_raw, abs(a_raw))
+        hist.append((now, v))
+        while len(hist) > 1 and now - hist[0][0] > 1.2:
+            hist.pop(0)
+        if hist and now - hist[0][0] >= 0.08:
+            peak_100ms = max(peak_100ms, abs((v - hist[0][1]) / max(now - hist[0][0], 1e-3)))
+        if hist and now - hist[0][0] >= 0.9:
+            peak_1s = max(peak_1s, abs((v - hist[0][1]) / max(now - hist[0][0], 1e-3)))
         if abs(a_raw) > 5.0:
             print(f"!! 尖峰 |a|={abs(a_raw):5.1f}  phase={phase} dt={dt:.3f} "
                   f"v_prev={v_prev_:+.2f} v={v:+.2f}")
@@ -129,16 +137,16 @@ def main() -> int:
 
         if phase == "stage":
             d_stage = math.hypot(stage[0] - pose.pos_x, stage[1] - pose.pos_y)
-            if d_stage < 6.0:
+            if d_stage < 20.0:
                 # 提前线性减速，避免最后一脚急刹把 |a| 顶过 5
-                if abs(v) < 0.12 and d_stage < 1.6:
+                if abs(v) < 0.30 and d_stage < 0.45:
                     phase = "arc"
                     print(f"到位并停稳(d={d_stage:.2f}, v={v:.2f})，切倒挡满舵")
-                    api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+                    api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=0.20))
                     time.sleep(0.4)
                 else:
                     a_req = (v * v) / (2.0 * max(d_stage, 0.3))
-                    brk = max(0.0, min(1.0, (a_req - 1.0) / 6.0))
+                    brk = max(0.0, min(0.10, (a_req - 0.8) / 25.0))
                     vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0, brake=brk)
                     send(vc, dt)
             else:
@@ -147,8 +155,8 @@ def main() -> int:
                 steer = max(-1.0, min(1.0, -1.5 * err))
                 thr = STAGE_SPEED if d_stage > 4 else 0.12
                 # 起步 1.2 秒内轻踩，压住场景启动时的加速度尖峰
-                if now - t0 < 1.2:
-                    thr = 0.03
+                if now - t0 < 2.5:
+                    thr = 0.02
                 vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr, steering=steer)
                 send(vc, dt)
 
@@ -157,7 +165,7 @@ def main() -> int:
             if dyaw < HEADING_TOL_DEG:
                 phase = "straight"
                 print(f"车头已摆正(dyaw={dyaw:.1f}°)，回正倒直线")
-            thr, brk = speed_cmd(v, 0.80)
+            thr, brk = speed_cmd(v, 0.55)
             send(VehicleControl(gear=GearMode.REVERSE, throttle=thr, brake=brk, steering=1.0), dt)
 
         elif phase == "straight":
@@ -165,24 +173,26 @@ def main() -> int:
             dx = pose.pos_x - slot.pos_x
             dy = pose.pos_y - slot.pos_y
             deep_enough = abs(dx) < PARK_DEPTH_TOL and abs(dy) < PARK_LATERAL_TOL
-            if (abs(dx) < 0.20) or (dx < -0.35) or (prev_d < 0.9 and d_center > prev_d + 0.10):
+            if (abs(dx) < 0.06) or (dx < -0.35) or (prev_d < 0.9 and d_center > prev_d + 0.10):
                 phase = "hold"
                 hold_t = now
                 print(f"入库：dx={dx:+.2f} dy={dy:+.2f} 航向 {dyaw:.1f}°")
-                api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+                api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=0.20))
             else:
                 # 直退的同时用陀螺仪修正朝向
                 err = wrap(heading_rad(slot.ori_z) - heading_rad(pose.ori_z))
                 steer = max(-0.4, min(0.4, 1.2 * err))
-                # 目标速度随剩余深度平滑衰减，全程连续，不点刹
-                vt = max(0.22, min(0.80, 1.1 * max(abs(dx) - 0.10, 0.0) + 0.22))
+                # 目标速度随剩余深度平滑衰减，最后 0.6 m 放慢到 0.15 m/s
+                vt = max(0.15, min(0.80, 1.1 * max(abs(dx) - 0.10, 0.0) + 0.22))
                 thr, brk = speed_cmd(v, vt)
                 send(VehicleControl(gear=GearMode.REVERSE, throttle=thr, brake=brk, steering=steer), dt)
 
         else:
-            api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+            # 停稳过程也做斜坡：先轻踩，1.5 秒后再压满，避免最后一下急刹
+            ramp = min(1.0, 0.22 + 0.55 * (now - hold_t))
+            api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=ramp))
             if now - hold_t > HOLD_SECONDS:
-                print(f"原始加速度峰值 {peak_raw:.2f} m/s2")
+                print(f"加速度峰值：逐帧 {peak_raw:.2f}，0.1s {peak_100ms:.2f}，1s {peak_1s:.2f} m/s2")
                 print(f"保持完成，用时 {now - t0:.1f}s，中心误差 {d_center:.2f} m，"
                       f"航向误差 {dyaw:.1f}°")
                 break
