@@ -56,7 +56,7 @@ python -m venv .venv
 **第一步：先起脚本**（它会阻塞等待场景连上来，这是正常的）
 
 ```bat
-.venv\Scripts\python.exe -u tools\park_v4.py
+.venv\Scripts\python.exe -u tools\park_v8.py
 ```
 
 看到 `等待场景连接...` 后再做第二步。
@@ -92,11 +92,10 @@ python -m venv .venv
 
 ## 8. 参数在哪
 
-全部在 `tools/park_v4.py` 顶部：
+全部在 `tools/park_v8.py` 顶部（v8 是几何推导版，**没有任何场景常数**，推荐用这个）：
 
 ```python
-ARC_RADIUS = 5.26        # 倒车满舵半径（实测）
-ARC_END_Y_FIX = 0.30     # 对位点 y 补偿
+ARC_RADIUS = 5.26        # 倒车满舵半径（车辆属性，实测）
 STAGE_SPEED = 0.14       # 接近段油门
 V_APPROACH = 3.6         # 接近段目标速度
 HOLD_SECONDS = 3.0       # 停稳保持
