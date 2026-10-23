@@ -21,7 +21,7 @@ from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
 LOOKAHEAD = 5.0
 SLOW_LOOKAHEAD = 12.0     # 预判距离
-MAX_SECONDS = 180
+MAX_SECONDS = 300
 
 
 def wrap(a):
@@ -36,7 +36,7 @@ def heading_rad(yaw_deg):
     return math.radians(-yaw_deg)
 
 
-def speed_cmd(v, vt, thr_max=0.45, brk_max=0.30):
+def speed_cmd(v, vt, thr_max=0.62, brk_max=0.30):
     err = vt - abs(v)
     if abs(err) < 0.05:
         return 0.0, 0.0
@@ -47,7 +47,7 @@ def speed_cmd(v, vt, thr_max=0.45, brk_max=0.30):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cruise", type=float, default=4.0)
+    ap.add_argument("--cruise", type=float, default=5.8)
     args = ap.parse_args()
 
     print("等待场景连接...")
@@ -64,7 +64,7 @@ def main() -> int:
 
     # 预计算每个点的局部转角（前后各 2 个点）
     # 用跨 5 个点的方向变化估计「这一段有多弯」，避免采样过密导致角度被摊薄
-    SPAN = 5
+    SPAN = 8
     curv = [0.0] * len(route)
     for i in range(len(route)):
         j0 = max(0, i - SPAN)
@@ -85,6 +85,8 @@ def main() -> int:
     hist = []
     lim = {"thr": 0.0, "brk": 0.0}
     done = False
+    vt_prev = 0.0
+    VT_SLEW = 1.2          # 目标速度变化率上限 m/s²
 
     def send(vc):
         lim["thr"] += max(-0.0015, min(0.0015, vc.throttle - lim["thr"]))
@@ -144,15 +146,17 @@ def main() -> int:
                 break
 
         vt = args.cruise
-        if max_turn > math.radians(45):
-            vt = min(vt, 1.6)
-        elif max_turn > math.radians(25):
-            vt = min(vt, 2.2)
-        elif max_turn > math.radians(10):
-            vt = min(vt, 3.0)
-        # 当前转角大时也压速
+        if max_turn > math.radians(55):
+            vt = min(vt, 2.4)
+        elif max_turn > math.radians(35):
+            vt = min(vt, 3.2)
+        elif max_turn > math.radians(20):
+            vt = min(vt, 4.2)
+        elif max_turn > math.radians(8):
+            vt = min(vt, 5.2)
+        # 当前打角大时也压速
         if abs(steer) > 0.6:
-            vt = min(vt, 1.8)
+            vt = min(vt, 2.2)
 
         dist_left = math.hypot(route[-1][0] - pose.pos_x, route[-1][1] - pose.pos_y)
 
@@ -161,6 +165,14 @@ def main() -> int:
                 done = True
                 print(f"接近终点 3 m，开始减速（剩余 {dist_left:.1f} m）")
             vt = min(vt, max(0.4, 0.6 * dist_left))
+
+        # 目标速度按 VT_SLEW 变化，保证减速过程平缓（这一步是 |a| 达标的关键）
+        max_step = VT_SLEW * dt
+        if vt > vt_prev + max_step:
+            vt = vt_prev + max_step
+        elif vt < vt_prev - max_step:
+            vt = vt_prev - max_step
+        vt_prev = vt
 
         thr, brk = speed_cmd(v, vt)
         send(VehicleControl(gear=GearMode.DRIVE, throttle=thr, brake=brk, steering=steer))
