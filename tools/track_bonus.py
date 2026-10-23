@@ -56,6 +56,7 @@ def main() -> int:
     ap.add_argument("--cruise", type=float, default=4.0)
     ap.add_argument("--offset", type=float, default=0.0)
     ap.add_argument("--nobrake", action="store_true")
+    ap.add_argument("--cscale", type=float, default=1.0)
     args = ap.parse_args()
 
     print("等待场景连接...")
@@ -154,14 +155,15 @@ def main() -> int:
                 break
 
         vt = args.cruise
+        cs = args.cscale
         if max_turn > math.radians(45):
-            vt = min(vt, 1.6)
+            vt = min(vt, 1.6 * cs)
         elif max_turn > math.radians(25):
-            vt = min(vt, 2.2)
+            vt = min(vt, 2.2 * cs)
         elif max_turn > math.radians(10):
-            vt = min(vt, 3.0)
+            vt = min(vt, 3.0 * cs)
         if abs(steer) > 0.6:
-            vt = min(vt, 1.8)
+            vt = min(vt, 1.8 * cs)
 
         dist_left = math.hypot(route[-1][0] - pose.pos_x, route[-1][1] - pose.pos_y)
         if dist_left < 3.0:
