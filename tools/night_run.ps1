@@ -1,4 +1,4 @@
-﻿# 通宵自动跑分（精简版）：逐场景启动控制器 -> 等待 -> 抓结算截图 -> 循环
+# 通宵自动跑分（精简版）：逐场景启动控制器 -> 等待 -> 抓结算截图 -> 循环
 param(
     [int]$RunTimeoutSec = 200,
     [double]$CooldownMinutes = 90,
@@ -13,6 +13,7 @@ $resDir = Join-Path $root "logs\results"
 New-Item -ItemType Directory -Force -Path $resDir | Out-Null
 
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
 
 $Scenes = @(
     @{ T = "车辆直行";       S = "straight";       A = @("main.py", "--track", "--cruise", "0.5", "--seconds", "60") },
@@ -51,6 +52,12 @@ function Go-PageOne {
             Start-Sleep -Seconds 2
         }
     }
+    # 滚回列表顶部，保证按标题定位卡片时位置一致
+    try {
+        $win.SetFocus()
+        [System.Windows.Forms.SendKeys]::SendWait("{PGUP 12}")
+        Start-Sleep -Milliseconds 900
+    } catch { }
 }
 
 $lastCooldown = Get-Date
