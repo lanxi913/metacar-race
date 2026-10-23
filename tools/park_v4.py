@@ -67,11 +67,34 @@ def main() -> int:
     hold_t = 0.0
     last = 0.0
     prev_d = 99.0
+    v_prev = 0.0
+    t_prev = t0
+    accel = 0.0
+    lim = {"thr": 0.0, "brk": 0.0}
+
+    def send(vc, dt):
+        """油门/刹车限斜率，并用加速度反馈保护 |a| <= 5。"""
+        thr, brk = vc.throttle, vc.brake
+        lim["thr"] += max(-0.04, min(0.04, thr - lim["thr"]))
+        lim["brk"] += max(-0.08, min(0.08, brk - lim["brk"]))
+        lim["thr"] = max(0.0, min(1.0, lim["thr"]))
+        lim["brk"] = max(0.0, min(1.0, lim["brk"]))
+        if accel > 4.0:
+            lim["thr"] = max(0.0, lim["thr"] - 0.04)
+        elif accel < -4.0:
+            lim["brk"] = max(0.0, lim["brk"] - 0.08)
+        vc.throttle, vc.brake = lim["thr"], lim["brk"]
+        api.set_vehicle_control(vc)
 
     for msg, _f in api.main_loop():
         pose = msg.pose_gnss
         v = msg.main_vehicle.speed
         now = time.time()
+        dt = max(now - t_prev, 1e-3)
+        t_prev = now
+        a_raw = (v - v_prev) / dt
+        v_prev = v
+        accel = 0.9 * accel + 0.1 * max(-10.0, min(10.0, a_raw))
 
         if slot is None:
             slot = find_slot(msg.obstacles)
@@ -88,20 +111,28 @@ def main() -> int:
 
         if phase == "stage":
             d_stage = math.hypot(stage[0] - pose.pos_x, stage[1] - pose.pos_y)
-            if d_stage < 0.6:
-                phase = "arc"
-                print(f"到位(d={d_stage:.2f})，切倒挡满舵")
-                api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
-                time.sleep(0.5)
+            if d_stage < 6.0:
+                # 提前线性减速，避免最后一脚急刹把 |a| 顶过 5
+                if abs(v) < 0.12 and d_stage < 1.6:
+                    phase = "arc"
+                    print(f"到位并停稳(d={d_stage:.2f}, v={v:.2f})，切倒挡满舵")
+                    api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+                    time.sleep(0.4)
+                else:
+                    a_req = (v * v) / (2.0 * max(d_stage, 0.3))
+                    brk = max(0.0, min(1.0, (a_req - 1.0) / 6.0))
+                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0, brake=brk)
+                    send(vc, dt)
             else:
                 dx, dy = stage[0] - pose.pos_x, stage[1] - pose.pos_y
                 err = wrap(math.atan2(dy, dx) - heading_rad(pose.ori_z))
                 steer = max(-1.0, min(1.0, -1.5 * err))
-                thr = STAGE_SPEED if d_stage > 3 else 0.10
+                thr = STAGE_SPEED if d_stage > 4 else 0.12
+                # 起步 1.2 秒内轻踩，压住场景启动时的加速度尖峰
+                if now - t0 < 1.2:
+                    thr = 0.03
                 vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr, steering=steer)
-                if v > 4.5:
-                    vc.throttle, vc.brake = 0.0, 0.6
-                api.set_vehicle_control(vc)
+                send(vc, dt)
 
         elif phase == "arc":
             # 倒车满舵，直到车头与车位轴线平行
@@ -111,7 +142,7 @@ def main() -> int:
             vc = VehicleControl(gear=GearMode.REVERSE, throttle=REVERSE_SPEED, steering=1.0)
             if abs(v) > 0.9:
                 vc.throttle, vc.brake = 0.0, 0.3
-            api.set_vehicle_control(vc)
+            send(vc, dt)
 
         elif phase == "straight":
             # 分轴判据：深度（x）要进得够深，横向（y）不能偏，航向要正
@@ -134,7 +165,7 @@ def main() -> int:
                     vc.brake = 0.45
                 if abs(v) > 0.85:
                     vc.throttle, vc.brake = 0.0, 0.4
-                api.set_vehicle_control(vc)
+                send(vc, dt)
 
         else:
             api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
@@ -146,7 +177,7 @@ def main() -> int:
         if now - last > 0.5:
             last = now
             print(f"[{now - t0:5.1f}s] {phase:<8} pos=({pose.pos_x:7.2f},{pose.pos_y:7.2f}) "
-                  f"yaw={pose.ori_z:6.1f} v={v:5.2f} d={d_center:5.2f} dyaw={dyaw:5.1f}")
+                  f"yaw={pose.ori_z:6.1f} v={v:5.2f} a={accel:+5.2f} d={d_center:5.2f} dyaw={dyaw:5.1f}")
 
         if now - t0 > 90:
             print("超时")
