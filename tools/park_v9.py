@@ -71,19 +71,25 @@ def arc_displacement(theta0, phi, kappa):
     return (dx, dy)
 
 
-def plan_arc(goal_x, goal_y, goal_theta, approach_theta):
-    """给定终点位姿和接近方向，返回 (起点x, 起点y, phi, kappa) 或 None。"""
+def plan_arc(goal_x, goal_y, goal_theta, approach_theta, entry_dx, entry_dy):
+    """给定终点位姿、接近方向、开口方向，返回 (sx, sy, phi, kappa)。
+
+    entry_dx/entry_dy 是指向车位开口外方向的单位向量。
+    两种曲率都试，挑「圆弧起点在开口侧」那个。
+    """
     best = None
     for kappa in (1.0 / ARC_RADIUS, -1.0 / ARC_RADIUS):
-        # 转角由接近方向决定；也允许 ±2π 内的等价角
         phi = wrap(goal_theta - approach_theta)
         for cand_phi in (phi, phi - 2 * math.pi, phi + 2 * math.pi):
             theta0 = goal_theta - cand_phi
-            if abs(wrap(theta0 - approach_theta)) > math.radians(4.0):
+            if abs(wrap(theta0 - approach_theta)) > math.radians(3.0):
                 continue
             dx, dy = arc_displacement(theta0, cand_phi, kappa)
             sx, sy = goal_x - dx, goal_y - dy
-            # 起点必须在车位开口那一侧（a_long > 0）
+            # 起点必须在开口方向一侧，且在车道上（离车位中心更远）
+            proj = (sx - goal_x) * entry_dx + (sy - goal_y) * entry_dy
+            if proj < 0.5:
+                continue
             score = abs(cand_phi)
             if best is None or score < best[0]:
                 best = (score, sx, sy, cand_phi, kappa)
@@ -147,10 +153,16 @@ def main() -> int:
             if slot is None:
                 api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=0.2))
                 continue
+            th0 = heading_rad(slot.ori_z)
+            r0x, r0y = pose.pos_x - slot.pos_x, pose.pos_y - slot.pos_y
+            a0 = r0x * math.cos(th0) + r0y * math.sin(th0)
+            entry_sign = 1.0 if a0 >= 0 else -1.0
             frame = {
-                "th": heading_rad(slot.ori_z),
+                "th": th0 * entry_sign + (0.0 if entry_sign > 0 else math.pi),
                 "cx": slot.pos_x,
                 "cy": slot.pos_y,
+                "ex": math.cos(th0) * entry_sign,
+                "ey": math.sin(th0) * entry_sign,
             }
             print(f"车位({slot.pos_x:.2f},{slot.pos_y:.2f}) 轴线 {slot.ori_z:.1f}°")
 
@@ -163,7 +175,8 @@ def main() -> int:
         # 接近到 18 m 内时，按当前航向规划圆弧
         if plan is None and a_long > 0 and math.hypot(rx, ry) < 18.0:
             approach_theta = heading_rad(pose.ori_z)
-            plan = plan_arc(frame["cx"], frame["cy"], th_slot, approach_theta)
+            plan = plan_arc(frame["cx"], frame["cy"], th_slot, approach_theta,
+                            frame["ex"], frame["ey"])
             if plan:
                 print(f"规划圆弧：转角 {math.degrees(plan[2]):+.1f}°  "
                       f"曲率 {plan[3]:+.3f}  起点({plan[0]:.2f},{plan[1]:.2f})")
