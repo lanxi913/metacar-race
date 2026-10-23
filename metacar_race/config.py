@@ -54,3 +54,15 @@ WHEELBASE_M = 2.6         # 轴距（估），纯跟踪用
 
 
 UPSHIFT_SPEED_THRESHOLD = 4.9   # 低于这个速度说明还在一挡（17.2 km/h 附近），需要 kick 升挡
+
+# ---- 车辆停止标定（feat/control-calibration，2026-10-23 实车数据）----
+STOP_THROTTLE_COMMAND = 0.01     # 稳态约 4.78 m/s，加速度窗口 < 5
+STOP_BRAKE_COMMAND = 0.10        # 从 4.78 m/s 停车约 4.22 m
+STOP_BRAKE_DECEL_MS2 = 2.70      # 上述刹车指令的等效平均减速度
+STOP_BRAKE_LEAD_M = 0.10         # 实测再晚一帧刹车，消除 0.125 m 位置误差
+STOP_CAPTURE_RADIUS_M = 0.20     # 进入该半径且速度足够低后锁存停车
+STOP_STILL_SPEED_MS = 0.30       # 静止时速度信号仍有约 ±0.23 的抖动
+STOP_SETTLE_SECONDS = 0.80       # 低速持续该时间后才锁存驻车
+STOP_HOLD_SECONDS = 5.0          # 题目要求停稳 5 s
+STOP_EXIT_GRACE_SECONDS = 1.0    # 停稳计时完成后再保持制动一段时间
+STOP_STEER_LOCK_DISTANCE_M = 2.5 # 终点附近回正，避免越过目标后继续打方向
