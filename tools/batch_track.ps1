@@ -1,7 +1,8 @@
 ﻿# 批量跑弯道类场景：逐个启动 tracker + 点启动场景 + 收日志
 param(
     [string[]]$Scenes = @("u型弯", "环形转弯", "连续转弯", "匝道行驶", "限速行驶", "环岛驶入、驶出", "车辆变道"),
-    [int]$MaxSeconds = 150
+    [int]$MaxSeconds = 150,
+    [string]$Script = "tools\track_run.py"
 )
 
 $ErrorActionPreference = "Continue"
@@ -40,7 +41,7 @@ foreach ($scene in $Scenes) {
     Write-Host "`n===== $scene ====="
     Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*track_run.py*" } |
+        Where-Object { $_.CommandLine -like "*track_*.py*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
 
@@ -48,7 +49,7 @@ foreach ($scene in $Scenes) {
 
     $safe = $scene -replace '[^\w\u4e00-\u9fa5]', '_'
     $log = Join-Path $root "logs\track_$safe.log"
-    $proc = Start-Process -FilePath $py -ArgumentList @("-u", "tools\track_run.py") `
+    $proc = Start-Process -FilePath $py -ArgumentList @("-u", $Script) `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 5
 

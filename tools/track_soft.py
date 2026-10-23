@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
-LOOKAHEAD = 4.0
+LOOKAHEAD = 2.5
 
 
 def wrap(a):
@@ -79,7 +79,7 @@ def main() -> int:
         v_prev = v
 
         while idx < len(route) - 1:
-            if math.hypot(route[idx][0] - pose.pos_x, route[idx][1] - pose.pos_y) < 3.0:
+            if math.hypot(route[idx][0] - pose.pos_x, route[idx][1] - pose.pos_y) < 2.0:
                 idx += 1
             else:
                 break
