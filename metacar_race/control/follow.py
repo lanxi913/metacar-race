@@ -10,17 +10,15 @@ from metacar import ObstacleType
 from metacar_race.config import (
     FOLLOW_BRAKE_SLEW_PER_FRAME,
     FOLLOW_CANDIDATE_MAX_HEADING_DEG,
-    FOLLOW_CANDIDATE_MAX_LATERAL_M,
     FOLLOW_END_DECEL_MS2,
-    FOLLOW_END_TOL_M,
     FOLLOW_GAP_GAIN,
-    FOLLOW_HEADWAY_SECONDS,
-    FOLLOW_LEADER_LOST_SPEED_MS,
-    FOLLOW_MAX_SPEED_MS,
-    FOLLOW_MIN_GAP_M,
+    FOLLOW_LATERAL_LANE_RATIO,
+    FOLLOW_MIN_GAP_RATIO,
+    FOLLOW_REACTION_TIME_S,
     FOLLOW_SAFE_DECEL_MS2,
-    FOLLOW_SPEED_DEADBAND_MS,
-    FOLLOW_STANDSTILL_GAP_M,
+    FOLLOW_SPEED_LIMIT_RATIO,
+    FOLLOW_SPEED_RESPONSE_S2_PER_M,
+    FOLLOW_STANDSTILL_CAR_LENGTHS,
     FOLLOW_THROTTLE_MAX,
     FOLLOW_THROTTLE_SLEW_PER_FRAME,
 )
@@ -54,7 +52,68 @@ class LeaderInfo:
     heading_diff_deg: float
 
 
-def select_leader(obstacles, pose, ego_length: float) -> LeaderInfo | None:
+@dataclass(frozen=True)
+class FollowAdaptiveParams:
+    max_lateral_m: float
+    standstill_gap_m: float
+    min_gap_m: float
+    max_speed_ms: float
+    end_tolerance_m: float
+    speed_deadband_ms: float
+    leader_lost_speed_ms: float
+
+
+def estimate_nearest_lane_width(roads, x: float, y: float, fallback: float) -> float:
+    """返回离当前车辆最近的车道宽度。"""
+    best_distance = math.inf
+    best_width = fallback
+    for road in roads:
+        for lane in road.lanes:
+            if lane.width <= 0.0:
+                continue
+            for point in lane.path_points:
+                distance = math.hypot(
+                    float(point.x) - x,
+                    float(point.y) - y,
+                )
+                if distance < best_distance:
+                    best_distance = distance
+                    best_width = float(lane.width)
+    return best_width
+
+
+def adaptive_params(
+    ego_length: float,
+    ego_width: float,
+    lane_width: float,
+    speed_limit_ms: float,
+) -> FollowAdaptiveParams:
+    standstill_gap = max(
+        FOLLOW_STANDSTILL_CAR_LENGTHS * ego_length,
+        3.0 * ego_width,
+    )
+    max_lateral = max(ego_width, FOLLOW_LATERAL_LANE_RATIO * lane_width)
+    max_speed = min(
+        FOLLOW_SPEED_LIMIT_RATIO * speed_limit_ms,
+        1.4 * lane_width,
+    )
+    return FollowAdaptiveParams(
+        max_lateral_m=max_lateral,
+        standstill_gap_m=standstill_gap,
+        min_gap_m=max(ego_length, FOLLOW_MIN_GAP_RATIO * standstill_gap),
+        max_speed_ms=max(1.0, max_speed),
+        end_tolerance_m=max(0.4, 0.1 * ego_length),
+        speed_deadband_ms=max(0.15, 0.04 * max_speed),
+        leader_lost_speed_ms=max(1.0, 0.08 * speed_limit_ms),
+    )
+
+
+def select_leader(
+    obstacles,
+    pose,
+    ego_length: float,
+    params: FollowAdaptiveParams,
+) -> LeaderInfo | None:
     """选择当前车道中净距最近的前方车辆。"""
     heading = -math.radians(float(pose.ori_z))
     cos_h = math.cos(heading)
@@ -73,7 +132,7 @@ def select_leader(obstacles, pose, ego_length: float) -> LeaderInfo | None:
         )
         if forward <= 0.0:
             continue
-        if abs(lateral) > FOLLOW_CANDIDATE_MAX_LATERAL_M:
+        if abs(lateral) > params.max_lateral_m:
             continue
         if abs(heading_diff) > FOLLOW_CANDIDATE_MAX_HEADING_DEG:
             continue
@@ -106,37 +165,42 @@ def select_leader(obstacles, pose, ego_length: float) -> LeaderInfo | None:
 def compute_target_speed(
     leader: LeaderInfo | None,
     remaining_to_end: float | None,
+    params: FollowAdaptiveParams,
 ) -> tuple[float, float, float]:
     """返回 (目标速度, 期望净距, 安全速度上限)。"""
     if leader is None:
-        target = FOLLOW_LEADER_LOST_SPEED_MS
-        desired_gap = FOLLOW_STANDSTILL_GAP_M
+        target = params.leader_lost_speed_ms
+        desired_gap = params.standstill_gap_m
         safe_speed = target
     else:
         desired_gap = (
-            FOLLOW_STANDSTILL_GAP_M
-            + FOLLOW_HEADWAY_SECONDS * leader.speed_ms
+            params.standstill_gap_m
+            + (
+                FOLLOW_REACTION_TIME_S
+                + FOLLOW_SPEED_RESPONSE_S2_PER_M * leader.speed_ms
+            )
+            * leader.speed_ms
         )
         gap_error = leader.gap_m - desired_gap
         gap_speed = leader.speed_ms + FOLLOW_GAP_GAIN * gap_error
         safe_speed = math.sqrt(
             2.0
             * FOLLOW_SAFE_DECEL_MS2
-            * max(0.0, leader.gap_m - FOLLOW_MIN_GAP_M)
+            * max(0.0, leader.gap_m - params.min_gap_m)
         )
         target = min(
-            FOLLOW_MAX_SPEED_MS,
+            params.max_speed_ms,
             max(0.0, gap_speed),
             safe_speed,
         )
-        if leader.gap_m <= FOLLOW_MIN_GAP_M:
+        if leader.gap_m <= params.min_gap_m:
             target = 0.0
 
     if remaining_to_end is not None:
         end_speed = math.sqrt(
             2.0
             * FOLLOW_END_DECEL_MS2
-            * max(0.0, remaining_to_end - FOLLOW_END_TOL_M)
+            * max(0.0, remaining_to_end - params.end_tolerance_m)
         )
         target = min(target, end_speed)
 
@@ -166,6 +230,7 @@ class LongitudinalController:
         target_speed: float,
         gap_m: float | None,
         dt: float,
+        params: FollowAdaptiveParams,
     ) -> tuple[float, float]:
         dt = max(dt, 1.0 / 60.0)
         raw_speed = abs(float(speed))
@@ -176,16 +241,16 @@ class LongitudinalController:
             clamp(raw_accel, -10.0, 10.0) - self.acceleration
         )
 
-        if gap_m is not None and gap_m <= FOLLOW_MIN_GAP_M:
+        if gap_m is not None and gap_m <= params.min_gap_m:
             throttle_target = 0.0
             brake_target = 0.20
-        elif error > FOLLOW_SPEED_DEADBAND_MS:
+        elif error > params.speed_deadband_ms:
             throttle_target = min(
                 FOLLOW_THROTTLE_MAX,
                 0.04 + 0.06 * error,
             )
             brake_target = 0.0
-        elif error < -FOLLOW_SPEED_DEADBAND_MS:
+        elif error < -params.speed_deadband_ms:
             throttle_target = 0.0
             brake_target = min(0.15, 0.03 + 0.04 * (-error))
         else:

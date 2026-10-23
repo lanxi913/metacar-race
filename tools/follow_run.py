@@ -20,13 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
 from metacar_race.config import (  # noqa: E402
-    FOLLOW_END_TOL_M,
     FOLLOW_HOLD_SECONDS,
     FOLLOW_LOOKAHEAD_M,
+    LIMIT_SCENE_ELEMENT_KMH,
 )
 from metacar_race.control.follow import (  # noqa: E402
     LongitudinalController,
+    FollowAdaptiveParams,
+    adaptive_params,
     compute_target_speed,
+    estimate_nearest_lane_width,
     select_leader,
 )
 from metacar_race.control.tracking import PurePursuit  # noqa: E402
@@ -52,6 +55,7 @@ def main() -> int:
         return 1
     pursuit = PurePursuit(route, lookahead=args.lookahead)
     fallback_end = static.sub_scenes[-1].end_point if static.sub_scenes else None
+    speed_limit_ms = LIMIT_SCENE_ELEMENT_KMH / 3.6
 
     log_dir = ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -78,6 +82,11 @@ def main() -> int:
             "leader_speed",
             "desired_gap",
             "safe_speed",
+            "lane_width",
+            "standstill_gap",
+            "min_gap",
+            "max_speed",
+            "end_tolerance",
             "remaining_to_end",
             "throttle",
             "brake",
@@ -93,7 +102,9 @@ def main() -> int:
     ending = "unknown"
     final_x = final_y = final_yaw = speed = 0.0
     leader = None
+    params: FollowAdaptiveParams | None = None
     target_speed = desired_gap = safe_speed = 0.0
+    lane_width = 0.0
     remaining_to_end = None
     try:
         for frame, (msg, _frames) in enumerate(api.main_loop(), start=1):
@@ -113,20 +124,34 @@ def main() -> int:
                     float(endpoint.y) - final_y,
                 )
 
+            lane_width = estimate_nearest_lane_width(
+                static.roads,
+                final_x,
+                final_y,
+                fallback=float(car.width) * 1.8,
+            )
+            params = adaptive_params(
+                float(car.length),
+                float(car.width),
+                lane_width,
+                speed_limit_ms,
+            )
             leader = select_leader(
                 msg.obstacles,
                 pose,
                 float(car.length),
+                params,
             )
             target_speed, desired_gap, safe_speed = compute_target_speed(
                 leader,
                 remaining_to_end,
+                params,
             )
 
             if phase == "follow":
                 if (
                     remaining_to_end is not None
-                    and remaining_to_end <= FOLLOW_END_TOL_M
+                    and remaining_to_end <= params.end_tolerance_m
                     and abs(speed) <= 0.12
                 ):
                     phase = "hold"
@@ -142,6 +167,7 @@ def main() -> int:
                         target_speed,
                         None if leader is None else leader.gap_m,
                         dt,
+                        params,
                     )
                     steering = pursuit.steering(
                         final_x,
@@ -189,6 +215,11 @@ def main() -> int:
                     None if leader is None else round(leader.speed_ms, 4),
                     round(desired_gap, 4),
                     round(safe_speed, 4),
+                    round(lane_width, 4),
+                    round(params.standstill_gap_m, 4),
+                    round(params.min_gap_m, 4),
+                    round(params.max_speed_ms, 4),
+                    round(params.end_tolerance_m, 4),
                     (
                         None
                         if remaining_to_end is None
@@ -244,6 +275,7 @@ def main() -> int:
         "remaining_to_end": (
             None if remaining_to_end is None else round(remaining_to_end, 4)
         ),
+        "adaptive_params": None if params is None else params.__dict__,
         "leader": None if leader is None else leader.__dict__,
         "csv": str(csv_path),
     }
