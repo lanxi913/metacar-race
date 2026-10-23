@@ -63,13 +63,33 @@ function Stop-Leftovers {
 }
 
 function Get-ClientWindow {
-    $cp = (Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -First 1).Id
-    if (-not $cp) { throw "client not running" }
-    $cond = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
-    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
-    return $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
-        Where-Object { $_.Current.Name -like "*$U_CLIENT*" } | Select-Object -First 1
+    # The client window may still be initializing right after launch; retry for ~20s.
+    for ($i = 1; $i -le 20; $i++) {
+        # the window can belong to any of the client processes (electron spawns children)
+        $pids = @(Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+        $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
+        foreach ($cp in $pids) {
+            $cond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
+            $cands = @($rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
+                       Where-Object { $_.Current.NativeWindowHandle -ne 0 })
+            # 主窗口是面积最大的那个；辅助/隐藏窗口（如 ...-siw）面积很小
+            $best = $null
+            $bestArea = 0
+            foreach ($c in $cands) {
+                $r = $c.Current.BoundingRectangle
+                if ($r.Width -lt 400 -or $r.Height -lt 300) { continue }
+                $area = $r.Width * $r.Height
+                if ($area -gt $bestArea) { $bestArea = $area; $best = $c }
+            }
+            if (-not $best) {
+                $best = $cands | Where-Object { $_.Current.Name -like "*$U_CLIENT*" } | Select-Object -First 1
+            }
+            if ($best) { return $best }
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "client window not ready"
 }
 
 function Invoke-El($el) {
@@ -93,6 +113,33 @@ if (-not $NoLaunch) {
         -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
     Write-Host "python pid=$($proc.Id) log=$log"
     Start-Sleep -Seconds $BootSeconds
+}
+
+# The client sometimes ends up with no visible main window (tray / crashed UI).
+# Start it when we cannot find one, and give it time to come up.
+function Test-ClientVisible {
+    $cpids = @(Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    if ($cpids.Count -eq 0) { return $false }
+    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
+    foreach ($cp in $cpids) {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
+        $w = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
+             Where-Object { $_.Current.BoundingRectangle.Width -gt 400 -and $_.Current.BoundingRectangle.Height -gt 300 }
+        if ($w) { return $true }
+    }
+    return $false
+}
+
+if (-not (Test-ClientVisible)) {
+    Write-Host "client window missing, starting the client..."
+    $exe = 'D:\' + (-join ([char]0x65E0,[char]0x4EBA,[char]0x7B97,[char]0x6CD5)) + '\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
+    if (Test-Path $exe) {
+        Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+        Start-Sleep -Seconds 18
+    } else {
+        Write-Host "!! client exe not found: $exe"
+    }
 }
 
 $win = Get-ClientWindow
