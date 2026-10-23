@@ -54,6 +54,14 @@ def find_slot(obs):
     return None
 
 
+def speed_cmd(v_meas, v_target):
+    """连续速度闭环：返回 (throttle, brake)，不同时非零。"""
+    err = v_target - abs(v_meas)
+    if err > 0:
+        return min(0.30, 0.03 + 0.15 * err), 0.0
+    return 0.0, min(0.65, -0.38 * err)
+
+
 def main() -> int:
     print("等待场景连接...")
     api = SceneAPI()
@@ -139,10 +147,8 @@ def main() -> int:
             if dyaw < HEADING_TOL_DEG:
                 phase = "straight"
                 print(f"车头已摆正(dyaw={dyaw:.1f}°)，回正倒直线")
-            vc = VehicleControl(gear=GearMode.REVERSE, throttle=REVERSE_SPEED, steering=1.0)
-            if abs(v) > 0.9:
-                vc.throttle, vc.brake = 0.0, 0.3
-            send(vc, dt)
+            thr, brk = speed_cmd(v, 0.80)
+            send(VehicleControl(gear=GearMode.REVERSE, throttle=thr, brake=brk, steering=1.0), dt)
 
         elif phase == "straight":
             # 分轴判据：深度（x）要进得够深，横向（y）不能偏，航向要正
@@ -158,14 +164,10 @@ def main() -> int:
                 # 直退的同时用陀螺仪修正朝向
                 err = wrap(heading_rad(slot.ori_z) - heading_rad(pose.ori_z))
                 steer = max(-0.4, min(0.4, 1.2 * err))
-                thr = min(REVERSE_SPEED, 0.02 + 0.035 * d_center)
-                vc = VehicleControl(gear=GearMode.REVERSE, throttle=thr, steering=steer)
-                # 不要在远处就龟速爬行，否则平台会提前判定驻车、车停得太浅
-                if abs(dx) < 0.30:
-                    vc.brake = 0.45
-                if abs(v) > 0.85:
-                    vc.throttle, vc.brake = 0.0, 0.4
-                send(vc, dt)
+                # 目标速度随剩余深度平滑衰减，全程连续，不点刹
+                vt = max(0.22, min(0.80, 1.1 * max(abs(dx) - 0.10, 0.0) + 0.22))
+                thr, brk = speed_cmd(v, vt)
+                send(VehicleControl(gear=GearMode.REVERSE, throttle=thr, brake=brk, steering=steer), dt)
 
         else:
             api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
