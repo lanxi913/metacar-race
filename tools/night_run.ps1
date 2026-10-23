@@ -21,7 +21,7 @@ $Scenes = @(
     @{ Title = "车辆停止";        Slug = "stop";              Arg = @("tools\stop_run.py") },
     @{ Title = "直角转弯";        Slug = "rightangleturn";    Arg = @("tools\track_bonus.py") },
     @{ Title = "u型弯";           Slug = "uxingwan";          Arg = @("tools\track_bonus.py", "--offset", "0.8") },
-    @{ Title = "连续转弯";        Slug = "lianxuzhuanwan";    Arg = @("tools\track_bonus.py", "--offset", "0.8") },
+    @{ Title = "连续转弯";        Slug = "lianxuzhuanwan";    Arg = @("tools\track_bonus.py", "--offset", "1.3", "--cruise", "3.4", "--nobrake") },
     @{ Title = "环形转弯";        Slug = "huanxingzhuanwan";  Arg = @("tools\track_bonus.py") },
     @{ Title = "匝道行驶";        Slug = "zadaoxingshi";      Arg = @("tools\track_bonus.py") },
     @{ Title = "限速行驶";        Slug = "xiansuxingshi";     Arg = @("tools\track_bonus.py") },

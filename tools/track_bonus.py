@@ -55,6 +55,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cruise", type=float, default=4.0)
     ap.add_argument("--offset", type=float, default=0.0)
+    ap.add_argument("--nobrake", action="store_true")
     args = ap.parse_args()
 
     print("等待场景连接...")
@@ -175,6 +176,14 @@ def main() -> int:
         if now - t0 < 3.0:
             thr = min(thr, 0.002 + 0.006 * (now - t0))
             brk = 0.0
+
+        # 可选：超速只松油门滑行，不踩刹车（避免负加速度违规）
+        if getattr(args, "nobrake", False):
+            if brk > 0:
+                brk = 0.0
+            if dist_left < 2.0 and v < 1.2:
+                brk = 0.05
+
         send(VehicleControl(gear=GearMode.DRIVE, throttle=thr, brake=brk, steering=steer))
 
         if now - last > 0.5:
