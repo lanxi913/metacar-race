@@ -27,7 +27,6 @@ $Scenes = @(
     @{ Title = "限速行驶";        Slug = "xiansuxingshi";     Arg = @("tools\track_bonus.py", "--offset", "0.8") },
     @{ Title = "车辆变道";        Slug = "cheliangbiandao";   Arg = @("tools\track_bonus.py", "--offset", "0.8") },
     @{ Title = "环岛驶入、驶出";  Slug = "huandaoshirushichu"; Arg = @("tools\track_bonus.py", "--offset", "1.0") },
-    @{ Title = "垂直车道泊车";    Slug = "chunzhichedaoboche"; Arg = @("tools\park_v8.py") }
 )
 
 function Close-Windows {
