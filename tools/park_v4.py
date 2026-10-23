@@ -57,9 +57,13 @@ def find_slot(obs):
 def speed_cmd(v_meas, v_target):
     """连续速度闭环：返回 (throttle, brake)，不同时非零。"""
     err = v_target - abs(v_meas)
+    if abs(err) < 0.06:
+        return 0.0, 0.0            # 死区：误差小就滑行，避免油门刹车来回切
     if err > 0:
-        return min(0.30, 0.03 + 0.15 * err), 0.0
-    return 0.0, min(0.65, -0.38 * err)
+        # 油门上限 0.16，实测对应约 3 m/s2
+        return min(0.16, 0.02 + 0.06 * err), 0.0
+    # 刹车上限 0.18，避免一脚下去 -7 m/s2
+    return 0.0, min(0.18, -0.10 * err)
 
 
 def main() -> int:
@@ -78,19 +82,20 @@ def main() -> int:
     v_prev = 0.0
     t_prev = t0
     accel = 0.0
+    peak_raw = 0.0
     lim = {"thr": 0.0, "brk": 0.0}
 
     def send(vc, dt):
         """油门/刹车限斜率，并用加速度反馈保护 |a| <= 5。"""
         thr, brk = vc.throttle, vc.brake
-        lim["thr"] += max(-0.04, min(0.04, thr - lim["thr"]))
-        lim["brk"] += max(-0.08, min(0.08, brk - lim["brk"]))
+        lim["thr"] += max(-0.012, min(0.012, thr - lim["thr"]))
+        lim["brk"] += max(-0.025, min(0.025, brk - lim["brk"]))
         lim["thr"] = max(0.0, min(1.0, lim["thr"]))
         lim["brk"] = max(0.0, min(1.0, lim["brk"]))
-        if accel > 4.0:
-            lim["thr"] = max(0.0, lim["thr"] - 0.04)
-        elif accel < -4.0:
-            lim["brk"] = max(0.0, lim["brk"] - 0.08)
+        if accel > 3.6:
+            lim["thr"] = max(0.0, lim["thr"] - 0.02)
+        elif accel < -3.6:
+            lim["brk"] = max(0.0, lim["brk"] - 0.04)
         vc.throttle, vc.brake = lim["thr"], lim["brk"]
         api.set_vehicle_control(vc)
 
@@ -98,11 +103,16 @@ def main() -> int:
         pose = msg.pose_gnss
         v = msg.main_vehicle.speed
         now = time.time()
-        dt = max(now - t_prev, 1e-3)
+        dt = min(0.10, max(now - t_prev, 0.02))
         t_prev = now
         a_raw = (v - v_prev) / dt
+        v_prev_ = v_prev
         v_prev = v
         accel = 0.9 * accel + 0.1 * max(-10.0, min(10.0, a_raw))
+        peak_raw = max(peak_raw, abs(a_raw))
+        if abs(a_raw) > 5.0:
+            print(f"!! 尖峰 |a|={abs(a_raw):5.1f}  phase={phase} dt={dt:.3f} "
+                  f"v_prev={v_prev_:+.2f} v={v:+.2f}")
 
         if slot is None:
             slot = find_slot(msg.obstacles)
@@ -172,6 +182,7 @@ def main() -> int:
         else:
             api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
             if now - hold_t > HOLD_SECONDS:
+                print(f"原始加速度峰值 {peak_raw:.2f} m/s2")
                 print(f"保持完成，用时 {now - t0:.1f}s，中心误差 {d_center:.2f} m，"
                       f"航向误差 {dyaw:.1f}°")
                 break
@@ -179,7 +190,8 @@ def main() -> int:
         if now - last > 0.5:
             last = now
             print(f"[{now - t0:5.1f}s] {phase:<8} pos=({pose.pos_x:7.2f},{pose.pos_y:7.2f}) "
-                  f"yaw={pose.ori_z:6.1f} v={v:5.2f} a={accel:+5.2f} d={d_center:5.2f} dyaw={dyaw:5.1f}")
+                  f"yaw={pose.ori_z:6.1f} v={v:5.2f} a_raw={a_raw:+6.2f} a={accel:+5.2f} "
+                  f"d={d_center:5.2f} dyaw={dyaw:5.1f}")
 
         if now - t0 > 90:
             print("超时")
