@@ -99,7 +99,20 @@ metacar-race/
 
 ---
 
-## 6. 实测跑分（车辆直行，满分 110）
+## 6. 正式场景模板
+
+| 场景 | 入口 | 最近验收 |
+|---|---|---|
+| 车辆停止 | `templates/stop/chang-kou/run.py` | 连续 3 次 110 |
+| 直角转弯 | `templates/rightturn/chang-kou/run.py` | 连续 3 次 110 |
+
+两个入口都遵循“先运行脚本、后在客户端启动场景”。参数说明和标定记录见
+[templates/README.md](templates/README.md)、[docs/stop-calibration.md](docs/stop-calibration.md)
+和 [docs/turn-calibration.md](docs/turn-calibration.md)。
+
+---
+
+## 7. 实测跑分（车辆直行，满分 110）
 
 | 跑法 | 用时 | 得分 | 说明 |
 |---|---|---|---|
@@ -122,7 +135,7 @@ metacar-race/
 
 5/5 满分，每次约 10 秒（时限 100 秒）。批量跑用 	ools/one_run.ps1。
 
-## 7. 常见坑（先看这里）
+## 8. 常见坑（先看这里）
 
 | 症状 | 原因 | 处理 |
 |---|---|---|
@@ -138,7 +151,7 @@ metacar-race/
 
 ---
 
-## 8. 相关资料
+## 9. 相关资料
 
 - [环境搭建（可复现）](docs/01-environment.md)
 - [赛题规则速查](docs/02-rules.md)
