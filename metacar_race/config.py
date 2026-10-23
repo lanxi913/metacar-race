@@ -66,3 +66,7 @@ STOP_SETTLE_SECONDS = 0.80       # 低速持续该时间后才锁存驻车
 STOP_HOLD_SECONDS = 5.0          # 题目要求停稳 5 s
 STOP_EXIT_GRACE_SECONDS = 1.0    # 停稳计时完成后再保持制动一段时间
 STOP_STEER_LOCK_DISTANCE_M = 2.5 # 终点附近回正，避免越过目标后继续打方向
+
+# ---- 直角转弯标定（feat/control-calibration）----
+TURN_THROTTLE_COMMAND = 0.01     # 与停车题相同，稳态约 4.78 m/s
+TURN_LOOKAHEAD_M = 3.0           # 匹配题目的 3 m 曲率，避免大前视切弯
