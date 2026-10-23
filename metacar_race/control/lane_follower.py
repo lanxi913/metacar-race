@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """车道级循迹 + 换道避让控制器（通用，不含任何写死坐标）
 
 2026-10-23 实测：场景元素 14「左侧车道超车」总得分 **110.00**
@@ -142,6 +142,7 @@ class LaneFollower:
         self.target_lane: int | None = None
         self.phase = "DRIVE"
         self.hold = 0.0
+        self.stall = 0.0
         self.t = 0.0
 
     def update(self, pose, speed: float, obstacles, dt: float) -> tuple[VehicleControl, dict]:
@@ -190,23 +191,41 @@ class LaneFollower:
         delta = math.atan2(2 * LANE_WHEELBASE * math.sin(alpha), ld)
         steer = max(-LANE_STEER_LIMIT, min(LANE_STEER_LIMIT, delta / MAX_STEER_RAD))
 
+        # 前车跟随：本车道前方 15 m 内有车就按净距限速（通用，不写死位置）
+        gap_ahead = 1e9
+        for o in obstacles:
+            if getattr(getattr(o, "type", None), "name", "") != "CAR":
+                continue
+            os_, oe = cur["path"].project(float(o.pos_x), float(o.pos_y))
+            if os_ > s and abs(oe) < cur["width"] / 2 + o.width / 2:
+                gap_ahead = min(gap_ahead, os_ - s - o.length / 2 - 2.0)
         # 速度规划
-        v_des = min(LANE_CRUISE_MS, math.sqrt(max(2 * LANE_ACCEL_MAX * max(rem - 1.5, 0.0), 0.0)))
+        v_des = min(LANE_CRUISE_MS, math.sqrt(max(2 * LANE_ACCEL_MAX * max(rem - 1.0, 0.0), 0.0)))
+        if gap_ahead < 15.0:
+            v_des = min(v_des, max(0.0, 0.45 * (gap_ahead - 3.0)))
         thr = brk = 0.0
         gear = GearMode.DRIVE
-        if rem <= 1.2:
+        if rem <= 0.8 and abs(speed) <= 0.05:
+            self.hold += dt
+            gear, brk = GearMode.PARKING, 0.10
+            self.phase = "HOLD"
+            if self.hold >= LANE_HOLD_SECONDS:
+                self.phase = "DONE"
+        elif rem <= 1.2:
             # 收尾轻刹到停，再保持 5 s（硬停会丢加速度分）
-            brk = self.ramp.brake(0.06)
-            if abs(speed) <= 0.05:
-                self.hold += dt
-                gear, brk = GearMode.PARKING, 0.10
-                self.phase = "HOLD"
-                if self.hold >= LANE_HOLD_SECONDS:
-                    self.phase = "DONE"
+            brk = self.ramp.brake(0.10)
+            self.phase = "STOP"
         elif speed > v_des + 0.25:
             brk = self.ramp.brake(0.10 if speed > v_des + 0.8 else 0.05)
         else:
             thr = self.ramp.throttle((v_des - speed) / 0.8)
+            # 破静摩擦：满舵低速会顶死，想走却不动就给连续油门
+            if abs(speed) < 0.12:
+                self.stall += dt
+                if self.stall > 0.8:
+                    thr = 0.010
+            else:
+                self.stall = 0.0
             self.phase = "DRIVE"
 
         return (VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer),
@@ -214,3 +233,4 @@ class LaneFollower:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
