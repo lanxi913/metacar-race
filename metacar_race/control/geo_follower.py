@@ -42,7 +42,7 @@ MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
 CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
 PLATEAU_EXIT_MS = 6.5       # m/s，超过它说明已越过低速挡位平台，可以撤 boost
 BRAKE_MAX = 0.02            # 刹车指令上限（0.12→13 m/s²，0.05→~8，0.02≈4~5 m/s²）
-THR_CAP = 0.12              # 油门硬上限：台阶标定 0.18 仍是 4.78 m/s，0.22 起跳挡/抖动
+THR_CAP = 0.105             # 油门硬上限：0.11 以上仿真会出现非线性弹跳（实测 14 m/s²）
 
 
 def wrap180(a: float) -> float:
@@ -160,6 +160,7 @@ class GeoFollower:
         self._lim_thr = 0.0
         self._lim_brk = 0.0
         self._v_prev = None            # 上一帧速度（加速度保护用）
+        self._a_lp = 0.0               # 实测加速度低通值（加速度闭环用）
         self._boost = 0.0               # 速度平台突破量（油门增量，自适应）
         self._v_hist = deque(maxlen=30)
         self._steer_lp = 0.0
@@ -383,19 +384,23 @@ class GeoFollower:
             thr_t = 0.0
             self._boost = 0.0
             brk_t = max(brk_t, 0.30 if v > V_RULE else 0.15)
-        # 加速度保护：|a|>4 时减油门（比赛要求 |a|≤5 才有 +10）
+        # ---- 实测加速度闭环（比赛 |a|≤5 是全局约束，必须用实测值反馈）----
         if self._v_prev is not None and dt > 0:
-            a_now = (v - self._v_prev) / dt
-            if a_now > A_LONG_MAX * 0.9:      # 超了就整帧收油，靠限斜率慢慢加回来
+            a_raw = (v - self._v_prev) / dt
+            # 一阶低通，压制单帧噪声
+            self._a_lp += (a_raw - self._a_lp) * min(1.0, dt / 0.08)
+            if self._a_lp > A_LONG_MAX * 0.8:        # 加速过猛 → 收油
                 thr_t = 0.0
-        # 起步 1 s 内油门从 0 平滑爬升：抑制仿真第一帧的速度跳变（|a| 尖峰）
-        if self.t < 0.5:
-            thr_t = min(thr_t, 0.002 + 0.02 * self.t)   # 轻起步 0.5 s 内到 0.012
+            elif self._a_lp < -A_LONG_MAX * 0.8:     # 减速过猛 → 松刹
+                brk_t = max(0.0, brk_t - 0.05)
+        # 起步 1.2 s 内油门只到 0.03：仿真从静止起步有一次性冲击，必须极轻给油
+        if self.t < 1.2:
+            thr_t = min(thr_t, 0.03 * (self.t / 1.2))
         # 油门硬上限：台阶标定显示 0.18 仍是 4.78 m/s，0.22 起会跳挡/抖动，
         # 一旦跳挡车速 4.78→13+，平台判「加速度高于允许上限」丢 +10
         thr_t = min(thr_t, THR_CAP)
-        # 油门小斜率限幅（平滑）；刹车直通（该刹就刹）
-        self._lim_thr += max(-0.02, min(0.02, thr_t - self._lim_thr))
+        # 油门斜率放慢到 0.008/帧：仿真在 ~0.11 油门处有非线性弹跳
+        self._lim_thr += max(-0.008, min(0.008, thr_t - self._lim_thr))
         self._lim_thr = max(0.0, min(1.0, self._lim_thr))
         self._lim_brk = max(0.0, min(1.0, brk_t))
         thr, brk = self._lim_thr, self._lim_brk
@@ -418,6 +423,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 
