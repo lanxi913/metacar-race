@@ -44,16 +44,16 @@ EGO_MARGIN_X = 0.0
 
 # ---------- 控制参数（速度层照抄 park_v8，垂直泊车 210 分那套）----------
 STAGE_THROTTLE = 0.14      # 巡航恒定油门（开环，不闭环追速度）
-SOFT_START_S = 3.0         # 起步前 2.5 s 油门封顶
+SOFT_START_S = 2.5
 SOFT_START_THR = 0.02
 A_DEC_PLAN = 0.8           # 刹车规划用的减速度基准
-V_REV = 0.55               # 倒车目标速度
+V_REV = 0.45               # 倒车目标速度
 STEER_SLEW = 0.12
-THR_SLEW = 0.0008
-BRK_SLEW = 0.0020
+THR_SLEW = 0.0015
+BRK_SLEW = 0.0040
 BRAKE_CAP = 0.06
-THR_MAX = 0.03
-BRK_MAX = 0.06
+THR_MAX = 0.10
+BRK_MAX = 0.10
 
 # 倒车级联
 K_YAW = 1.6
@@ -215,8 +215,22 @@ def speed_cmd(v_meas: float, v_target: float):
     if abs(err) < 0.06:
         return 0.0, 0.0
     if err > 0:
-        return min(THR_MAX, 0.004 + 0.020 * err), 0.0
-    return 0.0, min(BRK_MAX, 0.08 * (-err))
+        return min(THR_MAX, 0.01 + 0.04 * err), 0.0
+    return 0.0, min(BRK_MAX, -0.06 * err)
+
+
+def approach_cmd(v_meas: float, dist: float):
+    """park_v8 的接近段速度层，原样照抄：
+
+    20 m 外用恒定油门 0.14（车自己平滑加速到 4.78 m/s，一步跨过低速台阶带），
+    20 m 内用 a_req = v²/(2d) 反推所需减速度，换算成刹车量（封顶 0.10）。
+    """
+    if dist < 20.0 and v_meas > 0.30:
+        a_req = (v_meas * v_meas) / (2.0 * max(dist, 0.3))
+        brk = max(0.0, min(0.10, (a_req - 0.8) / 25.0))
+        if brk > 0.001:
+            return 0.0, brk
+    return STAGE_THROTTLE, 0.0
 
 
 def drive_to_point(v_meas: float, dist: float, thr_cruise: float = 0.02):
@@ -307,6 +321,10 @@ def main() -> int:
             geom = {"ux": math.cos(th), "uy": math.sin(th)}
             geom["vx"], geom["vy"] = -geom["uy"], geom["ux"]
             ego_l, ego_w = float(car.length), float(car.width)
+            try:
+                print(f"场景时限 {msg.scene_status.time_limit:.0f}s", flush=True)
+            except Exception:
+                pass
             print(f"车位 ({slot[0]:.2f},{slot[1]:.2f}) ori={slot[2]:.1f} "
                   f"{slot[3]:.2f}x{slot[4]:.2f}  自车 {ego_l:.2f}x{ego_w:.2f}", flush=True)
             planner = Planner(cars, ego_l, ego_w)
@@ -337,31 +355,18 @@ def main() -> int:
                 plan_holder["done"] = True
 
             threading.Thread(target=_work, daemon=True).start()
-            phase = "START"
+            phase = "CRUISE"
             continue
 
         ux, uy, vx, vy = geom["ux"], geom["uy"], geom["vx"], geom["vy"]
         du = (x - slot[0]) * ux + (y - slot[1]) * uy
         dv = (x - slot[0]) * vx + (y - slot[1]) * vy
 
-        # ---------------- 0) 起步：先驻车稳住，再用极小油门点起来 ----------------
-        if phase == "START":
-            if now - st["t0"] < 1.0:
-                send(GearMode.PARKING, 0.0, 1.0, 0.0)
-            elif abs(v) < 0.35:
-                send(GearMode.DRIVE, 0.005, 0.0, 0.0)
-            else:
-                phase = "CRUISE"
-                print(f"[{now - st['t0']:5.1f}s] 起步完成 v={v:.2f}", flush=True)
-            continue
 
         # ---------------- 1) 车道巡航到预置点 ----------------
         if phase == "CRUISE":
             remaining = math.hypot(stg[0] - x, stg[1] - y)
-            if remaining < 18.0:
-                thr, brk = drive_to_point(v, remaining)
-            else:
-                thr, brk = speed_cmd(v, 1.2)
+            thr, brk = approach_cmd(v, remaining)
             # 直线跟踪：目标点 = 预置点
             dx, dy = stg[0] - x, stg[1] - y
             th = heading_rad(yaw)
@@ -407,12 +412,7 @@ def main() -> int:
         if phase == "FWD":
             steer, fwd_idx = pp_steer(x, y, yaw, fwd_pts, fwd_idx, lookahead=1.8)
             remain_fwd = math.hypot(fwd_pts[-1].x - x, fwd_pts[-1].y - y)
-            # 只用 PWM 给油，绝不额外加大油门；只有"靠近终点且速度偏高"时才刹车
-            thr, brk = speed_cmd(v, 1.2)
-            if remain_fwd < 5.0 and v > 0.4:
-                _, brk2 = drive_to_point(v, remain_fwd, 0.0)
-                if brk2 > 0.001:
-                    thr, brk = 0.0, brk2
+            thr, brk = approach_cmd(v, remain_fwd)
             send(GearMode.DRIVE, thr, brk, steer)
             if now - last_log > 0.8:
                 last_log = now
@@ -485,6 +485,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
 
 
 
