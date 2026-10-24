@@ -66,12 +66,38 @@ def main() -> int:
                 last_sub = sub
                 print(f"  == 子场景切换：{sub} ==", flush=True)
 
-            want_park = PARK_KEYWORD in sub
+            # 泊车元素一开始就切会离车位太远（实测 180 m）；等进入车位附近再交给泊车控制器
+            slot_now = None
+            for o in msg.obstacles:
+                if getattr(getattr(o, "type", None), "value", None) == 30:
+                    slot_now = o
+                    break
+            near_slot = False
+            if slot_now is not None:
+                d_s = ((slot_now.pos_x - float(pose.pos_x)) ** 2 +
+                       (slot_now.pos_y - float(pose.pos_y)) ** 2) ** 0.5
+                near_slot = d_s < 8.0
+            # 只有开到车位口（<8 m）且路线基本走完时才交给泊车控制器，避免远距离倒车入场
+            want_park = (PARK_KEYWORD in sub) and near_slot and (geo.path.total - (geo._s_hint or 0.0)) < 12.0
             if want_park and mode != "PARK":
                 mode = "PARK"
                 park = VerticalPark()
-                print("  → 切入垂直泊车控制器（复用 park_v4 动作序列）", flush=True)
-            elif not want_park and mode != "ROUTE":
+                park._latched = True      # 进入泊车模式后不再切回循迹，避免模式抖动
+                slot_dbg = None
+                for o in msg.obstacles:
+                    if getattr(getattr(o, "type", None), "value", None) == 30:
+                        slot_dbg = o
+                        break
+                if slot_dbg is not None:
+                    d_slot = ((slot_dbg.pos_x - float(pose.pos_x)) ** 2 +
+                              (slot_dbg.pos_y - float(pose.pos_y)) ** 2) ** 0.5
+                    print(f"  → 切入垂直泊车：车位({float(slot_dbg.pos_x):.1f},{float(slot_dbg.pos_y):.1f}) "
+                          f"ori={float(slot_dbg.ori_z):.0f} 距车 {d_slot:.1f} m "
+                          f"车({float(pose.pos_x):.1f},{float(pose.pos_y):.1f}) 剩余路线 {geo.path.total - geo._s_hint if geo._s_hint else -1:.1f} m",
+                          flush=True)
+                else:
+                    print("  → 切入垂直泊车：当前没有 PARKING_SLOT 障碍物", flush=True)
+            elif not want_park and mode != "ROUTE" and not getattr(park, "_latched", False):
                 mode = "ROUTE"
                 print("  → 回到几何循迹", flush=True)
 
@@ -110,3 +136,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
