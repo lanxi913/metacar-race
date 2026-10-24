@@ -94,6 +94,8 @@ STALL_STEP_EVERY = 0.50
 
 STUCK_WINDOW_S = 4.0
 STUCK_MOVE_M = 0.30
+TELEPORT_MIN_M = 5.0     # 一帧位移超过它（且远超车速能走出的距离）就算平台瞬移
+IDX_GUARD_M = 40.0       # |pursuit.idx - 投影索引| 超过它就强行拉回，一帧自愈
 
 HOLD_END_S = 8.0
 
@@ -469,6 +471,20 @@ class Overtaker:
         self.v_hold = None
         self.last_block = None
 
+    def reset(self, t: float = 0.0) -> None:
+        """元素重开/平台瞬移后复位：回 CRUISE，横移与锁速全部清零。
+
+        平台把车拽回元素起点时，上一段的状态机残留（比如正在 PASS）会让车
+        带着 3.5 m 的横移找不存在的目标，这里必须一并清掉。
+        """
+        self.state = self.CRUISE
+        self.t_state = float(t)
+        self.lat_off = 0.0
+        self.from_off = 0.0
+        self.shift_dist = 0.0
+        self.v_hold = None
+        self.last_block = None
+
     # ---------------- 车道占用查询 ----------------
 
     @staticmethod
@@ -704,6 +720,8 @@ def main() -> int:
     t_end = time.time() + args.max_seconds
     ending = "ended"
     final = (0.0, 0.0, 0.0)
+    last_pose = None
+    restart_n = 0
 
     try:
         for frame, (msg, _frames) in enumerate(api.main_loop(), start=1):
@@ -718,6 +736,17 @@ def main() -> int:
                 last_shot = sim_t
                 save_shot(_frames, out_dir, "t%06.1f" % sim_t)
             final = (x, y, yaw)
+
+            # ---- 平台瞬移检测（元素超时重开 / 跳关 / 复位都表现为一帧内位移几十米）----
+            # 关键：PurePursuit.idx 只增不减，被拽回去以后前视点会留在几百米外，
+            # 横向误差对曲率的贡献趋近 0，转向输出恒 ~0.002，车会开环直行。
+            jump = 0.0
+            teleport = False
+            if last_pose is not None:
+                jump = math.hypot(x - last_pose[0], y - last_pose[1])
+                if jump > max(TELEPORT_MIN_M, 2.0 * abs(speed) * dt + 1.5):
+                    teleport = True
+            last_pose = (x, y)
 
             if sub and sub != cur_sub:
                 for k, sc in enumerate(static.sub_scenes, start=1):
@@ -753,12 +782,35 @@ def main() -> int:
                 phase = "cruise"
                 i_now = track.sync(x, y)
                 if pursuit is not None:
-                    pursuit.sync(x, y, max_jump_m=1.0)
+                    # 跳关=平台瞬移，索引必须拉回当前位置，否则前视点留在几百米外
+                    pursuit.idx = i_now
+                if stanley is not None:
+                    stanley.sync(x, y, max_jump_m=1e9)
                 print(f"进入 {sub}，位置 ({x:.2f},{y:.2f}) route_s={track.s[i_now]:.1f}",
                       flush=True)
 
             # ---- 定位 & 障碍 ----
             i_now = track.sync(x, y)
+            if teleport:
+                restart_n += 1
+                if pursuit is not None:
+                    pursuit.idx = i_now
+                if stanley is not None:
+                    stanley.sync(x, y, max_jump_m=1e9)
+                overtaker.reset(sim_t)
+                stall.extra = 0.0
+                stall.stall_t = 0.0
+                stall.step_t = 0.0
+                stall.active = False
+                stuck_watch.hist.clear()
+                emit("restart", s=round(float(track.s[i_now]), 1), jump=round(jump, 1),
+                     pos=[round(x, 2), round(y, 2)], n=restart_n)
+                print(f"[{sim_t:6.1f}s] 瞬移 {jump:8.1f} m → 重置跟踪 idx={i_now}",
+                      flush=True)
+            elif pursuit is not None and abs(pursuit.idx - i_now) > IDX_GUARD_M:
+                print(f"[{sim_t:6.1f}s] 跟踪索引漂移 pursuit.idx={pursuit.idx} → {i_now}",
+                      flush=True)
+                pursuit.idx = i_now
             block, obs_items = ObstacleScan.scan(
                 track, i_now, getattr(msg, "obstacles", None) or [])
             obs_n = len(obs_items)
