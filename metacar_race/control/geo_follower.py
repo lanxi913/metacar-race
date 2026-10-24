@@ -252,7 +252,7 @@ class GeoFollower:
             if v_req > v_cmd:
                 v_cmd = min(V_RULE, v_req)
             # 只跑到"够用"的 1.2 倍：既不超时也不触发高速挡位跳变（|a| 会爆）
-            v_cmd = min(v_cmd, max(v_req * 1.35, 5.0))
+            v_cmd = min(v_cmd, max(v_req * 1.15, 5.0))
         # 前车净距保护：安全距离 = 车身长 4 m + 2 m 余量
         if obstacles and self.lane_w:
             gap = None
@@ -410,6 +410,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 
