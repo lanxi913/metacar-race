@@ -415,7 +415,9 @@ class GeoFollower:
         # 油门斜率放慢到 0.008/帧：仿真在 ~0.11 油门处有非线性弹跳
         # 油门斜率 0.0015/帧（≈0.045/s）：仿真对油门台阶有阶跃响应，
         # 从 0 爬到 0.105 要 2.3 s，整个加速过程摊开，才不会出现 10+ m/s²
-        self._lim_thr += max(-0.0015, min(0.0015, thr_t - self._lim_thr))
+        # 变道期间油门斜率再减半：仿真在油门跨台阶时有一次弹跳，变道正好落在这个区间
+        slew = 0.0008 if abs(self.offset_target - self.offset) > 0.3 else 0.0015
+        self._lim_thr += max(-slew, min(slew, thr_t - self._lim_thr))
         self._lim_thr = max(0.0, min(1.0, self._lim_thr))
         self._lim_brk = max(0.0, min(1.0, brk_t))
         thr, brk = self._lim_thr, self._lim_brk
@@ -438,6 +440,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 
