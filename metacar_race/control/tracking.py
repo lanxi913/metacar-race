@@ -39,6 +39,26 @@ class PurePursuit:
     def reset(self):
         self.idx = 0
 
+    def sync(self, x: float, y: float, max_jump_m: float = 8.0) -> None:
+        """把索引对齐到车辆附近（跳关/重开后车辆被瞬移时必须调）。
+
+        只在当前索引点离车超过 max_jump_m 时才全局重搜，避免在相邻平行车道上跳错分支。
+        """
+        n = len(self.route)
+        if n == 0:
+            return
+        i = min(self.idx, n - 1)
+        p = self.route[i]
+        if math.hypot(p.x - x, p.y - y) <= max_jump_m:
+            return
+        best_i, best_d = 0, float("inf")
+        for k in range(n):
+            q = self.route[k]
+            d = math.hypot(q.x - x, q.y - y)
+            if d < best_d:
+                best_i, best_d = k, d
+        self.idx = best_i
+
     def _nearest(self, x: float, y: float):
         """在 [idx, idx+40] 窗口里找最近点，索引只许往前，不许回退。"""
         n = len(self.route)
@@ -96,9 +116,16 @@ class SpeedController:
     才能把 |a| 压在 5 m/s² 以内（场景元素加分项）。
     """
 
-    def __init__(self, v_target=TRACK_SPEED_MS, accel_limit=ACCEL_LIMIT_MS2):
+    def __init__(self, v_target=TRACK_SPEED_MS, accel_limit=ACCEL_LIMIT_MS2,
+                 throttle_max=0.40, kick_throttle=0.45, kick_time=0.40):
         self.v_target = float(v_target)
         self.accel_limit = float(accel_limit)
+        # 0.40 是老的单场景限速（约 17.2 km/h）。要跑到 8 m/s 必须放开，交给加速度闭环兜住。
+        self.throttle_max = float(throttle_max)
+        # 升挡 kick 的强度：顶满油门 0.8 s 会把车速直接甩到 14.3 m/s（实测 20261024-131247），
+        # 只能给到刚好触发换挡的量。
+        self.kick_throttle = float(kick_throttle)
+        self.kick_time = float(kick_time)
         self.v_cmd = 0.0          # 当前允许的速度指令（带斜坡）
         self._throttle = 0.0
         self._brake = 0.0
@@ -142,15 +169,17 @@ class SpeedController:
         # 5) 需要加速 -> 用加速度误差积分油门，刹车间隙释放
         else:
             self._throttle += max(-0.03, min(0.03, 0.03 * (a_des - self._a_f)))
-            # 全油门约 10 m/s²，这里限制到 0.40 把加速度压在 5 以内
-            self._throttle = max(0.0, min(0.40, self._throttle))
+            # 全油门约 10 m/s²，这里限制油门把加速度压在 5 以内
+            self._throttle = max(0.0, min(self.throttle_max, self._throttle))
             brake_cmd = 0.0
 
         # 5.5) 升挡 kick：低挡位下油门再大也上不去（实测卡 17.2 km/h），
-        #      需要短暂顶满油门触发换挡，再回落到闭环。
+        #      需要短暂给一脚油门触发换挡，再回落到闭环。
+        #      20261024-131247 那次 1.0 油门顶 0.8 s，车速从 4.77 甩到 14.28 m/s，
+        #      直接把直角转弯的加速度奖励打没了，所以强度和时长都要收。
         if self._kick_left > 0.0:
             self._kick_left -= dt
-            self._throttle = 1.0
+            self._throttle = self.kick_throttle
             self._brake = 0.0
             self._stuck_t = 0.0
             return self._throttle, self._brake
@@ -162,7 +191,7 @@ class SpeedController:
             else:
                 self._stuck_t = 0.0
             if self._stuck_t > 0.8:
-                self._kick_left = 0.8
+                self._kick_left = self.kick_time
                 self._stuck_t = 0.0
         else:
             self._stuck_t = 0.0
@@ -191,4 +220,53 @@ def distance_left(route, x, y, from_idx=0) -> float:
         a, b = route[i], route[i + 1]
         total += math.hypot(b.x - a.x, b.y - a.y)
     return total + best_d
+
+
+class OutputLimiter:
+    """油门/刹车的最后一道闸：按帧限幅 + 软起步。
+
+    平台的车辆模型对油门是「往稳态速度快跟随」：油门从 0 跳到 0.11，车速一帧就
+    涨 0.52 m/s（≈15.7 m/s²，见 logs/collect/20261024-131247 起步段）。加速度闭环
+    只管指令，压不住这个台阶，必须再限制**输出**的变化率。
+
+    这两个速率抄自已拿满分的 tools/park_v8.py（垂直泊车 200 分），那边实测 1 s
+    窗口加速度峰值 < 1 m/s²。收油比给油快（thr_down_step），否则从 0.85 收到 0
+    要 19 s，刹不住车。
+    """
+
+    def __init__(self, thr_step=0.0015, thr_down_step=0.006, brk_step=0.004,
+                 soft_start_seconds=2.5, soft_start_throttle=0.02):
+        self.thr_step = float(thr_step)
+        self.thr_down_step = float(thr_down_step)
+        self.brk_step = float(brk_step)
+        self.soft_start_seconds = float(soft_start_seconds)
+        self.soft_start_throttle = float(soft_start_throttle)
+        self._thr = 0.0
+        self._brk = 0.0
+        self._t0 = None
+
+    def reset(self, t0=None):
+        self._thr = 0.0
+        self._brk = 0.0
+        self._t0 = t0
+
+    def soft_start(self, now=None) -> bool:
+        """起步阶段：油门不许超过 soft_start_throttle。"""
+        if self._t0 is None or now is None:
+            return False
+        return 0.0 <= now - self._t0 < self.soft_start_seconds
+
+    def apply(self, throttle, brake, now=None):
+        thr = max(0.0, min(1.0, throttle))
+        brk = max(0.0, min(1.0, brake))
+        if self.soft_start(now):
+            thr = min(thr, self.soft_start_throttle)
+
+        delta = thr - self._thr
+        step = self.thr_step if delta > 0 else self.thr_down_step
+        self._thr += max(-step, min(step, delta))
+        self._brk += max(-self.brk_step, min(self.brk_step, brk - self._brk))
+        self._thr = max(0.0, min(1.0, self._thr))
+        self._brk = max(0.0, min(1.0, self._brk))
+        return self._thr, self._brk
 
