@@ -34,7 +34,7 @@ STEER_CMD = 0.75            # 打舵量（满舵会顶静摩擦，0.75 是平地
 V_APPROACH = 2.60           # 对位段目标速度 m/s
 V_REVERSE = 0.75            # 倒车目标速度 m/s
 LOOKAHEAD = 0.9             # 倒车纯跟踪前视距离 m（小一点才贴得住圆弧）
-STAGE_MARGIN = 0.60         # staging 相对远端车中心往外的余量
+STAGE_MARGIN = -3.00        # staging 往后再退 3 m：给两段圆弧留够横移距离
 STAGE_SHIFT = -1.67        # 实测两段弧会多走 2.27 m，把 staging 前移同样的量抵消
 CT_GAIN = 0.35              # 横向误差反馈增益（1/m 量纲）
 
@@ -226,10 +226,14 @@ class SlotReverseParker:
             steer = max(-1.0, min(1.0, ff + CT_GAIN * e_ct))
             # 靠近车位中心就减速，并在 0.45 m 内停住（不再依赖"走到路径末端"）
             dist = math.hypot(dx, dy)
-            v_target = 0.35 if dist < 1.6 else V_REVERSE
+            # 终点减速剖面：把"停在车位中心"当成终点处理，
+            # v = sqrt(2·a·剩余距离)，避免 1.5 m/s 冲进去后刹不住
+            rem_c = max(-dy - 0.08, 0.0) if dy < 0 else 0.0
+            v_target = min(V_REVERSE, math.sqrt(2.0 * 0.35 * rem_c) + 0.08)
             # 必须走完两段圆弧（best_i >= b2）才允许进精细对位，
             # 否则会在圆弧没走完时被截断，横向少走 1 m 以上
-            if best_i >= b2 and dist < 1.5 and yaw_err < 20.0:
+            # 冲过车位中心（dy>0.10）也要立刻交给精细对位，别继续往里挤
+            if (dist < 1.5 or dy > 0.10) and yaw_err < 30.0:
                 self.phase = "FINE"          # 最后 1.5 m 交给精细对位
                 self.hold = 0.0
                 return (VehicleControl(gear=GearMode.DRIVE, brake=0.25),
@@ -332,6 +336,10 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
+
+
 
 
 
