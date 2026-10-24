@@ -347,7 +347,8 @@ def parse_args() -> argparse.Namespace:
                         help="park 模式进车位前先往路的另一侧借位多少米（会被双黄线余量卡住）")
     parser.add_argument("--park-engage", type=float, default=30.0,
                         help="看到车位且对位点距离小于该值时接管倒车入库（0=一看到就接管）")
-    parser.add_argument("--park-hold", type=float, default=5.0, help="入库后保持驻车秒数")
+    parser.add_argument("--park-hold", type=float, default=8.0,
+                        help="入库后保持驻车秒数（平台要 5 s，多留 3 s 余量）")
     parser.add_argument("--detail", action="store_true", help="额外写逐帧完整消息 frames_detail.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="输出目录（默认 logs\\collect\\<时间戳>）")
     parser.add_argument("--max-wall", type=float, default=3600.0, help="墙钟保护上限 s")
@@ -572,7 +573,9 @@ def main() -> int:
                     last_park_phase = park.phase
                     emit("park_phase", phase=park.phase, sim_t=round(sim_t, 3),
                          d_stage=round(park.d_stage, 2), a_long=round(park.a_long, 2),
-                         a_lat=round(park.a_lat, 2))
+                         a_lat=round(park.a_lat, 2),
+                         goal_dist=(round(park.goal_dist, 2)
+                                    if park.goal_dist < 1e9 else None))
                 vc = VehicleControl(gear=cmd_gear, throttle=cmd_throttle,
                                     brake=cmd_brake, steering=cmd_steer)
             else:
@@ -584,6 +587,14 @@ def main() -> int:
                 # 双黄线的实际距离决定，不会压线。
                 off_x = off_y = 0.0
                 slot_now = find_slot(msg.obstacles) if (args.mode == "park" and in_park_elem) else None
+                # 平台的「停车检查点」：静态元素终点。泊车元素不把车开到这个点上
+                # 就不得分（实测停在车位中心、离它 0.40 m，200 分直接没了）。
+                park_goal = None
+                if in_park_elem:
+                    for sub in static.sub_scenes:
+                        if sub.name == current_sub and sub.end_point is not None:
+                            park_goal = (float(sub.end_point.x), float(sub.end_point.y))
+                            break
                 if slot_now is not None and args.park_shift > 0 and proj["idx"] >= 1:
                     i = proj["idx"]
                     j = min(i + 1, projector.n - 1)
@@ -626,7 +637,14 @@ def main() -> int:
                     else:
                         park_hold = True
                 if args.mode == "park" and in_park_elem:
-                    v_tgt = min(v_tgt, args.park_speed)
+                    # 只在「车位已经不远」或「快到最后 45 m」时限速。从元素起点就压到
+                    # 2 m/s 会把 180 m 拉成 90 s（实测垂直泊车元素 121 s / 200 s）。
+                    park_end_s = sub_ranges.get(current_sub, (-1, 0.0, 0.0))[2]
+                    slot_near = (slot_now is not None
+                                 and math.hypot(slot_now.pos_x - pose.pos_x,
+                                                slot_now.pos_y - pose.pos_y) < 60.0)
+                    if slot_near or proj["s"] > park_end_s - 45.0:
+                        v_tgt = min(v_tgt, args.park_speed)
                 speed_ctl.v_target = v_tgt
                 cmd_throttle, cmd_brake = speed_ctl.update(
                     speed, dt_ctl, a_now=accel_f, allow_kick=args.kick)
@@ -640,7 +658,8 @@ def main() -> int:
                 if slot_now is not None and park is None and not park_hold:
                     slot = slot_now
                     if slot is not None:
-                        candidate = ReversePark(hold_seconds=args.park_hold)
+                        candidate = ReversePark(hold_seconds=args.park_hold,
+                                                goal=park_goal)
                         info0 = candidate.begin(
                             pose.pos_x, pose.pos_y, pose.ori_z, slot, now)
                         near = args.park_engage <= 0 or info0["d_stage"] <= args.park_engage
@@ -654,6 +673,8 @@ def main() -> int:
                                  stage_x=round(info0["stage_x"], 2),
                                  stage_y=round(info0["stage_y"], 2),
                                  d_stage=round(info0["d_stage"], 2),
+                                 goal_x=round(park_goal[0], 2) if park_goal else None,
+                                 goal_y=round(park_goal[1], 2) if park_goal else None,
                                  shift=round(shift_used, 2))
             if park_hold:
                 cmd_throttle = 0.0

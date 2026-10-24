@@ -31,6 +31,9 @@ STOP_LAT_TOL = 0.15            # 横向容差（只用于日志判定）
 HOLD_SECONDS = 5.0             # 连续场景要求停稳保持 5 s
 ARC_TOL_RAD = math.radians(2.0)
 TIMEOUT_SECONDS = 120.0
+GOAL_TOL = 0.08                # 距「停车检查点」多近算到位（平台 end_point）
+GOAL_MAX_OFFSET = 1.50         # 检查点离车位中心超过这个距离就不当停车点用
+GOAL_MAX_LATERAL = 0.60
 
 
 def wrap(angle: float) -> float:
@@ -73,10 +76,17 @@ class ReversePark:
     """倒车入库：approach → stop → arc → straight → hold。"""
 
     def __init__(self, radius=DEFAULT_RADIUS, hold_seconds=HOLD_SECONDS,
-                 timeout=TIMEOUT_SECONDS):
+                 timeout=TIMEOUT_SECONDS, goal=None, goal_tol=GOAL_TOL):
         self.radius = float(radius)
         self.hold_seconds = float(hold_seconds)
         self.timeout = float(timeout)
+        # 平台给的「停车检查点」（static.sub_scenes[i].end_point）。车必须停到这
+        # 个点上，元素才算完成——20261024-133827 那次停在车位中心，离检查点
+        # 0.40 m，垂直泊车直接 0 分，430 分里少了 200。
+        self.goal = None if goal is None else (float(goal[0]), float(goal[1]))
+        self.goal_tol = float(goal_tol)
+        self.goal_dist = float("inf")
+        self.goal_a_long = 0.0
         self.phase = "approach"
         self.done = False
         self.slot = None
@@ -109,6 +119,14 @@ class ReversePark:
         self.stage = (sx + ux * self.radius + vx * stage_lat,
                       sy + uy * self.radius + vy * stage_lat)
         self.frame = dict(ux=ux, uy=uy, vx=vx, vy=vy, side=side, th=th)
+        # 检查点必须落在车位轴线附近（平台给的就是车位里那个点，实测离中心 0.40 m）。
+        # 离得太远的「检查点」不是停车点（比如元素终点在本段路口），按车位中心停。
+        if self.goal is not None:
+            ga = (self.goal[0] - sx) * ux + (self.goal[1] - sy) * uy
+            gb = (self.goal[0] - sx) * vx + (self.goal[1] - sy) * vy
+            self.goal_a_long = ga
+            if abs(ga) > GOAL_MAX_OFFSET or abs(gb) > GOAL_MAX_LATERAL:
+                self.goal = None
         self.t_begin = float(now)
         self.phase = "approach"
         self.done = False
@@ -202,12 +220,22 @@ class ReversePark:
                     self.lat_sign = -self.lat_sign
                 self._lat_prev, self._lat_check_t = a_lat, now
 
-            if abs(a_long) < STOP_LONG_TOL or a_long < -0.45:
+            if self.goal is not None:
+                # 有检查点时一路倒到检查点上，不能停在车位中心
+                gd = math.hypot(self.goal[0] - x, self.goal[1] - y)
+                self.goal_dist = gd
+                if gd <= self.goal_tol or a_long < -1.20:
+                    self.phase = "hold"
+                    self.t_hold = float(now)
+                    return "parking", 0.0, 0.35, 0.0
+            elif abs(a_long) < STOP_LONG_TOL or a_long < -0.45:
                 self.phase = "hold"
                 self.t_hold = float(now)
                 return "parking", 0.0, 0.35, 0.0
 
             vt = max(0.15, min(0.80, 1.1 * max(abs(a_long) - 0.10, 0.0) + 0.22))
+            if self.goal is not None and self.goal_dist < 3.0:
+                vt = min(vt, max(0.08, 0.9 * self.goal_dist))
             thr, brk = speed_cmd(v, vt)
             steer = max(-0.45, min(0.45, 1.6 * heading_err + self.lat_sign * 0.5 * a_lat))
             return "reverse", thr, brk, steer
