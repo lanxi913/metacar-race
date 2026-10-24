@@ -55,6 +55,7 @@ class AdaptiveCruise:
         self.state = "ramp"
         self._v_hist = []
         self._flat_t = 0.0
+        self._ramp_t = 0.0
         self.calibrated_thr = None
         self.calibrated_v = None
 
@@ -110,7 +111,10 @@ class AdaptiveCruise:
                     self._flat_t += dt
                 else:
                     self._flat_t = 0.0
-            if self._flat_t >= self.plateau_hold:
+            self._ramp_t += dt
+            # 兜底：场景里有拐弯/变化时平台检测可能触发不了，
+            # 上爬超过 6 s 就按当前油门锁定，避免一路加到 1.0 触发升挡
+            if self._flat_t >= self.plateau_hold or self._ramp_t > 6.0:
                 self.calibrated_thr = self.thr
                 self.calibrated_v = v
                 self.state = "cruise"

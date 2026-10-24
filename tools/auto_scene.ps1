@@ -63,13 +63,24 @@ function Stop-Leftovers {
 }
 
 function Get-ClientWindow {
-    $cp = (Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -First 1).Id
-    if (-not $cp) { throw "client not running" }
-    $cond = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
-    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
-    return $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
-        Where-Object { $_.Current.Name -like "*$U_CLIENT*" } | Select-Object -First 1
+    # 主窗口有时不在 UIA 顶层枚举里（被隐藏/最小化），用进程的 MainWindowHandle 直接取，
+    # 并且必须先 restore + 置前，否则 UIA 树里是 0 个后代节点。
+    for ($i = 1; $i -le 20; $i++) {
+        $p = Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue |
+             Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+        if ($p) {
+            $h = [IntPtr]$p.MainWindowHandle
+            [void][Win]::ShowWindow($h, 9)
+            [void][Win]::SetForegroundWindow($h)
+            Start-Sleep -Milliseconds 1200
+            $el = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+            $kids = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                                [System.Windows.Automation.Condition]::TrueCondition)
+            if ($kids.Count -gt 5) { return $el }
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "client window not ready"
 }
 
 function Invoke-El($el) {
@@ -93,6 +104,33 @@ if (-not $NoLaunch) {
         -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
     Write-Host "python pid=$($proc.Id) log=$log"
     Start-Sleep -Seconds $BootSeconds
+}
+
+# The client sometimes ends up with no visible main window (tray / crashed UI).
+# Start it when we cannot find one, and give it time to come up.
+function Test-ClientVisible {
+    $cpids = @(Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    if ($cpids.Count -eq 0) { return $false }
+    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
+    foreach ($cp in $cpids) {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
+        $w = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
+             Where-Object { $_.Current.BoundingRectangle.Width -gt 400 -and $_.Current.BoundingRectangle.Height -gt 300 }
+        if ($w) { return $true }
+    }
+    return $false
+}
+
+if (-not (Test-ClientVisible)) {
+    Write-Host "client window missing, starting the client..."
+    $exe = 'D:\' + (-join ([char]0x65E0,[char]0x4EBA,[char]0x7B97,[char]0x6CD5)) + '\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
+    if (Test-Path $exe) {
+        Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+        Start-Sleep -Seconds 18
+    } else {
+        Write-Host "!! client exe not found: $exe"
+    }
 }
 
 $win = Get-ClientWindow
