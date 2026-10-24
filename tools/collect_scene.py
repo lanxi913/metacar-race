@@ -87,6 +87,8 @@ FRAME_FIELDS = [
     "route_idx", "route_s", "route_len", "lat_err", "head_err",
     "dist_route_end", "dist_sub_end",
     "obs_count", "obs_dyn_count", "obs_min_dist", "obs_min_id", "obs_min_type",
+    "slot_id", "slot_du", "slot_dv", "slot_dist", "slot_ori_err",
+    "slot_margin", "slot_inside",
     "tl_count",
 ]
 
@@ -104,6 +106,57 @@ def wrap_deg(angle: float) -> float:
     while angle < -180.0:
         angle += 360.0
     return angle
+
+
+def slot_axes(slot) -> tuple[float, float, float, float]:
+    """车位长轴 u 与横向 v 的单位向量（与 reverse_park 约定一致）。"""
+    th = math.radians(-float(slot.ori_z))
+    ux, uy = math.cos(th), math.sin(th)
+    return ux, uy, -uy, ux
+
+
+def ego_corners(x: float, y: float, yaw_deg: float, length: float, width: float):
+    """按车辆中心、航向、长宽算出车身四角（世界坐标）。"""
+    yaw = math.radians(-yaw_deg)
+    c, s = math.cos(yaw), math.sin(yaw)
+    hl, hw = length / 2.0, width / 2.0
+    return [
+        (x + dl * c - dw * s, y + dl * s + dw * c)
+        for dl, dw in ((hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw))
+    ]
+
+
+def slot_metrics(pose, slot, length: float, width: float) -> dict:
+    """车身相对车位的量。
+
+    du/dv  -- 车中心在车位坐标系里的纵向/横向偏移（m）
+    margin -- 车身矩形完全落在车位框内时为正（= 最紧的那条边的余量），压线或出界为负
+    inside -- margin >= 0，即四角都在车位框内、没有压库边线
+    """
+    ux, uy, vx, vy = slot_axes(slot)
+    sx, sy = float(slot.pos_x), float(slot.pos_y)
+    half_len = float(slot.length) / 2.0
+    half_wid = float(slot.width) / 2.0
+    du = (pose.pos_x - sx) * ux + (pose.pos_y - sy) * uy
+    dv = (pose.pos_x - sx) * vx + (pose.pos_y - sy) * vy
+    corners = ego_corners(pose.pos_x, pose.pos_y, pose.ori_z, length, width)
+    cu = [(cx - sx) * ux + (cy - sy) * uy for cx, cy in corners]
+    cv = [(cx - sx) * vx + (cy - sy) * vy for cx, cy in corners]
+    overflow = max(
+        max(cu) - half_len,
+        -half_len - min(cu),
+        max(cv) - half_wid,
+        -half_wid - min(cv),
+    )
+    return {
+        "du": du,
+        "dv": dv,
+        "dist": math.hypot(du, dv),
+        "ori_err": wrap_deg(float(pose.ori_z) - float(slot.ori_z)),
+        "margin": -overflow,
+        "inside": overflow <= 0.0,
+        "corners": corners,
+    }
 
 
 def git_info(repo: Path) -> dict:
@@ -434,8 +487,19 @@ def main() -> int:
 
     events_fh = (out_dir / "events.jsonl").open("w", encoding="utf-8")
     detail_fh = (out_dir / "frames_detail.jsonl").open("w", encoding="utf-8") if args.detail else None
+    # 车位/库边线相关的数据在 park 模式与 --park-probe 下都要留，之前一次都没存过
+    record_slot = args.park_probe or args.mode == "park"
     obs_fh = ((out_dir / "obstacles.jsonl").open("w", encoding="utf-8")
-              if args.park_probe else None)
+              if record_slot else None)
+    slots_fh = ((out_dir / "slots.jsonl").open("w", encoding="utf-8")
+                if record_slot else None)
+    corners_fh = ((out_dir / "corners.csv").open("w", newline="", encoding="utf-8-sig")
+                  if record_slot else None)
+    corners_csv = None
+    if corners_fh is not None:
+        corners_csv = csv.writer(corners_fh)
+        corners_csv.writerow(["frame", "sim_t", "corner", "x", "y"])
+    prev_slot_key = None
 
     def emit(kind: str, **payload) -> None:
         events_fh.write(json.dumps(
@@ -746,9 +810,12 @@ def main() -> int:
             # ---- 障碍物 / 红绿灯 ----
             nearest_dist, nearest_id, nearest_type = float("inf"), -1, ""
             dyn_count = 0
+            slot_any = None
             obstacle_keys: set[tuple[int, int]] = set()
             for obs in msg.obstacles:
                 obstacle_keys.add((int(obs.id), int(obs.type.value)))
+                if slot_any is None and int(obs.type.value) == 30:  # PARKING_SLOT
+                    slot_any = obs
                 if abs(obs.vel_x) + abs(obs.vel_y) > 0.3:
                     dyn_count += 1
                 dist = math.hypot(obs.pos_x - pose.pos_x, obs.pos_y - pose.pos_y)
@@ -764,7 +831,8 @@ def main() -> int:
                          total=len(obstacle_keys))
                 prev_obstacles = obstacle_keys
 
-            if obs_fh is not None and current_sub and "泊车" in current_sub:
+            if obs_fh is not None and (
+                    (current_sub and "泊车" in current_sub) or slot_any is not None):
                 obs_fh.write(json.dumps({
                     "sim_t": round(sim_t, 3),
                     "ego": [round(pose.pos_x, 3), round(pose.pos_y, 3), round(pose.ori_z, 3),
@@ -779,6 +847,50 @@ def main() -> int:
                     } for o in msg.obstacles],
                 }, ensure_ascii=False) + "\n")
                 obs_fh.flush()
+
+            # ---- 车位与库边线：车位一出现就落盘，逐帧记车身四角与压线余量 ----
+            if slot_any is not None and slots_fh is not None:
+                key = (int(slot_any.id), round(float(slot_any.pos_x), 3),
+                       round(float(slot_any.pos_y), 3), round(float(slot_any.ori_z), 2))
+                if key != prev_slot_key:
+                    prev_slot_key = key
+                    ux, uy, vx, vy = slot_axes(slot_any)
+                    sx, sy = float(slot_any.pos_x), float(slot_any.pos_y)
+                    hl, hw = float(slot_any.length) / 2.0, float(slot_any.width) / 2.0
+                    corners = [(sx + dl * ux + dw * vx, sy + dl * uy + dw * vy)
+                               for dl, dw in ((hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw))]
+                    slots_fh.write(json.dumps({
+                        "sim_t": round(sim_t, 3),
+                        "id": int(slot_any.id),
+                        "x": round(sx, 3), "y": round(sy, 3), "z": round(float(slot_any.pos_z), 3),
+                        "ori_z": round(float(slot_any.ori_z), 3),
+                        "len": round(float(slot_any.length), 3),
+                        "wid": round(float(slot_any.width), 3),
+                        "extra": slot_any.extra_info,
+                        "corners": [[round(x, 3), round(y, 3)] for x, y in corners],
+                        "sub_scene": current_sub,
+                    }, ensure_ascii=False) + "\n")
+                    slots_fh.flush()
+                    emit("slot_found", sim_t=round(sim_t, 3), slot_id=int(slot_any.id),
+                         slot_center=[round(sx, 3), round(sy, 3)],
+                         slot_ori=round(float(slot_any.ori_z), 2),
+                         slot_size=[round(float(slot_any.length), 3),
+                                    round(float(slot_any.width), 3)],
+                         slot_corners=[[round(x, 3), round(y, 3)] for x, y in corners])
+
+            ego_len = float(car.length) or 4.814
+            ego_wid = float(car.width) or 2.180
+            slot_met = None
+            if slot_any is not None:
+                slot_met = slot_metrics(pose, slot_any, ego_len, ego_wid)
+                if corners_csv is not None and slot_met["dist"] <= 35.0:
+                    corners_csv.writerow([frame_no, f3(sim_t, 3), "center",
+                                          f3(pose.pos_x, 3), f3(pose.pos_y, 3)])
+                    for idx, (cx, cy) in enumerate(slot_met["corners"]):
+                        corners_csv.writerow([frame_no, f3(sim_t, 3), f"c{idx}",
+                                              f3(cx, 3), f3(cy, 3)])
+                    if frame_no % 10 == 0:
+                        corners_fh.flush()
 
             light_state: dict[str, str] = {}
             for group in msg.traffic_light_groups:
@@ -849,6 +961,13 @@ def main() -> int:
                 "obs_min_dist": f3(nearest_dist, 2) if nearest_dist < float("inf") else "",
                 "obs_min_id": nearest_id if nearest_id >= 0 else "",
                 "obs_min_type": nearest_type,
+                "slot_id": int(slot_any.id) if slot_any is not None else "",
+                "slot_du": f3(slot_met["du"], 3) if slot_met else "",
+                "slot_dv": f3(slot_met["dv"], 3) if slot_met else "",
+                "slot_dist": f3(slot_met["dist"], 3) if slot_met else "",
+                "slot_ori_err": f3(slot_met["ori_err"], 2) if slot_met else "",
+                "slot_margin": f3(slot_met["margin"], 3) if slot_met else "",
+                "slot_inside": (1 if slot_met["inside"] else 0) if slot_met else "",
                 "tl_count": len(msg.traffic_light_groups),
             })
             if frame_no % 10 == 0:
@@ -902,6 +1021,10 @@ def main() -> int:
             detail_fh.close()
         if obs_fh is not None:
             obs_fh.close()
+        if slots_fh is not None:
+            slots_fh.close()
+        if corners_fh is not None:
+            corners_fh.close()
 
     summary = {
         "stop_reason": stop_reason,
