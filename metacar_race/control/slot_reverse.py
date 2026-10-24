@@ -70,6 +70,7 @@ class SlotReverseParker:
         self.lane_x: float | None = None
         self.breaks: list[int] = [0, 0, 0]
         self.stuck = 0.0
+        self.fine_t = 0.0
 
     # ---------- 场景解析 ----------
     def _parse(self, obstacles, x: float) -> None:
@@ -209,9 +210,12 @@ class SlotReverseParker:
             # 靠近车位中心就减速，并在 0.45 m 内停住（不再依赖"走到路径末端"）
             dist = math.hypot(dx, dy)
             v_target = 0.35 if dist < 1.6 else V_REVERSE
-            if dist < 0.60 and yaw_err < 15.0:
-                self.phase = "SETTLE"
+            # 只有航向已经大致对上（<20°）才进精细对位，否则继续走圆弧
+            if dist < 1.5 and yaw_err < 20.0:
+                self.phase = "FINE"          # 最后 1.5 m 交给精细对位
                 self.hold = 0.0
+                return (VehicleControl(gear=GearMode.DRIVE, brake=0.25),
+                        SlotInfo("FINE", dx, dy, yaw_err, 1.0))
             elif abs(speed) > V_REVERSE + 0.30:
                 return (VehicleControl(gear=GearMode.REVERSE, brake=0.15, steering=steer),
                         SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
@@ -240,6 +244,35 @@ class SlotReverseParker:
                                    steering=steer),
                     SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
 
+        # ---- FINE：最后 1.5 m 的精细对位 ----
+        # 目标：沿车位轴向前后挪，同时用航向把横向误差压到 0；蠕行 0.12 m/s
+        if self.phase == "FINE":
+            self.fine_t += dt
+            dist = math.hypot(dx, dy)
+            if (dist < 0.30 and yaw_err < 8.0) or self.fine_t > 14.0:
+                self.phase = "SETTLE"
+                self.hold = 0.0
+                return (VehicleControl(gear=GearMode.DRIVE, brake=0.30),
+                        SlotInfo("SETTLE", dx, dy, yaw_err, 1.0))
+            # 期望航向：横向偏 +x 就朝 -x 侧偏一点（前进时 yaw<90 会往 -x 走）
+            yaw_des = syaw - max(-8.0, min(8.0, 12.0 * dx))   # 只允许小幅偏航修横向，最终仍回到车位朝向
+            yaw_e = wrap180(yaw_des - yaw)
+            gear = GearMode.DRIVE if dy > 0.05 else GearMode.REVERSE
+            # 前进行驶：+steer 增大 yaw；倒车时相反
+            steer = max(-0.7, min(0.7, (0.04 * yaw_e) * (1 if gear is GearMode.DRIVE else -1)))
+            if abs(speed) > 0.30:
+                return (VehicleControl(gear=gear, brake=0.20, steering=steer),
+                        SlotInfo("FINE", dx, dy, yaw_err, 1.0))
+            thr = 0.20 if abs(speed) < 0.12 else 0.0
+            if abs(speed) < 0.04:
+                self.stuck += dt
+                if self.stuck > 0.5:
+                    thr = 0.22
+            else:
+                self.stuck = 0.0
+            return (VehicleControl(gear=gear, throttle=thr, steering=steer),
+                    SlotInfo("FINE", dx, dy, yaw_err, 1.0))
+
         # SETTLE / DONE
         if abs(speed) > 0.06 and self.phase == "SETTLE":
             return (VehicleControl(gear=GearMode.DRIVE, brake=max(0.20, self.slope_brake)),
@@ -252,6 +285,8 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
 
 
 
