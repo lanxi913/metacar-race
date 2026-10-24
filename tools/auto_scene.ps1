@@ -63,29 +63,20 @@ function Stop-Leftovers {
 }
 
 function Get-ClientWindow {
-    # The client window may still be initializing right after launch; retry for ~20s.
+    # 主窗口有时不在 UIA 顶层枚举里（被隐藏/最小化），用进程的 MainWindowHandle 直接取，
+    # 并且必须先 restore + 置前，否则 UIA 树里是 0 个后代节点。
     for ($i = 1; $i -le 20; $i++) {
-        # the window can belong to any of the client processes (electron spawns children)
-        $pids = @(Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
-        $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
-        foreach ($cp in $pids) {
-            $cond = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
-            $cands = @($rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
-                       Where-Object { $_.Current.NativeWindowHandle -ne 0 })
-            # 主窗口是面积最大的那个；辅助/隐藏窗口（如 ...-siw）面积很小
-            $best = $null
-            $bestArea = 0
-            foreach ($c in $cands) {
-                $r = $c.Current.BoundingRectangle
-                if ($r.Width -lt 400 -or $r.Height -lt 300) { continue }
-                $area = $r.Width * $r.Height
-                if ($area -gt $bestArea) { $bestArea = $area; $best = $c }
-            }
-            if (-not $best) {
-                $best = $cands | Where-Object { $_.Current.Name -like "*$U_CLIENT*" } | Select-Object -First 1
-            }
-            if ($best) { return $best }
+        $p = Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue |
+             Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+        if ($p) {
+            $h = [IntPtr]$p.MainWindowHandle
+            [void][Win]::ShowWindow($h, 9)
+            [void][Win]::SetForegroundWindow($h)
+            Start-Sleep -Milliseconds 1200
+            $el = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+            $kids = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                                [System.Windows.Automation.Condition]::TrueCondition)
+            if ($kids.Count -gt 5) { return $el }
         }
         Start-Sleep -Seconds 1
     }
