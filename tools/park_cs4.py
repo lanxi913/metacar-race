@@ -43,6 +43,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from metacar import GearMode, VehicleControl, SceneAPI  # noqa: E402
+from metacar.models import TrafficLightState  # noqa: E402
 
 from metacar_race.config import LOOKAHEAD_M  # noqa: E402
 from metacar_race.control.profile import SpeedProfile  # noqa: E402
@@ -72,6 +73,19 @@ LANE_KEEP_M = 14.0          # 本车道前方还有这么远就不动
 LANE_ADV_M = 4.0            # 换道至少要多空出这么多
 LANE_DECIDE_S = 0.20        # 车道决策间隔
 LANE_MOVING_MS = 1.00       # 前车比这个快就是跟车，不换道绕
+LANE_PREP_M = 40.0          # P1：前方这个距离内出现静止车就提前决策换道
+LANE_SHIFT_MS = 1.20        # P3：横移速率下限（m/s），不再只看行驶距离
+FOLLOW_BAND_SWITCH = 0.30   # P2：|lat_off| 超过它，跟车带中心按目标车道算
+
+K_HEADING = 2.0             # Stanley 航向增益（与 roundabout/main.py 同值）
+K_CROSS = 2.2               # Stanley 横向增益
+STANLEY_TAIL_S = 3.0        # 离开环岛后继续用 Stanley 的秒数
+
+LIGHT_LOOK_M = 60.0         # 只看前方这么远的信号灯
+LIGHT_STOP_DIST_M = 30.0    # 红灯进入这个距离开始收速
+LIGHT_STOP_GAP_M = 2.60     # 停在停止线前 2.6 m（规则要求 0~3 m）
+LIGHT_STOP_TOL_M = 0.30
+LIGHT_DECEL = 1.20          # 匀减速到停的减速度
 
 STALL_SPEED_MS = 0.25       # "推不动"的速度阈值
 STALL_THROTTLE = 0.50       # 油门给到这个值还推不动就开始补油
@@ -166,6 +180,124 @@ class RouteTrack:
         px, py = self.pts[best]
         tx, ty = self.tangent(best)
         return best, (x - px) * (-ty) + (y - py) * tx
+
+
+class Stanley:
+    """折线路径上的 Stanley 跟踪（移植自 `roundabout/main.py`，那里实测环岛 110 分）。
+
+    与 PurePursuit 的区别：不用前视点，直接用"横向偏差 + 航向误差"反馈，
+    所以不会在环岛出弯处把弧线切掉（PurePursuit 6 m 前视在 R≈15 m 的弯里
+    会内切 1.2 m 以上，实测横向最大 2.02 m，直接压过边线）。
+
+    转向约定与 PurePursuit 一致：steering > 0 = 往右打（场景 yaw 顺时针为正）。
+    """
+
+    def __init__(self, route, k_heading: float = K_HEADING,
+                 k_cross: float = K_CROSS, smooth: int = 3) -> None:
+        self.route = route
+        self.k_h = float(k_heading)
+        self.k_c = float(k_cross)
+        self.smooth = int(smooth)
+        self.speed_ref = 0.0
+        self.idx = 0
+
+    def _pt(self, i: int) -> tuple[float, float]:
+        n = len(self.route)
+        p = self.route[max(0, min(n - 1, i))]
+        return float(p.x), float(p.y)
+
+    def sync(self, x: float, y: float, max_jump_m: float = 1.0) -> int:
+        self._nearest(x, y)
+        return self.idx
+
+    def _nearest(self, x: float, y: float) -> int:
+        n = len(self.route)
+        if n == 0:
+            return 0
+        lo = max(0, self.idx - 10)
+        hi = min(n - 1, self.idx + 40)
+        best, bd = lo, float("inf")
+        for i in range(lo, hi + 1):
+            px, py = self._pt(i)
+            d = math.hypot(px - x, py - y)
+            if d < bd:
+                best, bd = i, d
+        if bd > 10.0:                      # 跟丢了就回全局搜索重新对齐
+            best = min(range(n), key=lambda k: math.hypot(
+                self._pt(k)[0] - x, self._pt(k)[1] - y))
+        self.idx = best                    # 允许回退，纯跟踪那样只增不减会漂
+        return self.idx
+
+    def steering(self, x: float, y: float, yaw_deg: float) -> float:
+        n = len(self.route)
+        if n < 2:
+            return 0.0
+        i = self._nearest(x, y)
+        a = max(0, i - self.smooth)
+        b = min(n - 1, i + self.smooth)
+        ax, ay = self._pt(a)
+        bx, by = self._pt(b)
+        tx, ty = bx - ax, by - ay
+        m = math.hypot(tx, ty)
+        if m < 1e-6:
+            return 0.0
+        tx, ty = tx / m, ty / m
+        px, py = self._pt(i)
+        lat = (x - px) * (-ty) + (y - py) * tx        # 车在路径左侧为正
+        yaw_ref = -math.degrees(math.atan2(ty, tx))
+        # 横向项：车偏左(lat>0)就要往右打，而本平台 steering>0 是右转，
+        # 所以这里取 +lat。取 -lat 会让偏差发散（闭环仿真 60 s 漂到 350 m，
+        # 取 +lat 则稳定在 0.25 m 内）。
+        corr = math.degrees(math.atan2(self.k_c * lat,
+                                       max(abs(self.speed_ref), 0.8)))
+        err = wrap_deg(yaw_ref + corr - yaw_deg)
+        return max(-1.0, min(1.0, self.k_h * math.radians(err)))
+
+
+def pick_stop_line(roads, x: float, y: float, yaw_deg: float,
+                   max_dist: float = 80.0):
+    """车正前方最近的停止线中点。返回 (距离, (sx, sy)) 或 None。
+
+    停止线直接用 SDK 的道路数据（`RoadInfo.stop_line`），不自己猜几何——
+    移植自 `crossroad/main.py`，那里实测十字路口 210 分。
+    """
+    psi = math.radians(yaw_deg)
+    fx, fy = math.cos(psi), -math.sin(psi)        # 场景 yaw 顺时针为正
+    best = None
+    for rd in roads or []:
+        pts = getattr(rd, "stop_line", None) or []
+        for k in range(len(pts) - 1):
+            mx = (float(pts[k].x) + float(pts[k + 1].x)) * 0.5
+            my = (float(pts[k].y) + float(pts[k + 1].y)) * 0.5
+            dx, dy = mx - x, my - y
+            dist = math.hypot(dx, dy)
+            if dist > max_dist or dist < 0.5:
+                continue
+            if (dx * fx + dy * fy) / dist < 0.70:    # 只认前方 ±45°
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, (mx, my))
+    return best
+
+
+def pick_light(groups, x: float, y: float, yaw_deg: float,
+               max_dist: float = LIGHT_LOOK_M):
+    """车前方最近的直行信号灯（TrafficLightInfo）或 None。"""
+    psi = math.radians(yaw_deg)
+    fx, fy = math.cos(psi), -math.sin(psi)
+    best, bd = None, float("inf")
+    for g in groups or []:
+        for tl in getattr(g, "traffic_lights", None) or []:
+            dx = float(tl.position.x) - x
+            dy = float(tl.position.y) - y
+            dist = math.hypot(dx, dy)
+            if dist > max_dist or dist < 0.5:
+                continue
+            if (dx * fx + dy * fy) / dist < 0.50:    # 前方 ±60°
+                continue
+            if dist < bd:
+                best, bd = tl, dist
+    return best
 
 
 class ObstacleScan:
@@ -348,12 +480,16 @@ class Overtaker:
     def _pick(self, items, cur: float) -> tuple[float, bool]:
         """返回 (目标横向偏移, 是否三条车道全堵)。"""
         cur_clear = self.clearance(items, cur)
-        if cur_clear >= LANE_KEEP_M:
+        near = self.nearest(items, cur)
+        # P1：前方 LANE_PREP_M 内出现静止车就提前决策，不再等它压到 LANE_KEEP_M。
+        # 上一轮就是等到 13.6 m 才动，横移还没走完就贴到车上去了。
+        prep = (near is not None and near["v"] < LANE_MOVING_MS
+                and near["dist"] <= LANE_PREP_M)
+        if cur_clear >= LANE_KEEP_M and not prep:
             if abs(cur) > 1e-6 and self.clearance(items, 0.0) >= LANE_KEEP_M:
                 return 0.0, False        # 让出车道：回中间
             return cur, False
         # 前方那辆在动：这是跟车，不是绕障，老老实实跟在后面
-        near = self.nearest(items, cur)
         if near is not None and near["v"] >= LANE_MOVING_MS:
             return cur, False
         best_off, best_clear = cur, cur_clear
@@ -371,7 +507,9 @@ class Overtaker:
         return cur, True
 
     def update(self, t: float, block, items, dt: float, ds: float) -> dict:
-        step = max(ds, 0.02) * OVERTAKE_RAMP_RATE
+        # P3：横移按时间（1.2 m/s 下限）而不是只看行驶距离——低速跟车时
+        # 按距离算会把 3.5 m 的横移拖成 12 s，上一轮就是这么把车顶死的。
+        step = max(LANE_SHIFT_MS * dt, max(ds, 0.0) * OVERTAKE_RAMP_RATE)
         self.decide_t += dt
         # 上一段横移基本走完才重新决策，避免半路改主意
         if self.enabled and self.decide_t >= LANE_DECIDE_S and abs(self.target - self.lat_off) < 0.30:
@@ -405,6 +543,10 @@ def main() -> int:
                         help="每隔多少秒存一张前视相机图到 shots/（0=不存）")
     parser.add_argument("--no-overtake", action="store_true",
                         help="关掉自动绕行（默认开启）")
+    parser.add_argument("--no-stanley", action="store_true",
+                        help="环岛段也不用 Stanley（默认用）")
+    parser.add_argument("--no-light", action="store_true",
+                        help="不理会信号灯与停止线（默认理会）")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -426,9 +568,13 @@ def main() -> int:
         print(f"目标元素：{target}（其余自动跳关）", flush=True)
 
     pursuit = PurePursuit(static.route, lookahead=LOOKAHEAD_M) if track.n >= 2 else None
+    stanley = Stanley(static.route) if track.n >= 2 else None
     shift_route = ShiftRoute(static.route) if pursuit is not None else None
+    follower = pursuit
     if pursuit is not None and shift_route is not None:
         pursuit.route = shift_route.items
+        if stanley is not None:
+            stanley.route = shift_route.items
     overtaker = Overtaker(enabled=not args.no_overtake)
     profile = SpeedProfile(static.route, v_max=args.vmax) if track.n >= 3 else None
     speed_ctl = SpeedController(v_target=args.vmax, accel_limit=1.5, throttle_max=0.85)
@@ -444,6 +590,7 @@ def main() -> int:
         "frame", "sim_t", "sub_scene", "elem_i", "phase", "x", "y", "yaw", "speed",
         "gear", "throttle", "brake", "steering", "v_tgt", "route_s", "lat_err",
         "blk_dist", "blk_type", "blk_id", "obs_n", "stuck", "lat_off",
+        "light", "stop_gap",
     ])
     obs_fh = (out_dir / "obs.jsonl").open("w", encoding="utf-8")
     ev_fh = (out_dir / "events.jsonl").open("w", encoding="utf-8")
@@ -460,9 +607,15 @@ def main() -> int:
     cur_sub = ""
     hold_t = 0.0
     last_obs_key = None
+    last_obs_t = -99.0
     last_stuck_log = -99.0
     last_shot = -99.0
     last_break_log = -99.0
+    stanley_until = 0.0
+    stop_line = None
+    light = None
+    passed_stop = False
+    red_hold = False
     frame = 0
     sim_t = 0.0
     dt = 1.0 / 30.0
@@ -489,6 +642,12 @@ def main() -> int:
                     if sc.name == sub:
                         cur_sub = sub
                         elem_i = k
+                        stop_line = None
+                        light = None
+                        passed_stop = False
+                        red_hold = False
+                        if "环岛" in sub and not args.no_stanley:
+                            stanley_until = sim_t + STANLEY_TAIL_S
                         emit("element", name=sub, index=k,
                              limit=round(float(status.time_limit), 1))
                         break
@@ -518,13 +677,17 @@ def main() -> int:
 
             # ---- 定位 & 障碍 ----
             i_now = track.sync(x, y)
-            block, obs_items = ObstacleScan.scan(track, i_now, msg.obstacles or [])
+            block, obs_items = ObstacleScan.scan(
+                track, i_now, getattr(msg, "obstacles", None) or [])
             obs_n = len(obs_items)
 
             obs_key = tuple(sorted((o["id"], o["type"]) for o in obs_items))
             stuck_now = stuck_watch.update(sim_t, x, y)
-            if obs_key != last_obs_key or stuck_now:
+            # P6：除了集合变化/卡死，每秒无条件写一条——上一轮最后 25 s 一条都没有，
+            # 撞车瞬间只能靠 stuck 事件里那一辆车反推。
+            if obs_key != last_obs_key or stuck_now or sim_t - last_obs_t >= 1.0:
                 last_obs_key = obs_key
+                last_obs_t = sim_t
                 obs_fh.write(json.dumps({
                     "sim_t": round(sim_t, 3), "frame": frame,
                     "ego": [round(x, 2), round(y, 2)],
@@ -559,12 +722,17 @@ def main() -> int:
                 last_break_log = sim_t
                 emit("all_lanes_blocked", lat_off=round(lat_off, 2), n=obs_n)
 
-            # 当前车道（含横移）正前方的最近障碍，才是跟车/刹停目标
+            # 当前车道（含横移）正前方的最近障碍，才是跟车/刹停目标。
+            # P2：横移还没走完时，按**目标车道**算带心，否则被超越的那辆车一直在
+            # 带里，车会一边换道一边给自己刹车，最后贴着它停死。
+            band = lat_off
+            if abs(lat_off) > FOLLOW_BAND_SWITCH:
+                band = math.copysign(OVERTAKE_OFFSET_M, lat_off)
             blk_ctrl = None
             for o in obs_items:
                 if o["type"] in IGNORE_TYPES or o["dist"] < -1.0:
                     continue
-                if abs(o["lat"] - lat_off) > OVERTAKE_BAND_M:
+                if abs(o["lat"] - band) > OVERTAKE_BAND_M:
                     continue
                 if blk_ctrl is None or o["dist"] < blk_ctrl["dist"]:
                     blk_ctrl = o
@@ -582,7 +750,56 @@ def main() -> int:
             elif ov["active"]:
                 v_tgt = min(v_tgt, OVERTAKE_SPEED)
 
-            steer = pursuit.steering(x, y, yaw) if pursuit is not None else 0.0
+            # ---- 信号灯 / 停止线（移植 crossroad/main.py，那里实测十字路口 210 分）----
+            stop_gap = None
+            if not passed_stop and not args.no_light:
+                if light is None:
+                    light = pick_light(getattr(msg, "traffic_light_groups", None) or [],
+                                       x, y, yaw)
+                    if light is not None:
+                        emit("light", lid=light.id, state=light.straight_state.name,
+                             remain=round(float(light.straight_remaining_time), 1))
+                        print(f"[{sim_t:6.1f}s] 信号灯 {light.straight_state.name} "
+                              f"剩余 {light.straight_remaining_time:.1f}s", flush=True)
+                if stop_line is None:
+                    got = pick_stop_line(static.roads, x, y, yaw)
+                    if got is not None:
+                        stop_line = got[1]
+                        emit("stop_line",
+                             pos=[round(stop_line[0], 2), round(stop_line[1], 2)],
+                             dist=round(got[0], 1))
+                        print(f"[{sim_t:6.1f}s] 停止线 ({stop_line[0]:.1f},"
+                              f"{stop_line[1]:.1f}) 距 {got[0]:.1f} m", flush=True)
+                if stop_line is not None:
+                    stop_gap = math.hypot(stop_line[0] - x, stop_line[1] - y)
+                    red = light is not None and light.straight_state == TrafficLightState.RED
+                    if red and 0.0 < stop_gap < LIGHT_STOP_DIST_M:
+                        v_allow = math.sqrt(2.0 * LIGHT_DECEL *
+                                            max(stop_gap - LIGHT_STOP_GAP_M, 0.0))
+                        if v_allow < v_tgt:
+                            v_tgt = v_allow
+                        if stop_gap <= LIGHT_STOP_GAP_M + LIGHT_STOP_TOL_M:
+                            v_tgt = 0.0
+                            if not red_hold:
+                                red_hold = True
+                                emit("red_stop", gap=round(stop_gap, 2))
+                                print(f"[{sim_t:6.1f}s] 红灯停车 gap={stop_gap:.2f} m",
+                                      flush=True)
+                    elif red_hold:
+                        red_hold = False
+                        emit("red_go")
+                        print(f"[{sim_t:6.1f}s] 绿灯继续", flush=True)
+                    if stop_gap < 0.8:
+                        passed_stop = True
+                        emit("stop_line_passed")
+
+            # 环岛段用 Stanley：PurePursuit 会在出弯处切弧（实测横向 2.02 m 压边线）
+            if stanley is not None and not args.no_stanley and sim_t < stanley_until:
+                follower = stanley
+                stanley.speed_ref = speed
+            else:
+                follower = pursuit
+            steer = follower.steering(x, y, yaw) if follower is not None else 0.0
             speed_ctl.v_target = v_tgt
             thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
             thr = stall.update(thr, speed, dt)
@@ -606,8 +823,10 @@ def main() -> int:
                     round(v_tgt, 2), round(track.s[i_now], 1), 0.0,
                     "" if blk_ctrl is None else round(blk_ctrl["dist"], 2),
                     "" if blk_ctrl is None else blk_ctrl["type"],
-                    "" if blk_ctrl is None else blk_ctrl["id"], obs_n, int(stuck_now),
-                    round(lat_off, 2),
+                    "" if blk_ctrl is None else blk_ctrl["id"],
+                    obs_n, int(stuck_now), round(lat_off, 2),
+                    "" if light is None else light.straight_state.name,
+                    "" if stop_gap is None else round(stop_gap, 2),
                 ])
                 if frame % 60 == 0:
                     run_fh.flush()
@@ -634,13 +853,15 @@ def main() -> int:
                 "" if blk_ctrl is None else blk_ctrl["type"],
                 "" if blk_ctrl is None else blk_ctrl["id"], obs_n, int(stuck_now),
                 round(lat_off, 2),
+                "" if light is None else light.straight_state.name,
+                "" if stop_gap is None else round(stop_gap, 2),
             ])
             if frame % 30 == 0:
                 run_fh.flush()
                 print(f"[{sim_t:6.1f}s] {sub:8s} s={track.s[i_now]:7.1f} "
                       f"pos=({x:8.1f},{y:8.1f}) v={speed:5.2f} tgt={v_tgt:5.2f} "
                       f"thr={thr:4.2f} blk={'' if block is None else block['dist']:>6} "
-                      f"obs={obs_n}", flush=True)
+                      f"obs={obs_n} lat={lat_err:+.2f}", flush=True)
 
             if time.time() > t_end:
                 ending = "timeout"
