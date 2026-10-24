@@ -31,6 +31,7 @@ STOP_LAT_TOL = 0.15            # 横向容差（只用于日志判定）
 HOLD_SECONDS = 5.0             # 连续场景要求停稳保持 5 s
 ARC_TOL_RAD = math.radians(2.0)
 ARC_STEER = 0.74               # 倒车弧的转向量：steering=1.0 实测半径只有 3.61 m
+STAGE_TRIM = 0.84              # 对位点往车位轴线方向内缩多少米（实测系统偏差，见 begin）
 TIMEOUT_SECONDS = 120.0
 GOAL_TOL = 0.08                # 距「停车检查点」多近算到位（平台 end_point）
 GOAL_MAX_OFFSET = 1.50         # 检查点离车位中心超过这个距离就不当停车点用
@@ -80,8 +81,9 @@ class ReversePark:
 
     def __init__(self, radius=DEFAULT_RADIUS, hold_seconds=HOLD_SECONDS,
                  timeout=TIMEOUT_SECONDS, goal=None, goal_tol=GOAL_TOL,
-                 arc_steer=ARC_STEER):
+                 arc_steer=ARC_STEER, stage_trim=STAGE_TRIM):
         self.radius = float(radius)
+        self.stage_trim = float(stage_trim)
         self.hold_seconds = float(hold_seconds)
         self.timeout = float(timeout)
         # 倒车弧的转向量。20261024-142117 实测：steering=1.0 倒车画出来的半径只有
@@ -125,7 +127,7 @@ class ReversePark:
         rel_lat = (x - sx) * vx + (y - sy) * vy
         side = 1.0 if rel_lat >= 0 else -1.0
 
-        stage_lat = -side * self.radius
+        stage_lat = -side * (self.radius - self.stage_trim)
         self.stage = (sx + ux * self.radius + vx * stage_lat,
                       sy + uy * self.radius + vy * stage_lat)
         self.frame = dict(ux=ux, uy=uy, vx=vx, vy=vy, side=side, th=th)

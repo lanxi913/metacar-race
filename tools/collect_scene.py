@@ -347,6 +347,8 @@ def parse_args() -> argparse.Namespace:
                         help="进入非目标元素后先停多少仿真秒再跳关")
     parser.add_argument("--skip-to-index", type=int, default=0,
                         help="探针用：只跑第 N 个元素（1 起算），避免命令行传中文元素名")
+    parser.add_argument("--park-trim", type=float, default=0.84,
+                        help="对位点往车位轴线内缩的米数（实测 0.84，吃掉倒车弧末端的系统偏差）")
     parser.add_argument("--park-shift-radius", type=float, default=45.0,
                         help="离对位点多远之内才开始借位（太早借位会让车整段路偏着走）")
     parser.add_argument("--max-skips", type=int, default=6,
@@ -633,7 +635,7 @@ def main() -> int:
                     norm = math.hypot(tx, ty) or 1.0
                     lx, ly = -ty / norm, tx / norm        # 路线左法向
                     # 对位点在车的哪一侧，就往哪一侧借位；借多少看线/余量
-                    probe = ReversePark(hold_seconds=0.0)
+                    probe = ReversePark(hold_seconds=0.0, stage_trim=args.park_trim)
                     pinfo = probe.begin(pose.pos_x, pose.pos_y, pose.ori_z, slot_now, now)
                     # 只在临近车位时借位：车位在传感器里 90 m 外就能看见，太早借位
                     # 会让车整段路都偏 1 m 走（20261024-142117 实测横偏恒为 +1.00）。
@@ -696,7 +698,8 @@ def main() -> int:
                     slot = slot_now
                     if slot is not None:
                         candidate = ReversePark(hold_seconds=args.park_hold,
-                                                goal=park_goal)
+                                                goal=park_goal,
+                                                stage_trim=args.park_trim)
                         info0 = candidate.begin(
                             pose.pos_x, pose.pos_y, pose.ori_z, slot, now)
                         near = args.park_engage <= 0 or info0["d_stage"] <= args.park_engage
