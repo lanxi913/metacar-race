@@ -112,3 +112,17 @@ PARALLEL_STAGING_MARGIN_M = 0.15 # staging 相对远端车中心的余量
 PARALLEL_TOL_DX_M = 0.35         # 入位判据：横向
 PARALLEL_TOL_DY_M = 0.35         # 入位判据：纵向
 PARALLEL_HOLD_SECONDS = 5.0      # 停稳保持
+# ---- 车道级循迹 + 换道避让（feat/scenes-page2-zyy，左侧车道超车实测 110）----
+LANE_CRUISE_MS = 4.2       # 巡航目标速度
+LANE_ACCEL_MAX = 1.2       # 规划加速度上限（m/s²）
+LANE_HOLD_SECONDS = 5.0    # 终点停稳保持
+LANE_LAUNCH_HOLD_S = 1.5   # 起步前先驻车的时间，压掉挂挡首帧跳变
+LANE_STEER_LIMIT = 0.8     # 转向限幅，满舵低速会卡死
+LANE_WHEELBASE = 2.6       # 轴距（车辆属性）
+
+# ---- 路线级循迹（辅路驶入驶出实测 110，2026-10-23）----
+ROUTE_CRUISE_MS = 6.0      # 巡航目标速度（车实际最高 4.8 m/s，长路线按此跑）
+ROUTE_ACCEL_MAX = 2.0      # 规划加速度上限
+ROUTE_HOLD_SECONDS = 5.0   # 终点停稳保持
+ROUTE_STEER_LIMIT = 0.8    # 转向限幅
+ROUTE_WHEELBASE = 2.6      # 轴距
