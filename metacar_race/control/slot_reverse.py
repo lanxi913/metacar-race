@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """斜列/平行车位的「解析 S 弯 + 倒车纯跟踪」，带坡度适配。
 
 为什么需要它
@@ -32,7 +32,7 @@ WHEELBASE = 2.60
 MAX_STEER_RAD = 0.60
 STEER_CMD = 0.75            # 打舵量（满舵会顶静摩擦，0.75 是平地验证值）
 V_APPROACH = 2.60           # 对位段目标速度 m/s
-V_REVERSE = 0.75            # 倒车目标速度 m/s
+V_REVERSE = 0.55            # 倒车目标速度 m/s（撞车扣 5×v，慢一点更安全）
 LOOKAHEAD = 0.9             # 倒车纯跟踪前视距离 m（小一点才贴得住圆弧）
 STAGE_MARGIN = -3.00        # staging 往后再退 3 m：给两段圆弧留够横移距离
 STAGE_SHIFT = -1.67        # 实测两段弧会多走 2.27 m，把 staging 前移同样的量抵消
@@ -257,7 +257,12 @@ class SlotReverseParker:
             ahead = (sx - x) * fx + (sy - y) * fy
             gear = GearMode.DRIVE if (best_i >= b2 and ahead > 0.10) else GearMode.REVERSE
             # 油门必须 ≥0.18 才推得动（实测 0.10~0.16 在坡上会卡住），用 PWM 控速
-            thr = 0.20 if abs(speed) < v_target else 0.0
+            # 坡上不能"给一下停一下"（会卡在静摩擦），油门常开、用刹车限速
+            thr = 0.20
+            if abs(speed) > v_target + 0.08:
+                return (VehicleControl(gear=gear, throttle=self._slew(thr), brake=0.15,
+                                       steering=steer),
+                        SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
             # 最后 2 m 超速就主动刹（坡上下滑会让车越溜越快）
             if dist < 2.0 and abs(speed) > v_target + 0.15:
                 return (VehicleControl(gear=gear, brake=0.20, steering=steer),
@@ -288,7 +293,7 @@ class SlotReverseParker:
             dist = math.hypot(dx, dy)
             if self.fine_sub == "Y":
                 # 1) 先把纵向 dy 修到 ±0.18：死区内直接停住，换向之前必须先停稳
-                if abs(dy) < 0.18:
+                if abs(dy) < 0.12:
                     if abs(speed) < 0.06:
                         self.fine_sub, self.fine_t = "YAW", 0.0
                     return (VehicleControl(gear=GearMode.DRIVE, brake=0.25),
@@ -346,6 +351,9 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
+
 
 
 
