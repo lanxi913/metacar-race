@@ -393,7 +393,9 @@ class GeoFollower:
             brk_t = 0.0
         else:
             thr_t = 0.0
-            brk_t = min(BRAKE_MAX, (-err) / 1.2)   # 刹车限幅：|a|≤5 需要较小的刹车量
+            # 中途（超车/巡航）刹车要比收尾还轻：超车时那一下急刹就是加速度超标来源
+            brk_cap = 0.08 if rem < 10.0 else 0.03
+            brk_t = min(brk_cap, (-err) / 1.2)
         # 硬限速：接近规则限速就收油，超过就刹（超速每题 −10，不能碰）
         if v > V_RULE * 0.97:
             thr_t = 0.0
@@ -440,6 +442,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 
