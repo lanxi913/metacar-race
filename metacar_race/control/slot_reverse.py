@@ -285,10 +285,9 @@ class SlotReverseParker:
                         SlotInfo("FINE", dx, dy, yaw_err, 1.0))
             # 2) 航向：前进打舵 + 倒车反舵，让 yaw 单向累积（每次只挪 0.3 m）
             if self.fine_sub == "YAW" and (yaw_err < 4.0 or self.fine_t > 12.0):
-                self.phase = "SETTLE"
-                self.hold = 0.0
+                self.fine_sub, self.fine_t = "X", 0.0
                 return (VehicleControl(gear=GearMode.DRIVE, brake=0.30),
-                        SlotInfo("SETTLE", dx, dy, yaw_err, 1.0))
+                        SlotInfo("FINE", dx, dy, yaw_err, 1.0))
             if self.fine_sub == "YAW":
                 sign = 1.0 if wrap180(syaw - yaw) > 0 else -1.0
                 phase_half = (self.fine_t % 2.4) < 1.2
@@ -299,7 +298,7 @@ class SlotReverseParker:
                 if abs(speed) > 0.18:
                     return (VehicleControl(gear=gear, brake=0.20, steering=steer),
                             SlotInfo("FINE", dx, dy, yaw_err, 1.0))
-                return (VehicleControl(gear=gear, throttle=self._slew(0.20), steering=steer),
+                return (VehicleControl(gear=gear, throttle=self._slew(0.12), steering=steer),
                         SlotInfo("FINE", dx, dy, yaw_err, 1.0))
             # 3) 横向：同向打舵"前进+倒车"两次小动作，把 dx 拉到 0（航向基本不变）
             if abs(dx) < 0.25 or self.fine_t > 16.0:
@@ -307,16 +306,15 @@ class SlotReverseParker:
                 self.hold = 0.0
                 return (VehicleControl(gear=GearMode.DRIVE, brake=0.30),
                         SlotInfo("SETTLE", dx, dy, yaw_err, 1.0))
-            sgn = 1.0 if dx > 0 else -1.0          # dx>0 需要往 -x 挪
+            # 横移技巧：前进 +δ 与倒车 +δ 都往 -x 侧偏，且航向变化互相抵消
+            sgn = 1.0 if dx > 0 else -1.0          # dx>0 ⇒ 需要往 -x 挪 ⇒ 用 +δ
             half = (self.fine_t % 2.6) < 1.3
-            if half:
-                gear, steer = GearMode.DRIVE, -sgn * 0.55
-            else:
-                gear, steer = GearMode.REVERSE, sgn * 0.55
+            gear = GearMode.DRIVE if half else GearMode.REVERSE
+            steer = sgn * 0.55
             if abs(speed) > 0.18:
                 return (VehicleControl(gear=gear, brake=0.20, steering=steer),
                         SlotInfo("FINE", dx, dy, yaw_err, 1.0))
-            return (VehicleControl(gear=gear, throttle=self._slew(0.20), steering=steer),
+            return (VehicleControl(gear=gear, throttle=self._slew(0.12), steering=steer),
                     SlotInfo("FINE", dx, dy, yaw_err, 1.0))
 
         # SETTLE / DONE
@@ -331,6 +329,7 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
 
 
 
