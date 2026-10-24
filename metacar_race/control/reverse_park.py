@@ -34,8 +34,8 @@ TIMEOUT_SECONDS = 120.0
 GOAL_TOL = 0.08                # 距「停车检查点」多近算到位（平台 end_point）
 GOAL_MAX_OFFSET = 1.50         # 检查点离车位中心超过这个距离就不当停车点用
 GOAL_MAX_LATERAL = 0.60
-GOAL_STOP_TOL = 0.08           # 沿车位轴看，离检查点多远就停车（二维距离永远到不了 0）
-GOAL_STOP_LOOKAHEAD = 0.20      # 提前量：rem <= tol + k*|v| 就判到位，抵消平台响应延迟
+GOAL_STOP_TOL = 0.05           # 沿车位轴看，离检查点多远就停车（二维距离永远到不了 0）
+GOAL_STOP_LOOKAHEAD = 0.10      # 提前量：rem <= tol + k*|v| 就判到位，抵消平台响应延迟
 
 
 def wrap(angle: float) -> float:
@@ -183,12 +183,15 @@ class ReversePark:
         # 原版（park_v8）在 20 m 内直接收油靠滑行，滑多远取决于车辆阻力，换个车位
         # 距离就变味。这里改成按距离给速度指令：v = sqrt(2*a*d)，最后一米爬行。
         if self.phase == "approach":
-            if d_stage < 0.45:
+            # 对位点误差会原封不动传进车位：20261024-141009 那次在 d_stage=0.45 就
+            # 换挡，倒车弧的起点横向差 0.36 m，最后停在离检查点 0.27 m 的地方。
+            # 现在要求贴到 0.12 m 再停，并且最后几米把方向打得更狠。
+            if d_stage < 0.12:
                 self.phase = "stop"
                 return "drive", 0.0, 0.0, 0.0
             v_des = min(APPROACH_SPEED,
-                        max(0.25, math.sqrt(2.0 * APPROACH_DECEL
-                                           * max(d_stage - 0.30, 0.05))))
+                        max(0.14, math.sqrt(2.0 * APPROACH_DECEL
+                                           * max(d_stage - 0.10, 0.02))))
             thr, brk = speed_cmd(v, v_des)
             # speed_cmd 的刹车上限 0.10 是 park_v8 里「20 m 外收油靠滑行」的遗留，
             # 现在换成按距离给速度，刹车必须真的能把速度压下去，否则对位点会冲过头。
@@ -197,7 +200,8 @@ class ReversePark:
                 brk = max(brk, min(0.45, need / 8.0))
                 thr = 0.0
             err_h = wrap(math.atan2(stage_y - y, stage_x - x) - heading_rad(yaw_deg))
-            steer = max(-1.0, min(1.0, -1.5 * err_h))
+            gain = 1.5 if d_stage > 4.0 else 2.5
+            steer = max(-1.0, min(1.0, -gain * err_h))
             return "drive", thr, brk, steer
 
         # ---------- 2) 停稳换倒挡 ----------
@@ -240,18 +244,20 @@ class ReversePark:
                 return "parking", 0.0, 0.35, 0.0
 
             if self.goal is not None:
-                # 越接近检查点越慢：0.75 m/s per metre，最后 0.2 m 只剩 0.2 m/s
-                vt = max(0.06, min(0.80, 0.75 * max(rem, 0.0) + 0.05))
+                # 越接近检查点越慢：0.45 m/s per metre，最后 0.2 m 只剩 0.13 m/s
+                vt = max(0.05, min(0.80, 0.45 * max(rem, 0.0) + 0.04))
             else:
                 vt = max(0.15, min(0.80, 1.1 * max(abs(a_long) - 0.10, 0.0) + 0.22))
             thr, brk = speed_cmd(v, vt)
-            if abs(v) > vt + 0.10:
+            if abs(v) > vt + 0.06:
                 # 倒挡不给油也会一直滑（实测 0.5 m/s 不衰减），必须主动刹车
                 thr = 0.0
                 brk = max(brk, min(0.30, 0.45 * (abs(v) - vt)))
             lat_err = a_lat - self.goal_a_lat if self.goal is not None else a_lat
-            steer = max(-0.50, min(0.50,
-                                   1.6 * heading_err + self.lat_sign * 0.6 * lat_err))
+            # 靠近检查点时横向纠偏要更硬：实测 6.5 s 只纠回 0.07 m，收得太慢
+            lat_gain = 0.6 if rem > 3.0 else 1.3
+            steer = max(-0.55, min(0.55,
+                                   1.8 * heading_err + self.lat_sign * lat_gain * lat_err))
             return "reverse", thr, brk, steer
 
         # ---------- 5) 驻车保持 ----------

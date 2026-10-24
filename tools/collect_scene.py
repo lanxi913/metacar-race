@@ -56,6 +56,14 @@ from pathlib import Path
 import numpy as np
 from metacar import GearMode, SceneAPI, VehicleControl
 
+# 控制台是 GBK 时，打印里的 m/s² 之类字符会直接抛 UnicodeEncodeError 把整次采集带走，
+# 这里放宽成 replace：编码对不上就打成问号，至少别把数据跑丢。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
@@ -332,6 +340,13 @@ def parse_args() -> argparse.Namespace:
                         help="采集多少仿真秒后停（0=一直采到场景结束）")
     parser.add_argument("--skip-after", type=float, default=0.0,
                         help="hold 模式下每个元素停留多少秒后跳关（0=不跳）")
+    parser.add_argument("--skip-to", default="",
+                        help="探针用：只跑名字里含该子串的元素（如 泊车），"
+                             "其余元素进入后自动 skip_level 跳过，迭代一次十几秒")
+    parser.add_argument("--skip-to-dwell", type=float, default=1.2,
+                        help="进入非目标元素后先停多少仿真秒再跳关")
+    parser.add_argument("--max-skips", type=int, default=6,
+                        help="最多跳关次数，防止配置错误时无限跳")
     parser.add_argument("--kick", action="store_true",
                         help="允许升挡 kick：低挡位下油门再大也卡在 17.2 km/h，开这个才会升挡")
     parser.add_argument("--kick-throttle", type=float, default=0.45,
@@ -694,6 +709,18 @@ def main() -> int:
                     skipped.add(current_sub)
                     api.skip_level()
                     emit("skip_level", sub_scene=current_sub, sim_t=round(sim_t, 3))
+
+            # ---- 直达指定元素（探针用）----
+            if (args.skip_to and current_sub and args.skip_to not in current_sub
+                    and current_sub not in skipped
+                    and len(skipped) < args.max_skips
+                    and sim_t - sub_first_t.get(current_sub, sim_t) >= args.skip_to_dwell):
+                skipped.add(current_sub)
+                api.skip_level()
+                emit("skip_level", sub_scene=current_sub, sim_t=round(sim_t, 3),
+                     reason=f"skip_to={args.skip_to}")
+                print(f"[{sim_t:6.1f}s] 跳过 {current_sub}（只跑含“{args.skip_to}”的元素）",
+                      flush=True)
 
             # ---- 障碍物 / 红绿灯 ----
             nearest_dist, nearest_id, nearest_type = float("inf"), -1, ""
