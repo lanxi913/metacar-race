@@ -182,7 +182,9 @@ if ($proc) {
         Write-Host "!! timeout, killing"
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
-    Start-Sleep -Milliseconds 500
+    # Give the client time to upload the result before the scene process is killed.
+    Write-Host "waiting 12s for the client to upload the result..."
+    Start-Sleep -Seconds 12
     Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Write-Host "--- log tail ---"
     Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 15
