@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """垂直泊车控制器（把 tools/park_v4.py 的已验证动作封装成类）
 
 来源：`tools/park_v4.py`（元素场景「垂直车道泊车」实测 210 分）。
@@ -100,7 +100,7 @@ class VerticalPark:
         if self.phase == "STAGE":
             # 近距离（≤10 m）时直接"瞄准车位中心"开进去——连续场景里车位就在路线尽头，
             # 车位排是标准垂直车位，车头正对车位口即可进库
-            if d_center <= 10.0:
+            if False and d_center <= 10.0:   # SEEK 模式实测会顶到邻车，停用
                 if d_center <= 0.35 and abs(v) < 0.25:
                     self.phase = "HOLD"
                     self.hold_t = 0.0
@@ -167,6 +167,8 @@ class VerticalPark:
         if self.hold_t > HOLD_SECONDS:
             self.done = True
         return VehicleControl(gear=GearMode.PARKING, brake=ramp), "HOLD"
+
+
 
 
 
