@@ -108,6 +108,17 @@ if (-not $NoLaunch) {
 
 # The client sometimes ends up with no visible main window (tray / crashed UI).
 # Start it when we cannot find one, and give it time to come up.
+$clientExe = 'D:\' + (-join ([char]0x65E0,[char]0x4EBA,[char]0x7B97,[char]0x6CD5)) + '\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
+
+function Start-Client {
+    if (Test-Path $clientExe) {
+        Start-Process -FilePath $clientExe -WorkingDirectory (Split-Path $clientExe)
+        Start-Sleep -Seconds 18
+    } else {
+        Write-Host "!! client exe not found: $clientExe"
+    }
+}
+
 function Test-ClientVisible {
     # Only decide whether the client PROCESS is running. Whether its window is
     # currently minimised / behind Edge does not matter: Get-ClientWindow already
@@ -120,16 +131,22 @@ function Test-ClientVisible {
 
 if (-not (Test-ClientVisible)) {
     Write-Host "client window missing, starting the client..."
-    $exe = 'D:\' + (-join ([char]0x65E0,[char]0x4EBA,[char]0x7B97,[char]0x6CD5)) + '\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
-    if (Test-Path $exe) {
-        Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
-        Start-Sleep -Seconds 18
-    } else {
-        Write-Host "!! client exe not found: $exe"
-    }
+    Start-Client
 }
 
-$win = Get-ClientWindow
+# The client sometimes collapses into its 14x14 tray window after a scene run: the
+# process is alive with a MainWindowTitle, but the window has no UIA descendants.
+# In that state every click is impossible, so kill and relaunch it.
+$win = $null
+try {
+    $win = Get-ClientWindow
+} catch {
+    Write-Host "client window unusable, restarting the client..."
+    Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Start-Client
+    $win = Get-ClientWindow
+}
 [Win]::ShowWindow([IntPtr]$win.Current.NativeWindowHandle, 9) | Out-Null
 [Win]::SetForegroundWindow([IntPtr]$win.Current.NativeWindowHandle) | Out-Null
 Start-Sleep -Milliseconds 800
