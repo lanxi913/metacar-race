@@ -193,6 +193,7 @@ def pick_light(groups, x, y, yaw_deg, max_dist=60.0):
 def main() -> int:
     ap = argparse.ArgumentParser(description="十字路口通行")
     ap.add_argument("--seconds", type=float, default=190.0)
+    ap.add_argument("--csv", default="", help="逐帧 CSV 输出路径")
     args = ap.parse_args()
 
     print("连接仿真场景（先跑脚本，再点启动场景）...", flush=True)
@@ -221,6 +222,7 @@ def main() -> int:
     stopped_for_red = False
     arrived = False
     passed = False
+    csv = []
 
     for msg, cams in api.main_loop():
         frames += 1
@@ -281,6 +283,10 @@ def main() -> int:
             a_lat = (car.speed ** 2) / R if R < 1e8 else 0.0
             max_a = max(max_a, math.hypot(a_lon, a_lat))
         prev_v = car.speed
+        if args.csv:
+            csv.append((round(status.used_time, 3), round(pose.pos_x, 3), round(pose.pos_y, 3),
+                        round(pose.ori_z, 2), round(car.speed, 3), round(v_cmd, 3),
+                        round(thr, 3), round(brk, 3), round(steer, 3), idx))
 
         # ---- 终点：越过终点 2 m 再刹停 ----
         ex, ey = follower.pts[-1]
@@ -316,6 +322,12 @@ def main() -> int:
         "elapsed": round(time.time() - t0, 1),
     }
     print("SUMMARY " + json.dumps(summary, ensure_ascii=False), flush=True)
+    if args.csv and csv:
+        with open(args.csv, "w", encoding="utf-8") as fh:
+            fh.write("t,x,y,yaw,v,v_cmd,thr,brk,steer,idx\n")
+            for row in csv:
+                fh.write(",".join(str(c) for c in row) + "\n")
+        print(f"csv -> {args.csv}", flush=True)
 
     try:
         api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
