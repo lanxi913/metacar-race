@@ -34,3 +34,4 @@
 2026-10-24 20:41:02,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,200.00,首次跑通入位；差加速度+10；du=+0.28 dv=+0.03 航向差-0.7°
 2026-10-24 21:07:35,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,200.00,第6次复现；平顺化后违规帧168→8 max|a| 21.7→9.2；du=+0.37 dv=+0.04
 2026-10-24 21:58:21,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,200.00,速度层照抄park_v8；du=+0.21 dv=+0.04 航向差-0.9 29.5s
+2026-10-24 22:07:10,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,210.00,满分！du=+0.23 dv=+0.03 航向差-0.5 28.5s

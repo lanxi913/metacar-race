@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """异形车道泊车 v6：车道巡航 → 借道摆头 → 倒车入位。
 
 与 v4/v5 的区别：
@@ -44,6 +44,8 @@ EGO_MARGIN_X = 0.0
 
 # ---------- 控制参数（速度层照抄 park_v8，垂直泊车 210 分那套）----------
 STAGE_THROTTLE = 0.14      # 巡航恒定油门（开环，不闭环追速度）
+HARD_START_S = 1.5      # 起步硬给油的持续时间
+HARD_START_THR = 0.50    # 起步硬给油的油门（park_v8 的接近段油门）
 SOFT_START_S = 2.5
 SOFT_START_THR = 0.02
 A_DEC_PLAN = 0.8           # 刹车规划用的减速度基准
@@ -233,6 +235,23 @@ def approach_cmd(v_meas: float, dist: float):
     return STAGE_THROTTLE, 0.0
 
 
+def approach_hold(v_meas: float, dist: float, v_arrive: float, v_cap: float):
+    """带到点速度的接近段：终点目标不是 0 而是 v_arrive。
+
+    这样摆头段起点仍在 v_arrive（>1.6 m/s，已越过低速台阶带）上，
+    避免"刹到 0.5 再重新加速"造成第二次穿越台阶带。
+    """
+    v_allow = math.sqrt(max(0.0, v_arrive * v_arrive + 2.0 * 0.8 * max(dist, 0.0)))
+    if dist < 20.0 and v_meas > v_allow + 0.15:
+        a_req = (v_meas * v_meas - v_arrive * v_arrive) / (2.0 * max(dist, 0.3))
+        brk = max(0.0, min(0.10, (a_req - 0.8) / 25.0))
+        if brk > 0.001:
+            return 0.0, brk
+    if v_meas < v_cap:
+        return STAGE_THROTTLE, 0.0
+    return 0.0, 0.0
+
+
 def drive_to_point(v_meas: float, dist: float, thr_cruise: float = 0.02):
     """开环恒定油门 + 按剩余距离反推刹车（park_v8 的对位逻辑）。
 
@@ -259,9 +278,14 @@ def main() -> int:
     geom = {}
 
     def send(gear, thr, brk, steer):
-        # 转向、刹车做斜率限制；油门是 PWM 脉冲，直接下发（否则会被抹平）
         st["steer"] += max(-STEER_SLEW, min(STEER_SLEW, steer - st["steer"]))
-        st["thr"] += max(-THR_SLEW, min(THR_SLEW, thr - st["thr"]))
+        # 起步硬给油：从第 0 秒直接 0.14，不做斜率爬升
+        # 实测：油门从 0 慢慢爬会把车憋在原地，越过静摩擦那一刻突然窜起（+11 m/s²）；
+        # 一上来就给足油，车是从 0 平滑加速的（车辆直行 110 分就是恒定油门）
+        if HARD_START_S > 0 and (time.time() - st["t0"]) < HARD_START_S and gear == GearMode.DRIVE:
+            st["thr"] = HARD_START_THR
+        else:
+            st["thr"] += max(-THR_SLEW, min(THR_SLEW, thr - st["thr"]))
         st["brk"] += max(-BRK_SLEW, min(BRK_SLEW, brk - st["brk"]))
         st["steer"] = max(-1.0, min(1.0, st["steer"]))
         st["thr"] = max(0.0, min(1.0, st["thr"]))
@@ -366,7 +390,7 @@ def main() -> int:
         # ---------------- 1) 车道巡航到预置点 ----------------
         if phase == "CRUISE":
             remaining = math.hypot(stg[0] - x, stg[1] - y)
-            thr, brk = approach_cmd(v, remaining)
+            thr, brk = approach_hold(v, remaining, 2.0, 4.8)
             # 直线跟踪：目标点 = 预置点
             dx, dy = stg[0] - x, stg[1] - y
             th = heading_rad(yaw)
@@ -412,7 +436,7 @@ def main() -> int:
         if phase == "FWD":
             steer, fwd_idx = pp_steer(x, y, yaw, fwd_pts, fwd_idx, lookahead=1.8)
             remain_fwd = math.hypot(fwd_pts[-1].x - x, fwd_pts[-1].y - y)
-            thr, brk = approach_cmd(v, remain_fwd)
+            thr, brk = approach_hold(v, remain_fwd, 0.0, 2.2)
             send(GearMode.DRIVE, thr, brk, steer)
             if now - last_log > 0.8:
                 last_log = now
@@ -485,6 +509,10 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
 
 
 
