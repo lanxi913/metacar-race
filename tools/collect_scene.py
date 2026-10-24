@@ -349,6 +349,8 @@ def parse_args() -> argparse.Namespace:
                         help="看到车位且对位点距离小于该值时接管倒车入库（0=一看到就接管）")
     parser.add_argument("--park-hold", type=float, default=8.0,
                         help="入库后保持驻车秒数（平台要 5 s，多留 3 s 余量）")
+    parser.add_argument("--park-slow-radius", type=float, default=20.0,
+                        help="离车位/元素终点多近才开始把目标速度压到 --park-speed")
     parser.add_argument("--detail", action="store_true", help="额外写逐帧完整消息 frames_detail.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="输出目录（默认 logs\\collect\\<时间戳>）")
     parser.add_argument("--max-wall", type=float, default=3600.0, help="墙钟保护上限 s")
@@ -637,13 +639,15 @@ def main() -> int:
                     else:
                         park_hold = True
                 if args.mode == "park" and in_park_elem:
-                    # 只在「车位已经不远」或「快到最后 45 m」时限速。从元素起点就压到
-                    # 2 m/s 会把 180 m 拉成 90 s（实测垂直泊车元素 121 s / 200 s）。
+                    # 只在「已经贴近车位/终点」时压速。以前是从元素起点就压到 2 m/s，
+                    # 180 m 的进近段全程爬行（实测垂直泊车元素 121 s / 200 s）：车既没有
+                    # 加速段，也就谈不上「先加速再减速」。进近段的正常减速交给曲率剖面和
+                    # 倒车入库的 approach（d_stage<=park_engage 时接管，自带距离减速）去做。
                     park_end_s = sub_ranges.get(current_sub, (-1, 0.0, 0.0))[2]
-                    slot_near = (slot_now is not None
-                                 and math.hypot(slot_now.pos_x - pose.pos_x,
-                                                slot_now.pos_y - pose.pos_y) < 60.0)
-                    if slot_near or proj["s"] > park_end_s - 45.0:
+                    slot_dist = (float("inf") if slot_now is None else
+                                 math.hypot(slot_now.pos_x - pose.pos_x,
+                                            slot_now.pos_y - pose.pos_y))
+                    if slot_dist < args.park_slow_radius or proj["s"] > park_end_s - args.park_slow_radius:
                         v_tgt = min(v_tgt, args.park_speed)
                 speed_ctl.v_target = v_tgt
                 cmd_throttle, cmd_brake = speed_ctl.update(
