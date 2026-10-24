@@ -55,6 +55,23 @@ REVERSE_STEER_SIGN = -1.0
 
 CENTER_TOL_M = 0.35
 HEADING_TOL_DEG = 8.0
+STAGE_LATERAL_M = 5.64          # 车位中心到车道中心的横向距离（基线与连续场景实测一致）
+STOP_AT_STAGE_M = 0.35          # 距准备点这么近就刹停换倒挡
+AIM_NEAR_M = 28.0               # 距准备点这么近就不再跟赛道，直接对准准备点
+
+
+class _Point:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x: float, y: float) -> None:
+        self.x = float(x)
+        self.y = float(y)
+
+
+def aim_steering(x, y, yaw, target, lookahead=3.0):
+    """直接对准准备点的转向（复用 PurePursuit 的方向盘约定）。"""
+    path = [_Point(x, y), _Point(target[0], target[1])]
+    return PurePursuit(path, lookahead=lookahead).steering(x, y, yaw)
 
 
 def wrap_deg(angle: float) -> float:
@@ -193,56 +210,62 @@ def main() -> int:
             met = slot_metrics(pose, slot, car_len, car_wid)
             heading_error = wrap_deg(float(slot.ori_z) - yaw)
 
-            # 记录"最近点"，用来复刻基线的"开过车位 5.57 m 再停"（只在车位 60 m 内开始跟踪）
-            if met["dist"] < 60.0 and met["dist"] < min_dist - 1e-3:
-                min_dist = met["dist"]
-                closest = (x, y)
-            past_m = 0.0 if closest is None else math.hypot(x - closest[0], y - closest[1])
+            # 倒车准备点：车位中心沿"出库方向"5.64 m、沿行进方向再退 5.57 m（与基线同构）
+            ux, uy, vx, vy = slot_axes(slot)
+            stage = (float(slot.pos_x) + ux * STAGE_LATERAL_M - vx * args.stage_past,
+                     float(slot.pos_y) + uy * STAGE_LATERAL_M - vy * args.stage_past)
+            dsx, dsy = stage[0] - x, stage[1] - y
+            d_stage = math.hypot(dsx, dsy)
+            if pursuit is not None and static.route:
+                i_near = min(range(len(static.route)),
+                             key=lambda k: (static.route[k].x - x) ** 2
+                             + (static.route[k].y - y) ** 2)
+                j_near = min(len(static.route) - 1, i_near + 3)
+                tx = static.route[j_near].x - static.route[i_near].x
+                ty = static.route[j_near].y - static.route[i_near].y
+                tn = math.hypot(tx, ty) or 1.0
+                tx, ty = tx / tn, ty / tn
+            else:
+                rad = math.radians(-yaw)
+                tx, ty = math.cos(rad), math.sin(rad)
+            remaining = dsx * tx + dsy * ty
 
             if phase == "approach":
-                if past_m >= args.stage_past:
+                if remaining <= STOP_AT_STAGE_M or d_stage <= STOP_AT_STAGE_M:
                     if speed <= STAGE_STILL_SPEED_MS:
                         vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
                         stationary += dt
                     else:
                         vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                            brake=0.10, steering=0.0)
+                                            brake=0.12, steering=0.0)
                         stationary = 0.0
                     if stationary >= STAGE_SETTLE_SECONDS:
                         stage_ready = True
                         phase = "reverse"
                         stationary = 0.0
                         print(f"到达倒车准备点 ({x:.2f},{y:.2f}) yaw={yaw:.1f} "
-                              f"slot_dist={met['dist']:.2f} dv={met['dv']:+.2f} "
-                              f"过了车位 {past_m:.2f} m", flush=True)
+                              f"剩余={remaining:+.2f} 距准备点={d_stage:.2f} "
+                              f"du={met['du']:+.2f} dv={met['dv']:+.2f}", flush=True)
+                elif d_stage < AIM_NEAR_M:
+                    # 车位附近：不再跟赛道（赛道末段会拐进车位），直接对准准备点并减速
+                    v_des = min(2.20, max(0.35, 0.90 * remaining))
+                    steer = aim_steering(x, y, yaw, stage)
+                    thr = min(0.20, max(0.0, 0.02 + 0.05 * (v_des - speed)))
+                    brk = 0.0
+                    if speed > v_des + 0.30:
+                        brk = min(0.25, max(0.03, 0.05 * (speed - v_des)))
+                        thr = 0.0
+                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
+                                        brake=brk, steering=steer)
                 else:
-                    near = past_m > 0.0 or met["dist"] < 15.0
                     steer = pursuit.steering(x, y, yaw) if pursuit is not None else 0.0
-                    if near:
-                        # 车位附近按剩余距离给目标速度，再小增益闭环（基线只在最后一米爬行）
-                        if past_m > 0.0:
-                            remaining = max(args.stage_past - past_m, 0.0)
-                        else:
-                            remaining = max(met["dist"] - args.stage_past, 0.0)
-                        v_des = min(2.50, max(0.30, 0.35 * remaining + 0.25))
-                        thr = min(0.20, max(0.0, 0.02 + 0.05 * (v_des - speed)))
-                        brk = 0.0
-                        if speed > v_des + 0.25:
-                            brk = min(0.25, max(0.03, 0.05 * (speed - v_des)))
-                            thr = 0.0
-                        vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
-                                            brake=brk, steering=steer)
-                    else:
-                        v_tgt = args.vmax
-                        if profile is not None:
-                            idx = min(range(len(static.route)),
-                                      key=lambda i: (static.route[i].x - x) ** 2
-                                      + (static.route[i].y - y) ** 2)
-                            v_tgt = profile.target(idx, speed)
-                        speed_ctl.v_target = v_tgt
-                        thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
-                        vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
-                                            brake=brk, steering=steer)
+                    v_tgt = args.vmax
+                    if profile is not None and pursuit is not None:
+                        v_tgt = profile.target(i_near, speed)
+                    speed_ctl.v_target = v_tgt
+                    thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
+                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
+                                        brake=brk, steering=steer)
 
             elif phase == "reverse":
                 if (met["dist"] <= CENTER_TOL_M and abs(heading_error) <= HEADING_TOL_DEG
