@@ -225,8 +225,9 @@ class SlotReverseParker:
             # 靠近车位中心就减速，并在 0.45 m 内停住（不再依赖"走到路径末端"）
             dist = math.hypot(dx, dy)
             v_target = 0.35 if dist < 1.6 else V_REVERSE
-            # 只有航向已经大致对上（<20°）才进精细对位，否则继续走圆弧
-            if dist < 1.5 and yaw_err < 20.0:
+            # 必须走完两段圆弧（best_i >= b2）才允许进精细对位，
+            # 否则会在圆弧没走完时被截断，横向少走 1 m 以上
+            if best_i >= b2 and dist < 1.5 and yaw_err < 20.0:
                 self.phase = "FINE"          # 最后 1.5 m 交给精细对位
                 self.hold = 0.0
                 return (VehicleControl(gear=GearMode.DRIVE, brake=0.25),
@@ -329,6 +330,7 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
 
 
 
