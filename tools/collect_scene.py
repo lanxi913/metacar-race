@@ -66,11 +66,12 @@ from metacar_race.config import (  # noqa: E402
     LOOKAHEAD_M,
 )
 from metacar_race.control.tracking import PurePursuit, SpeedController  # noqa: E402
+from metacar_race.control.profile import SpeedProfile  # noqa: E402
 
 FRAME_FIELDS = [
     "frame", "wall_t", "sim_t", "dt_sim", "elem_t", "elem_limit", "elem_remain",
     "sub_scene", "sub_idx", "sub_progress", "restart",
-    "x", "y", "z", "yaw_deg", "vx", "vy", "vz", "speed", "speed_kmh",
+    "x", "y", "z", "yaw_deg", "vx", "vy", "vz", "speed", "speed_kmh", "v_tgt",
     "accel", "accel_raw",
     "gear", "throttle", "brake", "steering",
     "cmd_gear", "cmd_throttle", "cmd_brake", "cmd_steer",
@@ -291,6 +292,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["hold", "traj", "route"], default="hold",
                         help="hold=驻车只采几何（默认）；traj=沿建议轨迹低速跑；route=沿静态路线跑")
     parser.add_argument("--speed", type=float, default=3.0, help="traj/route 模式的目标速度 m/s")
+    parser.add_argument("--vmax", type=float, default=0.0,
+                        help="按曲率剖面跑时的直道速度上限 m/s（>0 时接管 --speed）")
+    parser.add_argument("--alat", type=float, default=2.5, help="剖面用横向加速度上限 m/s²")
+    parser.add_argument("--atan", type=float, default=1.5, help="剖面用纵向加减速上限 m/s²")
+    parser.add_argument("--throttle-cap", type=float, default=0.40,
+                        help="油门上限（0.40 约 17 km/h，跑高速要放到 0.85 以上）")
     parser.add_argument("--lookahead", type=float, default=LOOKAHEAD_M, help="纯跟踪前视距离 m")
     parser.add_argument("--duration", type=float, default=0.0,
                         help="采集多少仿真秒后停（0=一直采到场景结束）")
@@ -335,6 +342,16 @@ def main() -> int:
               flush=True)
     print("  静态数据: " + ", ".join(f"{k}({v})" for k, v in exported["counts"].items()), flush=True)
 
+    profile = None
+    if args.vmax > 0.0 and args.mode != "hold" and projector.n >= 3:
+        profile = SpeedProfile(static.route, v_max=args.vmax,
+                               a_lat=args.alat, a_tan=args.atan)
+        vmin = min(profile.v)
+        est = sum((profile.s[i] - profile.s[i - 1]) / max(profile.v[i], 0.3)
+                  for i in range(1, len(profile.v)))
+        print(f"  曲率剖面: v_max={args.vmax:.1f} a_lat={args.alat:.1f} a_tan={args.atan:.1f}"
+              f" -> 最低限速 {vmin:.1f} m/s，按剖面理论全程 {est:.1f} s", flush=True)
+
     frames_path = out_dir / "frames.csv"
     frames_fh = frames_path.open("w", newline="", encoding="utf-8-sig")
     frames_csv = csv.DictWriter(frames_fh, fieldnames=FRAME_FIELDS, extrasaction="ignore")
@@ -353,7 +370,9 @@ def main() -> int:
     emit("connect", route_points=projector.n, route_len=round(projector.total, 2),
          sub_scenes=[sub.name for sub in static.sub_scenes], mode=args.mode)
 
-    speed_ctl = SpeedController(v_target=args.speed, accel_limit=1.5)
+    speed_ctl = SpeedController(v_target=args.speed,
+                                accel_limit=args.atan if profile else 1.5,
+                                throttle_max=args.throttle_cap)
     speed_ctl.reset(0.0)
     pursuit = PurePursuit(static.route, lookahead=args.lookahead) if projector.n >= 2 else None
 
@@ -472,6 +491,7 @@ def main() -> int:
             # ---- 控制 ----
             cmd_throttle = cmd_brake = cmd_steer = 0.0
             cmd_gear = GearMode.PARKING
+            v_tgt = args.speed
             if args.mode == "hold":
                 vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
                 cmd_brake = 1.0
@@ -488,6 +508,9 @@ def main() -> int:
                     detail_route_warned = True
                     emit("warning", what="建议轨迹为空，退回静态 route")
                 dt_ctl = dt_sim if dt_sim > 1e-4 else (dt_wall if dt_wall > 1e-4 else 0.2)
+                if profile is not None:
+                    v_tgt = profile.target(proj["idx"], speed)
+                    speed_ctl.v_target = v_tgt
                 cmd_throttle, cmd_brake = speed_ctl.update(
                     speed, dt_ctl, a_now=accel_f, allow_kick=args.kick)
                 cmd_gear = GearMode.DRIVE
@@ -576,6 +599,7 @@ def main() -> int:
                 "yaw_deg": f3(pose.ori_z, 2),
                 "vx": f3(pose.vel_x, 3), "vy": f3(pose.vel_y, 3), "vz": f3(pose.vel_z, 3),
                 "speed": f3(speed, 3), "speed_kmh": f3(speed * 3.6, 2),
+                "v_tgt": f3(v_tgt, 2),
                 "accel": f3(accel_f, 3), "accel_raw": f3(a_raw, 3),
                 "gear": car.gear.name, "throttle": f3(car.throttle, 2),
                 "brake": f3(car.brake, 2), "steering": f3(car.steering, 3),

@@ -96,9 +96,12 @@ class SpeedController:
     才能把 |a| 压在 5 m/s² 以内（场景元素加分项）。
     """
 
-    def __init__(self, v_target=TRACK_SPEED_MS, accel_limit=ACCEL_LIMIT_MS2):
+    def __init__(self, v_target=TRACK_SPEED_MS, accel_limit=ACCEL_LIMIT_MS2,
+                 throttle_max=0.40):
         self.v_target = float(v_target)
         self.accel_limit = float(accel_limit)
+        # 0.40 是老的单场景限速（约 17.2 km/h）。要跑到 8 m/s 必须放开，交给加速度闭环兜住。
+        self.throttle_max = float(throttle_max)
         self.v_cmd = 0.0          # 当前允许的速度指令（带斜坡）
         self._throttle = 0.0
         self._brake = 0.0
@@ -142,8 +145,8 @@ class SpeedController:
         # 5) 需要加速 -> 用加速度误差积分油门，刹车间隙释放
         else:
             self._throttle += max(-0.03, min(0.03, 0.03 * (a_des - self._a_f)))
-            # 全油门约 10 m/s²，这里限制到 0.40 把加速度压在 5 以内
-            self._throttle = max(0.0, min(0.40, self._throttle))
+            # 全油门约 10 m/s²，这里限制油门把加速度压在 5 以内
+            self._throttle = max(0.0, min(self.throttle_max, self._throttle))
             brake_cmd = 0.0
 
         # 5.5) 升挡 kick：低挡位下油门再大也上不去（实测卡 17.2 km/h），
