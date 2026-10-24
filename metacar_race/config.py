@@ -70,3 +70,27 @@ STOP_STEER_LOCK_DISTANCE_M = 2.5 # 终点附近回正，避免越过目标后继
 # ---- 直角转弯标定（feat/control-calibration）----
 TURN_THROTTLE_COMMAND = 0.01     # 与停车题相同，稳态约 4.78 m/s
 TURN_LOOKAHEAD_M = 3.0           # 匹配题目的 3 m 曲率，避免大前视切弯
+
+# ---- 垂直车道泊车标定（feat/control-calibration）----
+PARK_LOOKAHEAD_M = 2.5           # 车位窄，前视距离小于直角转弯
+PARK_APPROACH_DISTANCE_M = 8.5   # 从这个剩余距离开始重建泊车末段
+PARK_ALIGN_EXTENSION_M = 3.0     # 转向引导延伸到车位中心之后，停车仍停在中心
+PARK_THROTTLE_COMMAND = 0.005    # 泊车段速度更低，减少切弯和碰撞
+PARK_REVERSE_THROTTLE = 0.01     # 第一次入位后倒车调整姿态
+PARK_ADJUST_THROTTLE = 0.005     # 回正时低速前进
+PARK_REVERSE_DISTANCE_M = 0.7    # 只做小幅倒车，避免把车横向带出车位
+PARK_RECOVERY_CONTROL_M = 1.2    # 回正曲线起止切线长度
+PARK_RECOVERY_LOOKAHEAD_M = 1.2  # 短距离回正时的小前视距离
+PARK_PAUSE_SECONDS = 0.40        # 换挡前先停稳
+PARK_ALIGN_TOLERANCE_DEG = 2.0   # 车位轴向角度容差
+PARK_ENTRY_RADIUS_M = 0.75       # 进入该范围且停稳后允许倒车调姿
+PARK_APPROACH_OFFSET_M = 0.0     # 回退实验无效，恢复使用真实车位中心
+PARK_POSITION_TOLERANCE_M = 0.25 # 与车位中心的允许误差
+PARK_FINAL_ALIGN_DEG = 3.0       # 最终车身与车位轴线的角度容差
+PARK_MAX_ADJUST_CYCLES = 4       # 最多倒车/回正轮数，防止无限循环
+PARK_ALIGN_TIMEOUT_SECONDS = 10.0  # 前向回正阶段的最长持续时间
+
+# ---- 入口对齐 + 直线入位 ----
+PARK_ENTRY_LOOKAHEAD_M = 3.0     # 入位前转弯段的前视距离
+PARK_ENTRY_ALIGN_DEG = 4.0       # 车位入口允许的航向误差
+PARK_ENTRY_SWITCH_RADIUS_M = 0.75  # 进入入口切换区的距离

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from metacar import GearMode, VehicleControl
 
 from metacar_race.config import (
+    LOOKAHEAD_M,
     STOP_BRAKE_COMMAND,
     STOP_BRAKE_DECEL_MS2,
     STOP_BRAKE_LEAD_M,
@@ -37,8 +38,16 @@ class StopInfo:
 class StopController:
     """循迹到终点后停车，并保持制动 5 s。"""
 
-    def __init__(self, route):
-        self.pursuit = PurePursuit(route)
+    def __init__(
+        self,
+        route,
+        lookahead: float = LOOKAHEAD_M,
+        throttle_command: float = STOP_THROTTLE_COMMAND,
+        steer_lock_distance: float = STOP_STEER_LOCK_DISTANCE_M,
+    ):
+        self.pursuit = PurePursuit(route, lookahead=lookahead)
+        self.throttle_command = float(throttle_command)
+        self.steer_lock_distance = float(steer_lock_distance)
         self.stopped = False
         self.held_seconds = 0.0
         self.braking = False
@@ -113,11 +122,14 @@ class StopController:
                     StopInfo(distance, along_track, 0.0, True, 0.0),
                 )
         else:
-            throttle = STOP_THROTTLE_COMMAND
+            throttle = self.throttle_command
             brake = 0.0
             self._low_speed_seconds = 0.0
 
-        if along_track <= STOP_STEER_LOCK_DISTANCE_M:
+        if (
+            self.steer_lock_distance > 0.0
+            and along_track <= self.steer_lock_distance
+        ):
             steering = 0.0
         else:
             steering = self.pursuit.steering(x, y, yaw_deg)
@@ -132,7 +144,7 @@ class StopController:
             StopInfo(
                 distance,
                 along_track,
-                0.0 if self.braking else STOP_THROTTLE_COMMAND,
+                0.0 if self.braking else self.throttle_command,
                 self.stopped,
                 self.held_seconds,
             ),

@@ -23,13 +23,23 @@ from metacar import GearMode, SceneAPI, VehicleControl
 # 直接运行 tools\calibrate_stop.py 时，将仓库根目录加入模块搜索路径。
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from metacar_race.config import STOP_EXIT_GRACE_SECONDS, STOP_HOLD_SECONDS
+from metacar_race.config import (
+    LOOKAHEAD_M,
+    STOP_EXIT_GRACE_SECONDS,
+    STOP_HOLD_SECONDS,
+)
 from metacar_race.control.stop import StopController, hold_complete
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="车辆停止标定")
     parser.add_argument("--seconds", type=float, default=100.0, help="运行时限")
+    parser.add_argument(
+        "--lookahead",
+        type=float,
+        default=LOOKAHEAD_M,
+        help="纯跟踪前视距离",
+    )
     args = parser.parse_args()
 
     print("连接仿真场景（先跑脚本，再点启动场景）...", flush=True)
@@ -43,12 +53,13 @@ def main() -> int:
         print("route 点不足，无法循迹。", flush=True)
         return 1
 
-    controller = StopController(route)
+    controller = StopController(route, lookahead=args.lookahead)
     fallback_end = static.sub_scenes[-1].end_point if static.sub_scenes else None
     endpoint = fallback_end
     print(
         f"子场景: {[s.name for s in static.sub_scenes]}  "
-        f"路线点: {len(route)}  初始终点: {fallback_end}",
+        f"路线点: {len(route)}  前视: {args.lookahead:.2f}  "
+        f"初始终点: {fallback_end}",
         flush=True,
     )
 
