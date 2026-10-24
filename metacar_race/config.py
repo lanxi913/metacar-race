@@ -148,3 +148,18 @@ EMERGENCY_STOP_DECEL_RATIO = 0.40       # 保守规划制动距离，提前开�
 EMERGENCY_STOP_CLEARANCE_RATIO = 0.05   # 终点处最小净余量按主车长度比例
 EMERGENCY_STOP_RESPONSE_SECONDS = 0.50
 EMERGENCY_STOP_HOLD_SECONDS = 3.0
+# ---- 车辆停止（正式模板）----
+STOP_THROTTLE_COMMAND = 0.01     # 稳态约 4.78 m/s
+STOP_BRAKE_COMMAND = 0.10        # 从 4.78 m/s 停车约 4.22 m
+STOP_BRAKE_DECEL_MS2 = 2.70      # 刹车指令的等效平均减速度
+STOP_BRAKE_LEAD_M = 0.10         # 补偿控制周期
+STOP_CAPTURE_RADIUS_M = 0.20     # 停车捕获半径
+STOP_STILL_SPEED_MS = 0.30       # 静止时速度信号抖动范围
+STOP_SETTLE_SECONDS = 0.80       # 锁存驻车前低速持续时间
+STOP_HOLD_SECONDS = 5.0          # 题目要求停稳 5 s
+STOP_EXIT_GRACE_SECONDS = 1.0    # 标定结束后额外制动时间
+STOP_STEER_LOCK_DISTANCE_M = 2.5 # 终点附近回正距离
+
+# ---- 直角转弯（正式模板）----
+TURN_THROTTLE_COMMAND = 0.01     # 稳态约 4.78 m/s
+TURN_LOOKAHEAD_M = 3.0           # 匹配 3 m 曲率，避免大前视切弯
