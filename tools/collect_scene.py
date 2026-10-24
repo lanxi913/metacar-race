@@ -305,6 +305,15 @@ def parse_args() -> argparse.Namespace:
                         help="hold 模式下每个元素停留多少秒后跳关（0=不跳）")
     parser.add_argument("--kick", action="store_true",
                         help="允许升挡 kick：低挡位下油门再大也卡在 17.2 km/h，开这个才会升挡")
+    parser.add_argument("--kick-throttle", type=float, default=0.45,
+                        help="升挡 kick 的油门（1.0 会把车甩到 14 m/s，实测）")
+    parser.add_argument("--kick-time", type=float, default=0.4, help="升挡 kick 持续秒数")
+    parser.add_argument("--park-probe", action="store_true",
+                        help="进入泊车元素后降到 --park-speed，并在终点前 --park-stop-m 驻车，"
+                             "把车位附近障碍物完整写进 obstacles.jsonl")
+    parser.add_argument("--park-speed", type=float, default=2.0, help="泊车元素内的限速 m/s")
+    parser.add_argument("--park-stop-m", type=float, default=8.0,
+                        help="在泊车元素终点前多少米驻车（正值=提前停）")
     parser.add_argument("--detail", action="store_true", help="额外写逐帧完整消息 frames_detail.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="输出目录（默认 logs\\collect\\<时间戳>）")
     parser.add_argument("--max-wall", type=float, default=3600.0, help="墙钟保护上限 s")
@@ -359,6 +368,8 @@ def main() -> int:
 
     events_fh = (out_dir / "events.jsonl").open("w", encoding="utf-8")
     detail_fh = (out_dir / "frames_detail.jsonl").open("w", encoding="utf-8") if args.detail else None
+    obs_fh = ((out_dir / "obstacles.jsonl").open("w", encoding="utf-8")
+              if args.park_probe else None)
 
     def emit(kind: str, **payload) -> None:
         events_fh.write(json.dumps(
@@ -372,7 +383,9 @@ def main() -> int:
 
     speed_ctl = SpeedController(v_target=args.speed,
                                 accel_limit=args.atan if profile else 1.5,
-                                throttle_max=args.throttle_cap)
+                                throttle_max=args.throttle_cap,
+                                kick_throttle=args.kick_throttle,
+                                kick_time=args.kick_time)
     speed_ctl.reset(0.0)
     pursuit = PurePursuit(static.route, lookahead=args.lookahead) if projector.n >= 2 else None
 
@@ -492,6 +505,7 @@ def main() -> int:
             cmd_throttle = cmd_brake = cmd_steer = 0.0
             cmd_gear = GearMode.PARKING
             v_tgt = args.speed
+            park_hold = False
             if args.mode == "hold":
                 vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
                 cmd_brake = 1.0
@@ -511,6 +525,15 @@ def main() -> int:
                 if profile is not None:
                     v_tgt = profile.target(proj["idx"], speed)
                     speed_ctl.v_target = v_tgt
+                # 泊车探针：先降速，到元素终点前 park_stop_m 直接驻车，
+                # 让我们能在不撞车的前提下把车位附近的障碍物看全。
+                if args.park_probe and current_sub and "泊车" in current_sub:
+                    park_end_s = sub_ranges.get(current_sub, (-1, 0.0, 0.0))[2]
+                    if proj["s"] < park_end_s - args.park_stop_m:
+                        v_tgt = min(v_tgt, args.park_speed)
+                    else:
+                        park_hold = True
+                    speed_ctl.v_target = v_tgt
                 cmd_throttle, cmd_brake = speed_ctl.update(
                     speed, dt_ctl, a_now=accel_f, allow_kick=args.kick)
                 cmd_gear = GearMode.DRIVE
@@ -518,6 +541,12 @@ def main() -> int:
                     gear=cmd_gear, throttle=cmd_throttle,
                     brake=cmd_brake, steering=cmd_steer,
                 )
+            if park_hold:
+                cmd_throttle = 0.0
+                cmd_brake = 1.0
+                cmd_steer = 0.0
+                cmd_gear = GearMode.PARKING
+                vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
             api.set_vehicle_control(vc)
 
             # ---- 跳关 ----
@@ -547,6 +576,22 @@ def main() -> int:
                          removed=[[i, t] for i, t in removed][:40],
                          total=len(obstacle_keys))
                 prev_obstacles = obstacle_keys
+
+            if obs_fh is not None and current_sub and "泊车" in current_sub:
+                obs_fh.write(json.dumps({
+                    "sim_t": round(sim_t, 3),
+                    "ego": [round(pose.pos_x, 3), round(pose.pos_y, 3), round(pose.ori_z, 3),
+                            round(speed, 3)],
+                    "obstacles": [{
+                        "id": int(o.id), "type": o.type.name, "type_id": int(o.type.value),
+                        "x": round(o.pos_x, 3), "y": round(o.pos_y, 3), "z": round(o.pos_z, 3),
+                        "ori_z": round(o.ori_z, 3),
+                        "vx": round(o.vel_x, 3), "vy": round(o.vel_y, 3),
+                        "len": round(o.length, 3), "wid": round(o.width, 3),
+                        "hgt": round(o.height, 3), "extra": o.extra_info,
+                    } for o in msg.obstacles],
+                }, ensure_ascii=False) + "\n")
+                obs_fh.flush()
 
             light_state: dict[str, str] = {}
             for group in msg.traffic_light_groups:
@@ -668,6 +713,8 @@ def main() -> int:
         frames_fh.close()
         if detail_fh is not None:
             detail_fh.close()
+        if obs_fh is not None:
+            obs_fh.close()
 
     summary = {
         "stop_reason": stop_reason,

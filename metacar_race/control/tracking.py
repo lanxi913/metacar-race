@@ -97,11 +97,15 @@ class SpeedController:
     """
 
     def __init__(self, v_target=TRACK_SPEED_MS, accel_limit=ACCEL_LIMIT_MS2,
-                 throttle_max=0.40):
+                 throttle_max=0.40, kick_throttle=0.45, kick_time=0.40):
         self.v_target = float(v_target)
         self.accel_limit = float(accel_limit)
         # 0.40 是老的单场景限速（约 17.2 km/h）。要跑到 8 m/s 必须放开，交给加速度闭环兜住。
         self.throttle_max = float(throttle_max)
+        # 升挡 kick 的强度：顶满油门 0.8 s 会把车速直接甩到 14.3 m/s（实测 20261024-131247），
+        # 只能给到刚好触发换挡的量。
+        self.kick_throttle = float(kick_throttle)
+        self.kick_time = float(kick_time)
         self.v_cmd = 0.0          # 当前允许的速度指令（带斜坡）
         self._throttle = 0.0
         self._brake = 0.0
@@ -150,10 +154,12 @@ class SpeedController:
             brake_cmd = 0.0
 
         # 5.5) 升挡 kick：低挡位下油门再大也上不去（实测卡 17.2 km/h），
-        #      需要短暂顶满油门触发换挡，再回落到闭环。
+        #      需要短暂给一脚油门触发换挡，再回落到闭环。
+        #      20261024-131247 那次 1.0 油门顶 0.8 s，车速从 4.77 甩到 14.28 m/s，
+        #      直接把直角转弯的加速度奖励打没了，所以强度和时长都要收。
         if self._kick_left > 0.0:
             self._kick_left -= dt
-            self._throttle = 1.0
+            self._throttle = self.kick_throttle
             self._brake = 0.0
             self._stuck_t = 0.0
             return self._throttle, self._brake
@@ -165,7 +171,7 @@ class SpeedController:
             else:
                 self._stuck_t = 0.0
             if self._stuck_t > 0.8:
-                self._kick_left = 0.8
+                self._kick_left = self.kick_time
                 self._stuck_t = 0.0
         else:
             self._stuck_t = 0.0
