@@ -131,6 +131,8 @@ metacar-race/
 | `ModuleNotFoundError: metacar` | 解释器不对 | 用 `.venv\Scripts\python.exe`，别用系统 python |
 | 速度卡在 **17.2 km/h** | 卡在低挡位 | 油门给到 1.0 顶到升挡；详见 docs/01 |
 | 脚本跑了场景没反应 | 程序已异常退出 | 先看终端最后 20 行 |
+| 连续场景被**拉回元素起点** | 元素超时自动重开（如连续转弯 857.8 m / 200 s） | 均速要够，详见 docs/08 |
+| `used_time` 忽大忽小 | 它是元素内计时，切元素/重开都归零 | 全局时钟自己累加，详见 docs/08 |
 
 ---
 
@@ -140,4 +142,5 @@ metacar-race/
 - [赛题规则速查](docs/02-rules.md)
 - [协作流程](docs/03-workflow.md)
 - [10 天路线图](docs/04-roadmap.md)
+- [连续场景1：元素、时限与跑法](docs/08-continuous-scene.md)
 - 参赛作战手册：`docs/2026智能无人系统算法挑战赛-参赛作战手册.docx`
