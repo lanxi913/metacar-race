@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """几何循迹控制器（规则 / 车辆 / 场景数据驱动，输出平滑）
 
 设计目标（按用户反馈修正）：**不摇摆、不冲速**。
@@ -223,8 +223,8 @@ class GeoFollower:
             v_best = min(v_best, v_allow)
             ds += step
         rem = self.path.total - s
-        # 终点别把速度降到 0：留 1.2 m/s 缓慢通过终点线，仿真收尾停车才不会被判加速度超标
-        v_end = max(1.2, math.sqrt(max(2.0 * 2.0 * max(rem - 0.3, 0.0), 0.0)))
+        # 终点主动停稳：减速到 0（而不是留给仿真强制停车），这样收尾那一下不会判加速度超标
+        v_end = math.sqrt(max(2.0 * 2.0 * max(rem - 0.2, 0.0), 0.0))
         v_best = min(v_best, v_end)
         if self.v_meas_max > 0.5:
             v_best = min(v_best, self.v_meas_max * 1.02)
@@ -263,7 +263,9 @@ class GeoFollower:
                     continue
                 os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
                 dg = os_ - s
-                if 0.0 < dg < 40.0 and abs(oe - self.offset) < self.lane_w / 2.0 + CAR_HALF_WIDTH:
+                # 用"目标车道"判定，并跳过车身侧后 5 m 内的车——否则换道过程中车旁边那辆
+                # 会被误判成正前方障碍，速度指令瞬间压到 0，表现为"超车时顿一下"
+                if 5.0 < dg < 40.0 and abs(oe - self.offset_target) < self.lane_w / 2.0 + CAR_HALF_WIDTH:
                     gap = dg if gap is None else min(gap, dg)
             if gap is not None:
                 safe_gap = 4.0 + 2.0
@@ -416,6 +418,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 
