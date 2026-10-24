@@ -57,6 +57,12 @@ def main() -> int:
     ap.add_argument("--offset", type=float, default=0.0)
     ap.add_argument("--nobrake", action="store_true")
     ap.add_argument("--cscale", type=float, default=1.0)
+    ap.add_argument("--endzone", type=float, default=0.0,
+                    help="距终点多少米开始按 v=sqrt(2*0.8*d) 减速（0=沿用 3 m 逻辑）")
+    ap.add_argument("--endbrake", action="store_true",
+                    help="终点区内允许轻刹（覆盖 --nobrake，上限 0.2）")
+    ap.add_argument("--steerat", type=float, default=1.0,
+                    help="方向盘每帧最大变化量，用来压横向加速度")
     args = ap.parse_args()
 
     print("等待场景连接...")
@@ -79,6 +85,7 @@ def main() -> int:
     last = 0.0
     lim = {"thr": 0.0, "brk": 0.0}
     done = False
+    steer_prev = None
 
     def send(vc):
         lim["thr"] += max(-0.0015, min(0.0015, vc.throttle - lim["thr"]))
@@ -166,11 +173,19 @@ def main() -> int:
             vt = min(vt, 1.8 * cs)
 
         dist_left = math.hypot(route[-1][0] - pose.pos_x, route[-1][1] - pose.pos_y)
+        if args.endzone > 0 and dist_left < args.endzone:
+            # v = sqrt(2*a*d)，a 取 0.8 m/s2：进终点区前提早平缓减速
+            vt = min(vt, max(0.8, math.sqrt(2.0 * 0.8 * max(dist_left, 0.0))))
         if dist_left < 3.0:
             if not done:
                 done = True
                 print(f"接近终点 3 m，开始减速（剩余 {dist_left:.1f} m）")
             vt = min(vt, max(0.4, 0.6 * dist_left))
+
+        # 方向盘限速：避免冲线弯这种近距离大转角把横向加速度顶上去
+        prev_steer = steer_prev if steer_prev is not None else steer
+        steer = max(prev_steer - args.steerat, min(prev_steer + args.steerat, steer))
+        steer_prev = steer
 
         thr, brk = speed_cmd(v, vt)
 
@@ -180,11 +195,14 @@ def main() -> int:
             brk = 0.0
 
         # 可选：超速只松油门滑行，不踩刹车（避免负加速度违规）
-        if getattr(args, "nobrake", False):
+        in_endzone = args.endzone > 0 and dist_left < args.endzone
+        if getattr(args, "nobrake", False) and not (args.endbrake and in_endzone):
             if brk > 0:
                 brk = 0.0
             if dist_left < 2.0 and v < 1.2:
                 brk = 0.05
+        elif in_endzone:
+            brk = min(brk, 0.20)
 
         send(VehicleControl(gear=GearMode.DRIVE, throttle=thr, brake=brk, steering=steer))
 
