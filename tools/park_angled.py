@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
-PARKING_SLOT_TYPE = 30
+PARKING_SLOT_TYPE = "PARKING_SLOT"   # 接口返回的是字符串类型名，不是数字 30
 ARC_RADIUS = 5.26          # m，满舵倒车半径（车辆属性，与 park_v8 一致）
 STAGING_EXTRA = 0.10       # m，对位点再多让一点
 STAGE_SPEED = 0.14
@@ -72,7 +72,9 @@ def heading_rad(yaw_deg: float) -> float:
 
 def find_slot(obstacles):
     for ob in obstacles:
-        if getattr(ob, "type", None) == PARKING_SLOT_TYPE:
+        raw = getattr(ob, "type", None)
+        tname = getattr(raw, "name", None) or str(raw)      # 可能是枚举，也可能是字符串
+        if tname.upper().endswith("PARKING_SLOT"):
             return ob
     return None
 
@@ -114,8 +116,12 @@ def main() -> int:
     api.connect()
     print("已连接。")
 
-    static = api.get_scene_static_data()
-    slot = find_slot(static.obstacle)
+    # 车位来自实时消息（与 park_v8 一致），不是静态数据
+    slot = None
+    for msg0, _f in api.main_loop():
+        slot = find_slot(msg0.obstacles)
+        if slot is not None:
+            break
     if slot is None:
         print("没找到泊车位（type=30），场景不对？")
         return 1
