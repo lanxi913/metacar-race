@@ -218,7 +218,34 @@ def main() -> int:
             if slot is None and slot_now is not None:
                 slot = slot_now
             if slot is None:
-                api.set_vehicle_control(VehicleControl(gear=GearMode.DRIVE, throttle=0.02))
+                # 还没看到车位（起跑到车位有 200 m）：照常沿赛道跑，不能在这里爬行
+                if pursuit is not None and static.route:
+                    i_near = min(range(len(static.route)),
+                                 key=lambda k: (static.route[k].x - x) ** 2
+                                 + (static.route[k].y - y) ** 2)
+                    pursuit.sync(x, y)
+                    steer = pursuit.steering(x, y, yaw)
+                    v_tgt = profile.target(i_near, speed) if profile is not None else args.vmax
+                else:
+                    steer, v_tgt = 0.0, args.vmax
+                speed_ctl.v_target = v_tgt
+                thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
+                vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
+                                    brake=brk, steering=steer)
+                api.set_vehicle_control(vc)
+                writer.writerow([
+                    frame, round(sim_t, 3), sub, "cruise", round(x, 3), round(y, 3),
+                    round(yaw, 2), round(speed, 3), car.gear.name,
+                    round(vc.throttle, 3), round(vc.brake, 2), round(vc.steering, 3),
+                    "", "", "", "", "", "",
+                ])
+                if frame % 60 == 0:
+                    csv_fh.flush()
+                    print(f"[{sim_t:6.1f}s] cruise   pos=({x:8.2f},{y:8.2f}) "
+                          f"yaw={yaw:6.1f} v={speed:5.2f} 未发现车位", flush=True)
+                if time.time() > t_end:
+                    ending = "timeout"
+                    break
                 continue
 
             car_len = float(getattr(car, "length", 0) or 0) or 4.814
