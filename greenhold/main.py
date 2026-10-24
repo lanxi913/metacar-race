@@ -62,8 +62,12 @@ V_MAX = 4.75            # 17.1 km/h：一挡平台 4.78 m/s 之前，永不升�
 BRK_CAP = 0.09
 LAUNCH_THR = 0.15       # 起步离合器咬合助力（0.6 s -> 0.2 s，见 playbook §3.9）
 ZONE_EDGE = 10.0        # 红灯检测区：车头距停止线 10 m 以内
-PACE_MIN = 0.30         # 配速下限（再慢就不好维持平稳了）
+PACE_MIN = 0.85         # 配速下限：低速可平稳保持的区间约 0.9~1.3 m/s（creep_probe2 实测）
+CROSS_MARGIN = 0.60     # 配速到"绿灯亮起后多少秒压过停止线"
 RED_LEN = 10.0          # 本场红灯时长（周期 20 s，绿 10 s / 红 10 s，现场实测）
+SOFT_GAIN = 0.020       # 低速配速段的软 P 律增益（thr = SOFT_GAIN*err）
+SOFT_THR_CAP = 0.020    # 软 P 律油门上限（实测 0.02 只给 2~2.5 m/s^2）
+SOFT_BRK_CAP = 0.020    # 软 P 律刹车上限（实测 0.02 只给 0.6 m/s^2）
 SOFT_LAUNCH_THR = 0.05  # 中途再起步（红灯停住后）的助力上限：前 0.5 s 的豁免不适用了
 HALF_LEN = 2.0          # 车长 4.0 m 的一半：规则里的"车头"= 中心 + 2.0 m
 PED_ALONG = 15.0        # 行人让行：前方 15 m
@@ -173,8 +177,9 @@ class Longi:
 
     KP = 1.0
     KI = 2.0
-    A_ACC_MAX = 3.0         # 本场是直行、没有弯道：横向加速度不占预算，纵向可以给大一点
-    A_ACC_SLOW = 1.8        # 2 m/s 以下：一挡低速扭矩放大，必须压小
+    A_ACC_MAX = 2.4         # 绿灯放开后从 1.2 m/s 加到 V_MAX：之前给 3.0 时实测
+                            # 相邻帧最大 |a| 到 4.8（快到 5 的红线，一次抖动就丢 +10）
+    A_ACC_SLOW = 1.5        # 2 m/s 以下：一挡低速扭矩放大，必须压小
     A_DEC_MAX = 1.8         # 刹车增益实测 32 m/s²/单位、BRK_CAP 0.09 -> 上限约 2.8，
                             # 但低速段实测只到 1.9 左右，指令超过 1.8 就跟不住
     THR_PER_A = 1.0 / 150.0
@@ -358,6 +363,7 @@ def main() -> int:
         # 不爬行、不反复点刹：要么整段维持一个恒速正好赶上绿灯窗口，
         # 要么（窗口来不及）按匀减速停到线前 2.5 m 等绿灯，一次通过。
         a_ff = None                     # 非 None：正在按已知速度剖面减速（前馈减速度）
+        pace_soft = False               # True：低速配速段，用软 P 律（见下）
         if not args.no_light:
             if light_id is None:
                 # 本进口的灯 = 前方、且在我方**右侧**（对向车道的灯会在左侧或在线上），
@@ -456,23 +462,46 @@ def main() -> int:
                         if frames % 30 == 1:
                             print(f"   绿灯剩余 {remain:.1f}s >= 最快通过 {t_min:.1f}s -> 巡航",
                                   flush=True)
-                    elif d_head > ZONE_EDGE + 1.0:
-                        # 现在还不能进路口（红灯 / 绿灯但出口堵着），但我们还离检测区
-                        # （车头 10 m）很远：不要停下来等，而是"配速"——把速度算成
-                        # "正好在绿灯亮起时开到检测区边界"，全程不停车。
-                        # 为什么必须这样做：本场中途一旦停住再起步，DRIVE 离合咬合那一帧
-                        # 就是 8.6~20 m/s^2 的冲击（实测三种压法都压不住），平台 |a|<=5
-                        # 的 +10 就没了；不停车 = 只有起步那一次咬合（在平台忽略的前
-                        # 0.5 s 内），既平顺又能拿加分。
-                        t_ng = remain if not green else remain + RED_LEN
-                        v_pace = (d_head - ZONE_EDGE - 1.0) / max(t_ng - 0.4, 0.3)
-                        cap = min(V_MAX, max(PACE_MIN, v_pace))
-                        a_ff = hold_ff(car.speed, cap)
-                        if frames % 30 == 1:
-                            why = "绿灯但出口阻塞" if (green and blocked) else "红灯"
-                            print(f"   {why}，{d_head:.1f} m 到线（检测区外）-> "
-                                  f"配速 {cap:.2f} m/s 在绿灯({t_ng:.1f}s)亮起时到检测区边界",
-                                  flush=True)
+                    elif d_head > 0.6:
+                        # 现在还不能进路口（红灯 / 绿灯但出口堵着）：不停车，按
+                        # "绿灯亮起后 CROSS_MARGIN 秒正好开到停止线"配速，一路配到线上。
+                        # 条件必须一直保持到 d_head≈0——中途切到"停线前"就等于停车，
+                        # 停完再起步那一帧咬合 20 m/s^2，+10 立刻没了（实测）。
+                        #
+                        # 为什么配速目标必须定在"停止线"而不是"检测区边界"：
+                        #   定在边界（10 m）时目标速度只有 (17-11)/14.5 = 0.43 m/s，
+                        #   低于本轮可达的平稳下限，控制器只能一路点刹，实测憋成
+                        #   "窜-憋-窜"极限环（v 0.15~1.21，尖峰 13~15 m/s^2）。
+                        #   定在停止线：17.27 m / 15.5 s = 1.11 m/s，正好落在
+                        #   低速可平稳保持的区间（creep_probe2 实测 |a| <= 2.2）。
+                        #
+                        # 为什么不停车：中途停住再起步，DRIVE 离合咬合那一帧就是
+                        # 8.6~20 m/s^2 的冲击（四种压法都压不住，实测见 README），
+                        # 平台 |a|<=5 的 +10 就没了；不停车 = 只有开局那一次咬合
+                        # （落在平台忽略的前 0.5 s 内），既平顺又保住加分。
+                        now_t = status.used_time
+                        sec = max(light_remain or 0.0, 0.0)
+                        if green or light_state == TrafficLightState.YELLOW:
+                            t_ng = now_t + sec + RED_LEN
+                        else:
+                            t_ng = now_t + sec
+                        t_left = max(t_ng + CROSS_MARGIN - now_t, 0.3)
+                        v_pace = d_head / t_left
+                        if v_pace >= PACE_MIN:
+                            cap = min(V_MAX, v_pace)
+                            pace_soft = True            # 低速段走软 P 律（见下）
+                            if frames % 30 == 1:
+                                why = "绿灯但出口阻塞" if (green and blocked) else "红灯"
+                                print(f"   {why}，{d_head:.1f} m 到线 -> 配速 {cap:.2f} m/s "
+                                      f"（{t_left:.1f}s 后到线，绿灯 {t_ng - now_t:.1f}s 后亮）",
+                                      flush=True)
+                        else:
+                            cap = profile
+                            a_ff = hold_ff(car.speed, cap)
+                            if frames % 30 == 1:
+                                print(f"   配速需要 {v_pace:.2f} m/s < {PACE_MIN:.2f}，"
+                                      f"来不及平滑配速 -> 停在车头距线 {STOP_GAP:.1f} m",
+                                      flush=True)
                     elif green and blocked:
                         # 绿灯但出口堵着：驶入就构成路口阻塞（−20×v），停在线前等它通
                         cap = profile
@@ -513,10 +542,21 @@ def main() -> int:
 
         v_cmd = max(0.0, min(v_cmd, V_MAX))
         thr, brk = longi.step(car.speed, v_cmd, dt, a_ff)
-        # ---- 低速离合带阻尼（本场必须中途再起步，见 README）----
-        # 现场实测（thr≈0.012，DRIVE 从静止拖起来）：怠速蠕行的加速曲线是
-        #   v 0.21->0.44 = 6.9、0.44->0.66 = 6.5、0.66->0.89 = 7.1 m/s^2，
-        # 峰值正在判分区里，中途再起步就丢 +10。刹车增益 32 m/s^2/单位，这里用一条
+        # ---- 低速配速段：换成软 P 律（本场能不能拿 +10 全靠这一段）----
+        # 现场实测（creep_probe2，绿灯禁行直道上跑 18 s）：
+        #   ① DRIVE 挡 thr=0 时车不会自己爬，而是以 0.17~0.3 m/s^2 平滑滑行减速；
+        #   ② 车已经滚起来（约 1 m/s）之后给 0.001~0.005 的小油门，只有 0.2~0.3
+        #      m/s^2，低速保持段最大 |a| 只有 2.10，完全平滑；
+        #   ③ 8.6~20 m/s^2 的冲击只出现在"从静止起步"那一瞬（离合咬合），
+        #      而开局那次咬合落在平台忽略的前 0.5 s 内。
+        # 所以配速段用一条限幅很死的软 P 律：油门/刹车都不超过 0.02，
+        # 目标是让"17.27 m 用 15.5 s 走完"这种 1.1 m/s 的慢速也平滑。
+        # 注意：加速度空间 PI 在这里不能直接用——同样的误差会被积分撑到 0.03+
+        # 的油门，一给就是 3 m/s^2，随后又刹车一拍到底（run5/run10 的极限环）。
+        if pace_soft and car.speed < 1.8:
+            err_v = v_cmd - car.speed
+            thr = max(0.0, min(SOFT_THR_CAP, SOFT_GAIN * err_v))
+            brk = max(0.0, min(SOFT_BRK_CAP, SOFT_GAIN * (-err_v)))
         # ---- 起步：场景起步与中途再起步用同一个策略（快咬合 + 限加速度）----
         # 现场实测教训：
         #   ① 只给 0.012 的油，车靠怠速蠕行拖起来，离合咬合那一下是一帧 +0.26 m/s

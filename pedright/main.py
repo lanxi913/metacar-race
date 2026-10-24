@@ -260,6 +260,10 @@ def main() -> int:
     ap.add_argument("--hold-red", type=float, default=0.0,
                     help="调试用：开局前 N 秒强制当红灯处理（本场相位固定红转绿 5 s，"
                          "否则永远进不到'红灯停在 0~3 m'分支），用来实跑该分支")
+    ap.add_argument("--hold-start", type=float, default=0.0,
+                    help="实验用：开局先原地静止 N 秒（刹车踩死），再按与场景起点完全相同的"
+                         "起步方式出发。用于验证平台的 |a| 判定窗口是'场景时间 0.5 s'"
+                         "还是'车辆首次运动后 0.5 s'")
     args = ap.parse_args()
 
     print("连接仿真场景（先跑脚本，再点启动场景）...", flush=True)
@@ -304,6 +308,19 @@ def main() -> int:
 
         steer, v_cmd, idx = follower.control(pose.pos_x, pose.pos_y, pose.ori_z, car.speed)
         vel = tracker.update(msg.obstacles, status.used_time)
+
+        # ---- 实验：开局原地静止 N 秒（验证平台 |a| 判定窗口的起点）----
+        # 必须用 P 挡保持静止：DRIVE + 刹车会让车在 ±0.26 m/s 间来回弹，自己造出
+        # 15.7 m/s^2 的假尖峰（22:40:48 那次就是这么被污染的）。
+        if args.hold_start > 0.0 and status.used_time < args.hold_start:
+            if frames == 1:
+                print(f"== 开局静止 {args.hold_start:.1f}s（P 挡锁死），之后按起点方式起步 ==",
+                      flush=True)
+            api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, throttle=0.0,
+                                                   brake=1.0, steering=0.0))
+            prev_v = car.speed
+            continue
+        t_start = max(args.hold_start, 0.0)
 
         # ---- 行人让行：前方 15 m、横向 2.8 m 内出现行人就停（本场不会触发）----
         psi = math.radians(pose.ori_z)
@@ -428,7 +445,7 @@ def main() -> int:
         v_cmd = max(0.0, min(v_cmd, V_MAX))
         thr, brk = longi.step(car.speed, v_cmd, dt, a_ff)
         if car.speed < 0.5 and v_cmd > 1.0:
-            if status.used_time < 1.0:
+            if status.used_time - t_start < 1.0:
                 thr = max(thr, LAUNCH_THR)  # 场景起步：快咬合（前 0.5 s 平台不看 |a|）
             else:
                 thr = min(thr, SOFT_LAUNCH_THR)   # 中途再起步：慢慢抬，压落差与顿挫
