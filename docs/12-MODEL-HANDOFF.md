@@ -1,5 +1,12 @@
 # 换模型交接（SESSION HANDOFF）
 
+> **⚠️ 本文写于 2026-10-24 20:00，部分内容已过时。最新状态看 `PROGRESS.md`。**
+> 已过时的部分：
+> - **异形车道泊车已完成，210 满分**（`tools/park_angled6.py`，见 `14-angled-parking-findings.md`），
+>   下文第三节"当前进度"、第二节表格里的"未跑通"都不再成立
+> - 仓库已不只在 `e3e54df`，新增分支 `feat/angled-parking`
+>
+
 > 你是接手这个项目的新模型/新会话。读完这份 + `docs/00-PROJECT-OVERVIEW.md` + `docs/PROGRESS.md` 就能继续干活。
 
 ## 一、当前时间点（2026-10-24 晚）
