@@ -345,6 +345,8 @@ def parse_args() -> argparse.Namespace:
                              "其余元素进入后自动 skip_level 跳过，迭代一次十几秒")
     parser.add_argument("--skip-to-dwell", type=float, default=1.2,
                         help="进入非目标元素后先停多少仿真秒再跳关")
+    parser.add_argument("--skip-to-index", type=int, default=0,
+                        help="探针用：只跑第 N 个元素（1 起算），避免命令行传中文元素名")
     parser.add_argument("--max-skips", type=int, default=6,
                         help="最多跳关次数，防止配置错误时无限跳")
     parser.add_argument("--kick", action="store_true",
@@ -402,6 +404,14 @@ def main() -> int:
         print(f"  {i + 1}. {sub.name:<12s} s={s0:7.1f} -> {s1:7.1f}  ({max(0.0, s1 - s0):6.1f} m)",
               flush=True)
     print("  静态数据: " + ", ".join(f"{k}({v})" for k, v in exported["counts"].items()), flush=True)
+
+    if args.skip_to_index > 0:
+        if args.skip_to_index > len(static.sub_scenes):
+            print(f"--skip-to-index {args.skip_to_index} 超出元素个数 "
+                  f"{len(static.sub_scenes)}，忽略", flush=True)
+        else:
+            args.skip_to = static.sub_scenes[args.skip_to_index - 1].name
+            print(f"只跑第 {args.skip_to_index} 个元素「{args.skip_to}」，其余自动跳关", flush=True)
 
     profile = None
     if args.vmax > 0.0 and args.mode != "hold" and projector.n >= 3:
