@@ -320,7 +320,7 @@ class SlotReverseParker:
                         SlotInfo("FINE", dx, dy, yaw_err, 1.0))
             if self.fine_sub == "YAW":
                 sign = 1.0 if wrap180(syaw - yaw) > 0 else -1.0
-                phase_half = (self.fine_t % 2.4) < 1.2
+                phase_half = (self.fine_t % 4.0) < 2.0   # 半周期加长到 2 s，减少换向次数
                 if phase_half:
                     gear, steer = GearMode.DRIVE, sign * 0.55
                 else:
@@ -328,7 +328,7 @@ class SlotReverseParker:
                 if abs(speed) > 0.18:
                     return (VehicleControl(gear=gear, brake=0.20, steering=steer),
                             SlotInfo("FINE", dx, dy, yaw_err, 1.0))
-                return (VehicleControl(gear=gear, throttle=self._slew(0.12), steering=steer),
+                return (VehicleControl(gear=gear, throttle=self._slew(0.18), steering=steer),
                         SlotInfo("FINE", dx, dy, yaw_err, 1.0))
             # 3) 横向：同向打舵"前进+倒车"两次小动作，把 dx 拉到 0（航向基本不变）
             if abs(dx) < 0.25 or self.fine_t > 16.0:
@@ -344,7 +344,7 @@ class SlotReverseParker:
             if abs(speed) > 0.18:
                 return (VehicleControl(gear=gear, brake=0.20, steering=steer),
                         SlotInfo("FINE", dx, dy, yaw_err, 1.0))
-            return (VehicleControl(gear=gear, throttle=self._slew(0.12), steering=steer),
+            return (VehicleControl(gear=gear, throttle=self._slew(0.18), steering=steer),
                     SlotInfo("FINE", dx, dy, yaw_err, 1.0))
 
         # SETTLE / DONE
@@ -359,6 +359,7 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
 
 
 
