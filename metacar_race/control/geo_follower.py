@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """几何循迹控制器（规则 / 车辆 / 场景数据驱动，输出平滑）
 
 设计目标（按用户反馈修正）：**不摇摆、不冲速**。
@@ -41,7 +41,7 @@ WHEELBASE_DEFAULT = 2.6
 MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
 CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
 PLATEAU_EXIT_MS = 6.5       # m/s，超过它说明已越过低速挡位平台，可以撤 boost
-BRAKE_MAX = 0.35            # 刹车指令上限（实测 1.0 ≈ 18 m/s²，0.35 ≈ 5 m/s²）
+BRAKE_MAX = 0.05            # 刹车指令上限（实测 0.12 也有 ~13 m/s²，压到 0.05）
 
 
 def wrap180(a: float) -> float:
@@ -268,6 +268,13 @@ class GeoFollower:
                 v_safe = math.sqrt(max(2.0 * A_LONG_MAX * max(gap - safe_gap, 0.0), 0.0))
                 v_cmd = min(v_cmd, v_safe)
 
+        # ---- 目标速度限加速度：v_cmd 每帧变化量 ≤ A_LONG·dt ----
+        # 这样加速/减速都由"期望速度"平滑下来，而不是事后猛刹（|a| 会爆）
+        if getattr(self, "_vcmd_prev", None) is not None:
+            dv_max = A_LONG_MAX * dt
+            v_cmd = min(max(v_cmd, self._vcmd_prev - dv_max), self._vcmd_prev + dv_max)
+        self._vcmd_prev = max(0.0, v_cmd)
+
         # ---- 横向：纯跟踪 ----
         Ld = max(2.0 * MIN_TURN_RADIUS_DEFAULT, v * tau + 2.0)
         Ld = min(Ld, 25.0)
@@ -378,8 +385,8 @@ class GeoFollower:
             if a_now > A_LONG_MAX * 0.9:      # 超了就整帧收油，靠限斜率慢慢加回来
                 thr_t = 0.0
         # 起步 1 s 内油门从 0 平滑爬升：抑制仿真第一帧的速度跳变（|a| 尖峰）
-        if self.t < 1.0:
-            thr_t = min(thr_t, 0.02 + 0.04 * self.t)
+        if self.t < 0.5:
+            thr_t = min(thr_t, 0.002 + 0.02 * self.t)   # 轻起步 0.5 s 内到 0.012
         # 油门小斜率限幅（平滑）；刹车直通（该刹就刹）
         self._lim_thr += max(-0.02, min(0.02, thr_t - self._lim_thr))
         self._lim_thr = max(0.0, min(1.0, self._lim_thr))
@@ -403,6 +410,9 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
 
 
 
