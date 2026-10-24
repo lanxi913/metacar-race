@@ -109,17 +109,13 @@ if (-not $NoLaunch) {
 # The client sometimes ends up with no visible main window (tray / crashed UI).
 # Start it when we cannot find one, and give it time to come up.
 function Test-ClientVisible {
+    # Only decide whether the client PROCESS is running. Whether its window is
+    # currently minimised / behind Edge does not matter: Get-ClientWindow already
+    # restores the window by MainWindowHandle. Checking the UIA rectangle here used
+    # to return false for a perfectly healthy client, which made this script spawn a
+    # second instance and then fail with "client window not ready".
     $cpids = @(Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
-    if ($cpids.Count -eq 0) { return $false }
-    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
-    foreach ($cp in $cpids) {
-        $cond = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
-        $w = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
-             Where-Object { $_.Current.BoundingRectangle.Width -gt 400 -and $_.Current.BoundingRectangle.Height -gt 300 }
-        if ($w) { return $true }
-    }
-    return $false
+    return ($cpids.Count -gt 0)
 }
 
 if (-not (Test-ClientVisible)) {
