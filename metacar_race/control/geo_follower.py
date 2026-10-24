@@ -290,7 +290,10 @@ class GeoFollower:
             if self.lane_state != 0 and self.clear_t > 0.8 and not self.keep_lane:
                 self.lane_state = 0
                 self.offset_target = 0.0
-            if self.lane_state == 0 and block is not None and block[0] < 45.0:
+            # 本车道被堵（<25 m）时允许**随时重新选道**，实现 0→1→0→1 的绕行；
+            # 未被堵时才用滞回等 0.8 s 回原车道。
+            re_pick = block is not None and block[0] < 25.0
+            if (self.lane_state == 0 or re_pick) and block is not None and block[0] < 45.0:
                 # 候选车道：左 1、右 1、左 2、右 2；要求该车道在"当前车到障碍车 + 30 m"内无车
                 def lane_free(off):
                     for o in obstacles:
@@ -303,6 +306,8 @@ class GeoFollower:
                 cands = self._valid_offsets(s, (self.lane_w, -self.lane_w,
                                                 2 * self.lane_w, -2 * self.lane_w))
                 for cand in cands:
+                    if abs(cand - self.offset_target) < 0.5:
+                        continue          # 不要选回当前车道
                     if lane_free(cand):
                         self.lane_state = cand / self.lane_w
                         self.offset_target = cand
@@ -383,6 +388,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 
