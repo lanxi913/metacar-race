@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """斜列/平行车位的「解析 S 弯 + 倒车纯跟踪」，带坡度适配。
 
 为什么需要它
@@ -74,6 +74,7 @@ class SlotReverseParker:
         self.fine_t = 0.0
         self.thr_lim = 0.0     # 油门斜率限制后的实际输出
         self.fine_sub = "Y"    # FINE 子阶段：Y=先修纵向，YAW=再修航向
+        self.cycles = 0        # 已重规划的 S 弯次数
 
     # ---------- 场景解析 ----------
     def _parse(self, obstacles, x: float) -> None:
@@ -232,6 +233,15 @@ class SlotReverseParker:
             v_target = min(V_REVERSE, math.sqrt(2.0 * 0.35 * rem_c) + 0.08)
             # 必须走完两段圆弧（best_i >= b2）才允许进精细对位，
             # 否则会在圆弧没走完时被截断，横向少走 1 m 以上
+            # 路径走完或已回到车位朝向：若横向还差 >0.30 m，就【重新规划一次 S 弯】
+            # （小动作物理上补不动 0.7 m，但再来一段小 S 弯是几何上成立的）
+            if ((best_i >= len(self.path) - 3 or yaw_err < 6.0) and abs(dx) > 0.30
+                    and self.cycles < 3 and abs(dy) < 3.0):
+                self.cycles += 1
+                self.path = self._plan(x, y, yaw, sx, sy, syaw)
+                self.idx = 0
+                return (VehicleControl(gear=GearMode.DRIVE, brake=0.30),
+                        SlotInfo("REVERSE", dx, dy, yaw_err, 0.0))
             # 冲过车位中心（dy>0.10）也要立刻交给精细对位，别继续往里挤
             if (dist < 1.5 or dy > 0.10) and yaw_err < 30.0:
                 self.phase = "FINE"          # 最后 1.5 m 交给精细对位
@@ -336,6 +346,7 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
 
 
 
