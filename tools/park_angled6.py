@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """异形车道泊车 v6：车道巡航 → 借道摆头 → 倒车入位。
 
 与 v4/v5 的区别：
@@ -355,6 +355,24 @@ def main() -> int:
             stg = (slot[0] + STAGE_OFFSET[0], slot[1] + STAGE_OFFSET[1], STAGE_OFFSET[2])
             print(f"预置点 ({stg[0]:.2f},{stg[1]:.2f})", flush=True)
 
+            # 巡航参考线：起点 → 平滑 S 形横移到预置点所在车道 → 直线到预置点
+            # 用 smoothstep 生成，两端曲率为零，不会出现"先打满再反打"的摆动
+            cruise_pts = []
+            y_from, y_to = y, stg[1] + 12.0
+            n_s = 24
+            for i in range(n_s + 1):
+                u = i / n_s
+                yy = y_from + (y_to - y_from) * u
+                xx = x + (stg[0] - x) * (3 * u * u - 2 * u * u * u)
+                cruise_pts.append(Pt(xx, yy))
+            n_l = 8
+            for i in range(1, n_l + 1):
+                v = i / n_l
+                cruise_pts.append(Pt(stg[0], y_to + (stg[1] - y_to) * v))
+            cruise_idx = 0
+            print(f"巡航参考线 {len(cruise_pts)} 点：({x:.2f},{y:.2f}) → "
+                  f"({stg[0]:.2f},{stg[1]:.2f})", flush=True)
+
             def _work():
                 try:
                     t = time.time()
@@ -391,11 +409,7 @@ def main() -> int:
         if phase == "CRUISE":
             remaining = math.hypot(stg[0] - x, stg[1] - y)
             thr, brk = approach_hold(v, remaining, 2.0, 4.8)
-            # 直线跟踪：目标点 = 预置点
-            dx, dy = stg[0] - x, stg[1] - y
-            th = heading_rad(yaw)
-            ly = -dx * math.sin(th) + dy * math.cos(th)
-            steer = max(-0.6, min(0.6, -ly * 0.35))
+            steer, cruise_idx = pp_steer(x, y, yaw, cruise_pts, cruise_idx, lookahead=7.0)
             send(GearMode.DRIVE, thr, brk, steer)
             if now - last_log > 1.0:
                 last_log = now
