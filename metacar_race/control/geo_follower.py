@@ -165,6 +165,7 @@ class GeoFollower:
         self.block_ds = None            # 走廊内最近障碍的纵向距离（调试/信息用）
         self.lane_pts = []              # 场景所有车道中心线点（用于判断"哪条邻道真实存在"）
         self.lane_state = 0             # 0=保持本车道；±n=已决定换到第 n 条邻道
+        self.keep_lane = False          # True=换过去就不回来（实验用）
         self.clear_t = 0.0              # 连续"无阻挡"计时，用于退出换道（滞回）
 
     # ---------- 在线标定 ----------
@@ -286,7 +287,7 @@ class GeoFollower:
                 self.clear_t += dt
             else:
                 self.clear_t = 0.0
-            if self.lane_state != 0 and self.clear_t > 0.8:
+            if self.lane_state != 0 and self.clear_t > 0.8 and not self.keep_lane:
                 self.lane_state = 0
                 self.offset_target = 0.0
             if self.lane_state == 0 and block is not None and block[0] < 45.0:
@@ -382,6 +383,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 

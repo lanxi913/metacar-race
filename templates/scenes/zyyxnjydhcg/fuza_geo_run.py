@@ -46,6 +46,8 @@ def main() -> int:
     ctrl = GeoFollower(pts, lane_width=lane_w)
     lane_pts = [(float(p.x), float(p.y)) for rd in static.roads for ln in rd.lanes for p in ln.path_points]
     ctrl.set_lane_points(lane_pts)
+    import os as _os
+    ctrl.keep_lane = bool(_os.environ.get("KEEP_LANE"))
     print(f"路线 {len(pts)} 点，{ctrl.path.total:.1f} m；车道宽（场景数据中位数）={lane_w}", flush=True)
 
     fh = open(args.jsonl, "w", encoding="utf-8")
@@ -88,4 +90,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
