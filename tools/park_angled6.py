@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """异形车道泊车 v6：车道巡航 → 借道摆头 → 倒车入位。
 
 与 v4/v5 的区别：
@@ -49,9 +49,11 @@ SOFT_START_THR = 0.02
 A_DEC_PLAN = 0.8           # 刹车规划用的减速度基准
 V_REV = 0.55               # 倒车目标速度
 STEER_SLEW = 0.12
-THR_SLEW = 0.0015          # 每帧油门变化量（park_v8 实测值）
-BRK_SLEW = 0.004           # 每帧刹车变化量
-BRAKE_CAP = 0.10
+THR_SLEW = 0.0008
+BRK_SLEW = 0.0020
+BRAKE_CAP = 0.06
+THR_MAX = 0.03
+BRK_MAX = 0.06
 
 # 倒车级联
 K_YAW = 1.6
@@ -213,8 +215,8 @@ def speed_cmd(v_meas: float, v_target: float):
     if abs(err) < 0.06:
         return 0.0, 0.0
     if err > 0:
-        return min(0.10, 0.01 + 0.04 * err), 0.0
-    return 0.0, min(0.10, -0.06 * err)
+        return min(THR_MAX, 0.004 + 0.020 * err), 0.0
+    return 0.0, min(BRK_MAX, 0.08 * (-err))
 
 
 def drive_to_point(v_meas: float, dist: float, thr_cruise: float = 0.02):
@@ -359,7 +361,7 @@ def main() -> int:
             if remaining < 18.0:
                 thr, brk = drive_to_point(v, remaining)
             else:
-                thr, brk = (0.10 if v < 2.0 else 0.0), 0.0
+                thr, brk = speed_cmd(v, 1.2)
             # 直线跟踪：目标点 = 预置点
             dx, dy = stg[0] - x, stg[1] - y
             th = heading_rad(yaw)
@@ -406,7 +408,7 @@ def main() -> int:
             steer, fwd_idx = pp_steer(x, y, yaw, fwd_pts, fwd_idx, lookahead=1.8)
             remain_fwd = math.hypot(fwd_pts[-1].x - x, fwd_pts[-1].y - y)
             # 只用 PWM 给油，绝不额外加大油门；只有"靠近终点且速度偏高"时才刹车
-            thr, brk = (0.10 if v < 2.0 else 0.0), 0.0
+            thr, brk = speed_cmd(v, 1.2)
             if remain_fwd < 5.0 and v > 0.4:
                 _, brk2 = drive_to_point(v, remain_fwd, 0.0)
                 if brk2 > 0.001:
