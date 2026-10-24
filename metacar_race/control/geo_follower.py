@@ -163,10 +163,36 @@ class GeoFollower:
         self.offset = 0.0
         self.offset_target = 0.0
         self.block_ds = None            # 走廊内最近障碍的纵向距离（调试/信息用）
+        self.lane_pts = []              # 场景所有车道中心线点（用于判断"哪条邻道真实存在"）
         self.lane_state = 0             # 0=保持本车道；±n=已决定换到第 n 条邻道
         self.clear_t = 0.0              # 连续"无阻挡"计时，用于退出换道（滞回）
 
     # ---------- 在线标定 ----------
+    def set_lane_points(self, pts):
+        """登记场景里的车道中心线点；换道候选只能落在真实存在的车道上。"""
+        self.lane_pts = [(float(p[0]), float(p[1])) for p in pts]
+
+    def _valid_offsets(self, s: float, cands):
+        """把候选偏移过滤成"该横向位置确实有车道"的那些（用车道中心线点判定）。"""
+        if not self.lane_pts:
+            return list(cands)
+        x0, y0, _ = self.path.at(s)
+        x1, y1, _ = self.path.at(min(s + 2.0, self.path.total))
+        tn = math.hypot(x1 - x0, y1 - y0) or 1.0
+        nx, ny = -(y1 - y0) / tn, (x1 - x0) / tn    # 左法向
+        tol = (self.lane_w or 3.5) / 2.0
+        out = []
+        for c in cands:
+            for (lx, ly) in self.lane_pts:
+                if abs(lx - x0) > 60 or abs(ly - y0) > 60:
+                    continue
+                lat = (lx - x0) * nx + (ly - y0) * ny
+                lon = (lx - x0) * (x1 - x0) / tn + (ly - y0) * (y1 - y0) / tn
+                if abs(lon) < 12.0 and abs(lat - c) < tol:
+                    out.append(c)
+                    break
+        return out
+
     def _calibrate(self, v: float, steer: float, yaw_rate: float):
         if abs(steer) > 0.15 and v > 1.0 and abs(yaw_rate) > 1e-4:
             delta = abs(steer) * STEER_FULL_SCALE
@@ -273,7 +299,9 @@ class GeoFollower:
                         if -8.0 < (os_ - s) < block[0] + 30.0 and abs(oe - off) < half_corridor:
                             return False
                     return True
-                for cand in (self.lane_w, -self.lane_w, 2 * self.lane_w, -2 * self.lane_w):
+                cands = self._valid_offsets(s, (self.lane_w, -self.lane_w,
+                                                2 * self.lane_w, -2 * self.lane_w))
+                for cand in cands:
                     if lane_free(cand):
                         self.lane_state = cand / self.lane_w
                         self.offset_target = cand
@@ -326,6 +354,10 @@ class GeoFollower:
         else:
             thr_t = 0.0
             brk_t = min(1.0, (-err) / 1.2)
+        # 硬限速：超过规则限速就强制收油+轻刹（超速每题 −10，不能碰）
+        if v > V_RULE:
+            thr_t = 0.0
+            brk_t = max(brk_t, 0.15)
         # 油门小斜率限幅（平滑）；刹车直通（该刹就刹）
         self._lim_thr += max(-0.02, min(0.02, thr_t - self._lim_thr))
         self._lim_thr = max(0.0, min(1.0, self._lim_thr))
@@ -349,6 +381,9 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
 
 
 

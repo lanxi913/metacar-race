@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 r"""场景元素 15「复杂路况超车」· 几何控制器版（无经验参数）
 
 控制器：`metacar_race/control/geo_follower.py`
@@ -44,6 +44,8 @@ def main() -> int:
     widths = [float(ln.width) for rd in static.roads for ln in rd.lanes if float(ln.width) > 1.0]
     lane_w = statistics.median(widths) if widths else None
     ctrl = GeoFollower(pts, lane_width=lane_w)
+    lane_pts = [(float(p.x), float(p.y)) for rd in static.roads for ln in rd.lanes for p in ln.path_points]
+    ctrl.set_lane_points(lane_pts)
     print(f"路线 {len(pts)} 点，{ctrl.path.total:.1f} m；车道宽（场景数据中位数）={lane_w}", flush=True)
 
     fh = open(args.jsonl, "w", encoding="utf-8")
@@ -86,3 +88,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
