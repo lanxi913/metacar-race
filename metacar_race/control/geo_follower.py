@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """几何循迹控制器（规则 / 车辆 / 场景数据驱动，输出平滑）
 
 设计目标（按用户反馈修正）：**不摇摆、不冲速**。
@@ -41,8 +41,9 @@ WHEELBASE_DEFAULT = 2.6
 MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
 CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
 PLATEAU_EXIT_MS = 6.5       # m/s，超过它说明已越过低速挡位平台，可以撤 boost
-BRAKE_MAX = 0.08            # 刹车指令上限：仿真刹车 <0.05 有死区（几乎不减速），0.08≈4 m/s²
+BRAKE_MAX = 0.20            # 刹车上限放大，靠"实测加速度环"（a<-4 就松刹）把减速度压在 4 m/s² 附近
 THR_CAP = 0.105             # 油门硬上限：0.11 以上仿真会出现非线性弹跳（实测 14 m/s²）
+V_CRUISE = 2.0              # 巡航速度上限（低速区仿真最平顺，|a| 可控；时间不敏感）
 
 
 def wrap180(a: float) -> float:
@@ -262,10 +263,12 @@ class GeoFollower:
                 v_cmd = min(V_RULE, v_req)
             # 只跑到"够用"的 1.2 倍：既不超时也不触发高速挡位跳变（|a| 会爆）
             # 最后 10 m 不再给"赶时间"的速度下限，让终点减速曲线接管（爬过终点线）
-            v_cmd = min(v_cmd, max(v_req * 1.15, 5.0) if rem > 10.0 else 0.3)
+            v_cmd = min(v_cmd, V_CRUISE * 3.0)   # 低速区优先保证 |a|，但仍要能跑完
         # 终点减速曲线必须是"最后一道闸"：时间压力不能把它顶掉，
-        # 否则车会以 4.8 m/s 冲线，被仿真强制停车判加速度超标
-        v_cmd = min(v_cmd, max(0.3, math.sqrt(max(8.0 * (rem - 0.1), 0.0))))
+        # 否则车会以 4.8 m/s 冲线，被仿真强制停车判加速度超标。
+        # 目标是停在"路径终点前 stop_margin 米"（场景真正判定到达的位置）
+        rem_stop = max(rem - self.stop_margin - 4.0, 0.0)   # 提前 4 m 开始减速，留出刹车距离
+        v_cmd = min(v_cmd, max(0.3, math.sqrt(max(8.0 * rem_stop, 0.0))))
         # 前车净距保护：安全距离 = 车身长 4 m + 2 m 余量
         if obstacles and self.lane_w:
             gap = None
@@ -440,6 +443,10 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
+
 
 
 
