@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import os
 import math
 from dataclasses import dataclass
 
@@ -248,6 +249,12 @@ class SlotReverseParker:
         # 目标：沿车位轴向前后挪，同时用航向把横向误差压到 0；蠕行 0.12 m/s
         if self.phase == "FINE":
             self.fine_t += dt
+            # 实验：进入 FINE 就直接停稳，先量出平台对"位置+航向"的容差
+            if os.environ.get("FINE_STOP"):
+                self.phase = "SETTLE"
+                self.hold = 0.0
+                return (VehicleControl(gear=GearMode.DRIVE, brake=0.35),
+                        SlotInfo("SETTLE", dx, dy, yaw_err, 1.0))
             dist = math.hypot(dx, dy)
             if (dist < 0.30 and yaw_err < 8.0) or self.fine_t > 14.0:
                 self.phase = "SETTLE"
@@ -285,6 +292,7 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
 
 
 
