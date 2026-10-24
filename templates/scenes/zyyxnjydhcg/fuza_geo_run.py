@@ -64,9 +64,11 @@ def main() -> int:
                      f'"v":{float(car.speed):.2f},"vcmd":{info["v_cmd"]:.2f},'
                      f'"off":{ctrl.offset:.2f},"steer":{info["steer"]:.3f}}}\n')
             if frame % 15 == 1:
+                blk = f"{ctrl.block_ds:5.1f}" if ctrl.block_ds is not None else "  -  "
                 print(f"[{st.used_time:5.1f}s] s={info['s']:6.1f} e={info['e']:+5.2f} "
-                      f"off={ctrl.offset:+5.2f} v={float(car.speed):5.2f}/{info['v_cmd']:5.2f} "
-                      f"κ={info['k']:+.3f} pos=({float(pose.pos_x):6.1f},{float(pose.pos_y):7.1f})",
+                      f"off={ctrl.offset:+5.2f}/{ctrl.offset_target:+5.2f} blk={blk} "
+                      f"v={float(car.speed):5.2f}/{info['v_cmd']:5.2f} "
+                      f"pos=({float(pose.pos_x):6.1f},{float(pose.pos_y):7.1f})",
                       flush=True)
             if ctrl.done or st.used_time >= args.max_seconds:
                 print(f"结束：done={ctrl.done} s={info['s']:.1f}/{ctrl.path.total:.1f}", flush=True)

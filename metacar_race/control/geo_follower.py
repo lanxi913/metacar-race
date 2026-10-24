@@ -156,10 +156,15 @@ class GeoFollower:
         self._k_plant = 60.0        # 油门→速度 增益（在线估计）
         self._lim_thr = 0.0
         self._lim_brk = 0.0
+        self._boost = 0.0               # 速度平台突破量（油门增量，自适应）
+        self._v_hist = deque(maxlen=30)
         self._steer_lp = 0.0
         self.lane_w = lane_width        # 车道宽（来自场景数据），用于换道避让
         self.offset = 0.0
         self.offset_target = 0.0
+        self.block_ds = None            # 走廊内最近障碍的纵向距离（调试/信息用）
+        self.lane_state = 0             # 0=保持本车道；±n=已决定换到第 n 条邻道
+        self.clear_t = 0.0              # 连续"无阻挡"计时，用于退出换道（滞回）
 
     # ---------- 在线标定 ----------
     def _calibrate(self, v: float, steer: float, yaw_rate: float):
@@ -224,7 +229,7 @@ class GeoFollower:
                     continue
                 os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
                 dg = os_ - s
-                if 0.0 < dg < 40.0 and abs(oe) < self.lane_w / 2.0 + CAR_HALF_WIDTH:
+                if 0.0 < dg < 40.0 and abs(oe - self.offset) < self.lane_w / 2.0 + CAR_HALF_WIDTH:
                     gap = dg if gap is None else min(gap, dg)
             if gap is not None:
                 safe_gap = 4.0 + 2.0
@@ -236,6 +241,7 @@ class GeoFollower:
         Ld = min(Ld, 25.0)
 
         # ---- 障碍物：走廊判断 + 换道避让（车道宽来自场景数据）----
+        self.block_ds = None
         if obstacles and self.lane_w:
             half_corridor = self.lane_w / 2.0 + CAR_HALF_WIDTH
             block = None
@@ -244,25 +250,34 @@ class GeoFollower:
                     continue
                 os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
                 ds = os_ - s
-                if 0.0 < ds < 50.0 and abs(oe) < half_corridor:
+                if 0.0 < ds < 50.0 and abs(oe - self.offset) < half_corridor:   # 相对"当前所在车道"判定
                     if block is None or ds < block[0]:
                         block = (ds, oe)
-            if block is not None and block[0] < 45.0:
-                # 选一条空车道：优先左（+lane_w），其次右
+            if block is not None:
+                self.block_ds = block[0]
+            # 滞回：一旦决定换道就保持，直到"连续 0.8 s 无阻挡"才回原车道
+            if block is None or block[0] > 35.0:
+                self.clear_t += dt
+            else:
+                self.clear_t = 0.0
+            if self.lane_state != 0 and self.clear_t > 0.8:
+                self.lane_state = 0
+                self.offset_target = 0.0
+            if self.lane_state == 0 and block is not None and block[0] < 45.0:
+                # 候选车道：左 1、右 1、左 2、右 2；要求该车道在"当前车到障碍车 + 30 m"内无车
                 def lane_free(off):
                     for o in obstacles:
                         if getattr(getattr(o, "type", None), "name", "") != "CAR":
                             continue
                         os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
-                        if -5.0 < (os_ - s) < block[0] + 25.0 and abs(oe - off) < half_corridor:
+                        if -8.0 < (os_ - s) < block[0] + 30.0 and abs(oe - off) < half_corridor:
                             return False
                     return True
                 for cand in (self.lane_w, -self.lane_w, 2 * self.lane_w, -2 * self.lane_w):
                     if lane_free(cand):
+                        self.lane_state = cand / self.lane_w
                         self.offset_target = cand
                         break
-            elif block is None:
-                self.offset_target = 0.0          # 无阻挡 → 回到原车道
             # 横向偏移限速（用横向加速度上限反解），平滑切入切出
             max_rate = min(1.5, A_LAT_MAX / max(v, 1.0) * 0.5)
             step = max_rate * dt
@@ -279,9 +294,9 @@ class GeoFollower:
             tnx, tny = tx2 - tx, ty2 - ty
             tn = math.hypot(tnx, tny)
             if tn > 1e-6:
-                # 路径左法向（左手侧为正）
-                tx += (-tny / tn) * self.offset * -1.0
-                ty += (tnx / tn) * self.offset * -1.0
+                # 路径左法向：(−t_y, t_x)/|t|；offset>0 = 向左偏移
+                tx += (-tny / tn) * self.offset
+                ty += (tnx / tn) * self.offset
         bearing = -math.degrees(math.atan2(ty - y, tx - x))     # 仿真 yaw 顺时针
         alpha = math.radians(wrap180(bearing - yaw))
         delta = math.atan2(2.0 * L * math.sin(alpha), Ld)
@@ -298,8 +313,15 @@ class GeoFollower:
                 self._k_plant = 0.98 * self._k_plant + 0.02 * k_obs
         kp = 1.5 / max(self._k_plant, 20.0)
         err = v_cmd - v
+        # 速度平台突破：油门给到却长时间不提速（变速箱/挡位平台），逐步加 boost
+        self._v_hist.append(v)
+        dv = (max(self._v_hist) - min(self._v_hist)) if len(self._v_hist) > 8 else 1.0
+        if err > 0.4 and dv < 0.15:
+            self._boost = min(0.6, self._boost + 0.01)
+        elif err < 0.1:
+            self._boost = max(0.0, self._boost - 0.02)
         if err >= 0:
-            thr_t = min(1.0, v_cmd / max(self._k_plant, 20.0) + kp * err)
+            thr_t = min(1.0, v_cmd / max(self._k_plant, 20.0) + kp * err + self._boost)
             brk_t = 0.0
         else:
             thr_t = 0.0
@@ -327,6 +349,10 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
+
 
 
 
