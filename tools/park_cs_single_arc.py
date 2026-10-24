@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 r"""连续场景 · 垂直泊车 · 单圆弧移植版。
 
 策略直接照搬已在单场景拿到 200 分的 chang-kou 基线（提交 5f72206）：
@@ -58,6 +58,10 @@ HEADING_TOL_DEG = 8.0
 STAGE_LATERAL_M = 5.64          # 车位中心到车道中心的横向距离（基线与连续场景实测一致）
 STOP_AT_STAGE_M = 0.35          # 距准备点这么近就刹停换倒挡
 AIM_NEAR_M = 28.0               # 距准备点这么近就不再跟赛道，直接对准准备点
+
+BRAKE_CAP = 0.10                # 刹车命令上限：实测 decel ≈ 1.2+24*brake，0.10 约 3.6 m/s²
+SOFT_START_SECONDS = 1.50       # 换挡后这段时间内油门压到很低，抑制平台起步瞬态
+SOFT_START_THROTTLE = 0.04
 
 
 class _Point:
@@ -123,6 +127,55 @@ def slot_metrics(pose, slot, length, width):
     }
 
 
+class DriveOut:
+    """油门/刹车输出层：速率限制 + 软起步 + 刹车上限。
+
+    平台的加速度奖励要求元素内 |a| ≤ 5 m/s²，而它的起步/换挡瞬态即使给
+    0.02 的油门也会甩出 15 m/s²。这里做三件事：
+    1. 换挡后前 SOFT_START_SECONDS 秒把油门压到 SOFT_START_THROTTLE；
+    2. 油门/刹车都做速率限制，命令不再突跳；
+    3. 刹车命令封顶 BRAKE_CAP（≈4.3 m/s²），需要停死时改用 PARKING 挡。
+    """
+
+    def __init__(self, thr_up=0.010, thr_down=0.030, brk_up=0.010, brk_down=0.040) -> None:
+        self.thr_up = thr_up
+        self.thr_down = thr_down
+        self.brk_up = brk_up
+        self.brk_down = brk_down
+        self.gear = None
+        self.gear_t0 = 0.0
+        self.thr = 0.0
+        self.brk = 0.0
+
+    def reset(self) -> None:
+        self.thr = 0.0
+        self.brk = 0.0
+
+    def build(self, gear, throttle: float, brake: float, steering: float, now: float):
+        if gear != self.gear:
+            self.gear = gear
+            self.gear_t0 = now
+            self.reset()
+        if gear is GearMode.PARKING:
+            self.reset()
+            return VehicleControl(gear=gear, brake=max(1.0, brake))
+        throttle = max(0.0, min(1.0, throttle))
+        brake = max(0.0, min(BRAKE_CAP, brake))
+        if throttle > 0.0 and brake > 0.0:      # 不同时给油和刹车
+            if brake >= throttle:
+                throttle = 0.0
+            else:
+                brake = 0.0
+        if now - self.gear_t0 < SOFT_START_SECONDS:
+            throttle = min(throttle, SOFT_START_THROTTLE)
+        self.thr = (min(throttle, self.thr + self.thr_up) if throttle >= self.thr
+                    else max(throttle, self.thr - self.thr_down))
+        self.brk = (min(brake, self.brk + self.brk_up) if brake >= self.brk
+                    else max(brake, self.brk - self.brk_down))
+        return VehicleControl(gear=gear, throttle=self.thr, brake=self.brk,
+                              steering=steering)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="连续场景垂直泊车单圆弧移植")
     parser.add_argument("--skip-to-index", type=int, default=5,
@@ -153,6 +206,7 @@ def main() -> int:
     profile = SpeedProfile(static.route, v_max=args.vmax) if len(static.route) >= 3 else None
     speed_ctl = SpeedController(v_target=args.vmax, accel_limit=1.5, throttle_max=0.85)
     speed_ctl.reset(0.0)
+    out = DriveOut()
 
     out_dir = args.out or (REPO / "logs" / "park_cs" / time.strftime("%Y%m%d-%H%M%S"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -230,8 +284,7 @@ def main() -> int:
                     steer, v_tgt = 0.0, args.vmax
                 speed_ctl.v_target = v_tgt
                 thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
-                vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
-                                    brake=brk, steering=steer)
+                vc = out.build(GearMode.DRIVE, thr, brk, steer, sim_t)
                 api.set_vehicle_control(vc)
                 writer.writerow([
                     frame, round(sim_t, 3), sub, "cruise", round(x, 3), round(y, 3),
@@ -287,8 +340,7 @@ def main() -> int:
                         vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
                         stationary += dt
                     else:
-                        vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                            brake=0.12, steering=0.0)
+                        vc = out.build(GearMode.DRIVE, 0.0, 0.12, 0.0, sim_t)
                         stationary = 0.0
                     if stationary >= STAGE_SETTLE_SECONDS:
                         stage_ready = True
@@ -298,7 +350,9 @@ def main() -> int:
                               f"剩余={remaining:+.2f} 距准备点={d_stage:.2f} "
                               f"du={met['du']:+.2f} dv={met['dv']:+.2f}", flush=True)
                 elif near_stage:
-                    # 车位附近：不再跟赛道（赛道末段会拐进车位），直接对准准备点并减速
+                    # 车位附近：不再跟赛道（赛道末段会拐进车位），直接对准准备点并减速。
+                    # 刹车不再"想停多快就踩多深"：命令经 DriveOut 限幅与封顶，
+                    # 否则从 8 m/s 一步踩到 0.15 会刹出 7 m/s² 的尖峰。
                     v_des = min(2.20, max(0.35, 0.90 * remaining))
                     steer = aim_steering(x, y, yaw, stage)
                     thr = min(0.20, max(0.0, 0.02 + 0.05 * (v_des - speed)))
@@ -306,14 +360,12 @@ def main() -> int:
                     if speed > v_des + 0.30:
                         brk = min(0.25, max(0.03, 0.05 * (speed - v_des)))
                         thr = 0.0
-                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
-                                        brake=brk, steering=steer)
+                    vc = out.build(GearMode.DRIVE, thr, brk, steer, sim_t)
                 else:
                     if speed > 3.0 and sim_t - approach_t0 < 2.5:
                         # 平台瞬移时会注入初速（实测 8.2 m/s），前 2.5 s 先刹下去；
                         # 之后交回闭环，否则 3 m/s 的门槛会和加速段形成来回打刹的极限环。
-                        vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                            brake=0.15, steering=0.0)
+                        vc = out.build(GearMode.DRIVE, 0.0, 0.15, 0.0, sim_t)
                     else:
                         steer = pursuit.steering(x, y, yaw) if pursuit is not None else 0.0
                         v_tgt = args.vmax
@@ -321,8 +373,7 @@ def main() -> int:
                             v_tgt = profile.target(i_near, speed)
                         speed_ctl.v_target = v_tgt
                         thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
-                        vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
-                                            brake=brk, steering=steer)
+                        vc = out.build(GearMode.DRIVE, thr, brk, steer, sim_t)
 
             elif phase == "reverse":
                 if d_stage > 15.0:
@@ -331,8 +382,7 @@ def main() -> int:
                     approach_t0 = sim_t
                     print(f"倒车位置异常（距准备点 {d_stage:.1f} m，剩 {remaining:+.1f}），"
                           f"退回接近段", flush=True)
-                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                        brake=0.12, steering=0.0)
+                    vc = out.build(GearMode.DRIVE, 0.0, 0.12, 0.0, sim_t)
                 elif (met["dist"] <= CENTER_TOL_M and abs(heading_error) <= HEADING_TOL_DEG
                         and abs(speed) <= STAGE_STILL_SPEED_MS):
                     phase = "hold"
@@ -350,8 +400,7 @@ def main() -> int:
                         throttle, brake = REVERSE_THROTTLE, 0.0
                         if abs(speed) > REVERSE_MAX_SPEED_MS:
                             throttle, brake = 0.0, REVERSE_BRAKE
-                    vc = VehicleControl(gear=GearMode.REVERSE, throttle=throttle,
-                                        brake=brake, steering=steering)
+                    vc = out.build(GearMode.REVERSE, throttle, brake, steering, sim_t)
 
             elif phase == "hold":
                 hold += dt
