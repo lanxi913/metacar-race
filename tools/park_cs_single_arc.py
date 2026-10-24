@@ -151,6 +151,7 @@ def main() -> int:
 
     pursuit = PurePursuit(static.route, lookahead=LOOKAHEAD_M) if len(static.route) >= 2 else None
     profile = SpeedProfile(static.route, v_max=args.vmax) if len(static.route) >= 3 else None
+    lim_thr = 0.0
     speed_ctl = SpeedController(v_target=args.vmax, accel_limit=1.5, throttle_max=0.85)
     speed_ctl.reset(0.0)
 
@@ -362,6 +363,24 @@ def main() -> int:
                     break
             else:
                 vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
+
+            # 前段油门保护：按速度给油门上限。
+            # 这车低挡上限 4.76 m/s(17 km/h)，升挡需 0.80 以上油门且必带 ~10 m/s^2 冲量，
+            # 所以这里压住油门，用 17 km/h 跑完整关，换取第一个元素的加速度奖励。
+            if vc.gear == GearMode.DRIVE and not (sub and "泊车" in sub and d_stage is not None and d_stage <= AIM_NEAR_M):
+                lim_thr += max(-0.0015, min(0.0015, vc.throttle - lim_thr))
+                lim_thr = max(0.0, min(1.0, lim_thr))
+                if speed < 6.0:
+                    cap = 0.02
+                else:
+                    cap = 0.02 + 0.06 * (speed - 6.0)
+                if speed < 1.5:
+                    cap = 0.006   # 离合器门槛以下，压住起步
+                lim_thr = min(lim_thr, min(0.85, cap))
+                vc = VehicleControl(gear=vc.gear, throttle=lim_thr, brake=vc.brake,
+                                    steering=vc.steering)
+            else:
+                lim_thr = 0.0
 
             api.set_vehicle_control(vc)
             writer.writerow([
