@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """几何循迹控制器（连续场景用，无经验参数）
 
 设计原则：**每个数值都能追溯到"规则 / 车辆 / 场景数据"三者之一**，
@@ -84,9 +84,15 @@ class Polyline:
             out[i] = 2.0 * area2 / (a * b * c)
         return out
 
-    def project(self, x: float, y: float):
+    def project(self, x: float, y: float, s_hint: float | None = None, window: float = 40.0):
+        """投影到折线。给定 s_hint 时只在 ±window 内搜索，
+        防止路径自交（连续场景里有平行/回环路段）时跳到远处段上。"""
         best_s, best_d, best_sign = 0.0, float("inf"), 1.0
+        lo = 0.0 if s_hint is None else max(0.0, s_hint - window)
+        hi = self.total if s_hint is None else min(self.total, s_hint + window)
         for i in range(len(self.pts) - 1):
+            if self.cum[i + 1] < lo or self.cum[i] > hi:
+                continue
             x1, y1 = self.pts[i]
             x2, y2 = self.pts[i + 1]
             dx, dy = x2 - x1, y2 - y1
@@ -129,7 +135,7 @@ class Polyline:
 
 
 class GeoFollower:
-    """规则 / 物理 / 数据驱动的路线循迹。"""
+    """规则 / 物理 / 数据驱动的路线循迹（速度环 + 位置环，输出平滑）。"""
 
     def __init__(self, route_pts, speed_limit: float = V_RULE):
         self.path = Polyline(route_pts)
@@ -142,6 +148,46 @@ class GeoFollower:
         self.done = False
         self._prev_yaw = None
         self._stall = 0.0
+        # ---- 平滑与自适应状态（速度环 / 舵角环） ----
+        self._steer_lp = 0.0
+        self._thr_lp = 0.0
+        self._brk_lp = 0.0
+        self._v_prev = None
+        self._thr_prev = 0.0
+        self._k_plant = 60.0       # 油门→速度 增益（在线估计，初始仅作占位）
+        self._integ = 0.0
+        self._s_hint = None
+
+    def _speed_loop(self, v: float, v_cmd: float, dt: float):
+        """PI + 前馈：比例/积分增益由**在线估计的 plant 增益与响应滞后**决定，不手调。"""
+        if self._v_prev is not None and abs(self._thr_lp - self._thr_prev) > 0.02 and dt > 0:
+            k = (v - self._v_prev) / (self._thr_lp - self._thr_prev)
+            if 2.0 < k < 400.0:
+                self._k_plant = 0.95 * self._k_plant + 0.05 * k
+        tau = max(0.25, min(1.5, (sum(self.lag) / len(self.lag)) if self.lag else 0.4))
+        kp = 1.0 / max(self._k_plant, 5.0)         # 油门 / (m/s)
+        ki = kp / tau
+        err = v_cmd - v
+        if err < 0:
+            # 超速：立刻收油，并用"规则加速度"反算刹车量（不做低通，保证及时）
+            self._integ = 0.0
+            brk_t = min(1.0, (-err) / (A_LONG_MAX * max(tau, 0.1)))
+            thr_t = 0.0
+            a = dt / (tau + dt)
+            self._thr_lp += a * (thr_t - self._thr_lp)
+            self._brk_lp = brk_t                 # 刹车直通
+            self._v_prev, self._thr_prev = v, self._thr_lp
+            return self._thr_lp, self._brk_lp
+        self._integ += err * dt
+        self._integ = max(0.0, min(1.0 / max(ki, 1e-6), self._integ))
+        cmd = kp * err + ki * self._integ
+        thr_t = max(0.0, min(1.0, cmd))
+        brk_t = 0.0
+        a = dt / (tau + dt)                        # 一阶低通，时间常数=实测滞后
+        self._thr_lp += a * (thr_t - self._thr_lp)
+        self._brk_lp += a * (brk_t - self._brk_lp)
+        self._v_prev, self._thr_prev = v, self._thr_lp
+        return self._thr_lp, self._brk_lp
 
     def _calibrate(self, v: float, steer: float, yaw_rate: float):
         if abs(steer) > 0.15 and v > 1.0 and abs(yaw_rate) > 1e-4:
@@ -164,7 +210,8 @@ class GeoFollower:
         self._prev_yaw = yaw
 
         L = self.wheelbase or WHEELBASE_DEFAULT
-        s, e = self.path.project(x, y)
+        s, e = self.path.project(x, y, self._s_hint)
+        self._s_hint = s          # 下一帧只在 ±window 内搜索，防止路径自交跳段
         rem = self.path.total - s
 
         tau = (sum(self.lag) / len(self.lag)) if self.lag else 0.3
@@ -184,17 +231,16 @@ class GeoFollower:
         v_cmd = min(v_cap, v_end)
 
         delta = math.atan(L * k_ff) + psi_e - math.atan2(e, max(v, 0.5))
-        steer = max(-1.0, min(1.0, delta / STEER_FULL_SCALE))
+        steer_raw = max(-1.0, min(1.0, delta / STEER_FULL_SCALE))
+        # 舵角平滑：一阶低通，时间常数 = 实测响应滞后（不引入手调系数）
+        a_steer = dt / (tau + dt)
+        self._steer_lp += a_steer * (steer_raw - self._steer_lp)
+        steer = self._steer_lp
 
+        thr, brk = self._speed_loop(v, v_cmd, dt)
         gear = GearMode.DRIVE
-        thr = brk = 0.0
-        err = v_cmd - v
-        if err >= 0:
-            thr = min(1.0, err / max(v_cmd, 1.0))
-        else:
-            brk = min(1.0, -err / max(v_cmd + 1.0, 1.0))
         # 静摩擦兜底：想走但车不动（物理现象，不是调参）
-        if thr > 0 and abs(v) < 0.1:
+        if thr > 0.05 and abs(v) < 0.10:
             self._stall += dt
             if self._stall > 0.5:
                 thr = 1.0
@@ -207,6 +253,9 @@ class GeoFollower:
 
         self._calibrate(v, steer, yaw_rate)
         info = {"s": s, "e": e, "rem": rem, "v_cmd": v_cmd, "k": k_ahead,
-                "L": L, "k_steer": self.k_steer, "steer": steer}
+                "L": L, "k_steer": self.k_steer, "steer": steer,
+                "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
 
