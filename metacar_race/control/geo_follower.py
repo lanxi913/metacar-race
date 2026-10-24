@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """几何循迹控制器（规则 / 车辆 / 场景数据驱动，输出平滑）
 
 设计目标（按用户反馈修正）：**不摇摆、不冲速**。
@@ -39,6 +39,7 @@ V_RULE = 60.0 / 3.6
 STEER_FULL_SCALE = 0.6
 WHEELBASE_DEFAULT = 2.6
 MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
+CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
 
 
 def wrap180(a: float) -> float:
@@ -140,7 +141,7 @@ class Polyline:
 class GeoFollower:
     """速度环 + 位置环，输出平滑。"""
 
-    def __init__(self, route_pts, speed_limit: float = V_RULE):
+    def __init__(self, route_pts, speed_limit: float = V_RULE, lane_width: float | None = None):
         self.path = Polyline(route_pts)
         self.v_cap = speed_limit
         self.v_meas_max = 0.0
@@ -156,6 +157,9 @@ class GeoFollower:
         self._lim_thr = 0.0
         self._lim_brk = 0.0
         self._steer_lp = 0.0
+        self.lane_w = lane_width        # 车道宽（来自场景数据），用于换道避让
+        self.offset = 0.0
+        self.offset_target = 0.0
 
     # ---------- 在线标定 ----------
     def _calibrate(self, v: float, steer: float, yaw_rate: float):
@@ -189,7 +193,7 @@ class GeoFollower:
             v_best = min(v_best, self.v_meas_max * 1.02)
         return max(0.0, v_best)
 
-    def update(self, pose, speed: float, dt: float):
+    def update(self, pose, speed: float, dt: float, obstacles=None, time_left: float | None = None):
         x, y, yaw = float(pose.pos_x), float(pose.pos_y), float(pose.ori_z)
         v = float(speed)
         self.t += dt
@@ -207,11 +211,77 @@ class GeoFollower:
         # ---- 纵向：速度剖面 ----
         horizon = max(30.0, v * 4.0)
         v_cmd = self._v_plan(s, horizon)
+        # 时间约束：场景给了时限就必须跑够平均速度（由 rem/time_left 反解，不是调参）
+        if time_left is not None and time_left > 1.0:
+            v_req = rem / time_left
+            if v_req > v_cmd:
+                v_cmd = min(V_RULE, v_req)
+        # 前车净距保护：安全距离 = 车身长 4 m + 2 m 余量
+        if obstacles and self.lane_w:
+            gap = None
+            for o in obstacles:
+                if getattr(getattr(o, "type", None), "name", "") != "CAR":
+                    continue
+                os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
+                dg = os_ - s
+                if 0.0 < dg < 40.0 and abs(oe) < self.lane_w / 2.0 + CAR_HALF_WIDTH:
+                    gap = dg if gap is None else min(gap, dg)
+            if gap is not None:
+                safe_gap = 4.0 + 2.0
+                v_safe = math.sqrt(max(2.0 * A_LONG_MAX * max(gap - safe_gap, 0.0), 0.0))
+                v_cmd = min(v_cmd, v_safe)
 
         # ---- 横向：纯跟踪 ----
         Ld = max(2.0 * MIN_TURN_RADIUS_DEFAULT, v * tau + 2.0)
         Ld = min(Ld, 25.0)
+
+        # ---- 障碍物：走廊判断 + 换道避让（车道宽来自场景数据）----
+        if obstacles and self.lane_w:
+            half_corridor = self.lane_w / 2.0 + CAR_HALF_WIDTH
+            block = None
+            for o in obstacles:
+                if getattr(getattr(o, "type", None), "name", "") != "CAR":
+                    continue
+                os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
+                ds = os_ - s
+                if 0.0 < ds < 50.0 and abs(oe) < half_corridor:
+                    if block is None or ds < block[0]:
+                        block = (ds, oe)
+            if block is not None and block[0] < 45.0:
+                # 选一条空车道：优先左（+lane_w），其次右
+                def lane_free(off):
+                    for o in obstacles:
+                        if getattr(getattr(o, "type", None), "name", "") != "CAR":
+                            continue
+                        os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
+                        if -5.0 < (os_ - s) < block[0] + 25.0 and abs(oe - off) < half_corridor:
+                            return False
+                    return True
+                for cand in (self.lane_w, -self.lane_w, 2 * self.lane_w, -2 * self.lane_w):
+                    if lane_free(cand):
+                        self.offset_target = cand
+                        break
+            elif block is None:
+                self.offset_target = 0.0          # 无阻挡 → 回到原车道
+            # 横向偏移限速（用横向加速度上限反解），平滑切入切出
+            max_rate = min(1.5, A_LAT_MAX / max(v, 1.0) * 0.5)
+            step = max_rate * dt
+            if self.offset < self.offset_target:
+                self.offset = min(self.offset_target, self.offset + step)
+            else:
+                self.offset = max(self.offset_target, self.offset - step)
+        else:
+            self.offset = 0.0
+
         tx, ty, _ = self.path.at(s + Ld)
+        if abs(self.offset) > 1e-3:
+            tx2, ty2, _ = self.path.at(min(s + Ld + 1.0, self.path.total))
+            tnx, tny = tx2 - tx, ty2 - ty
+            tn = math.hypot(tnx, tny)
+            if tn > 1e-6:
+                # 路径左法向（左手侧为正）
+                tx += (-tny / tn) * self.offset * -1.0
+                ty += (tnx / tn) * self.offset * -1.0
         bearing = -math.degrees(math.atan2(ty - y, tx - x))     # 仿真 yaw 顺时针
         alpha = math.radians(wrap180(bearing - yaw))
         delta = math.atan2(2.0 * L * math.sin(alpha), Ld)
@@ -257,5 +327,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
 
 
