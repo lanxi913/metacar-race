@@ -154,17 +154,20 @@ class LaneFollower:
             self.target_lane = self.lane_id
         cur = self.lanes[self.lane_id]
         s, e = cur["path"].project(x, y)
+        # 指定停车点优先用平台给的 end_point（比 route 末点更准）
+        ep = getattr(pose, "end_point", None)
         rem = math.hypot(self.goal[0] - x, self.goal[1] - y)
 
-        # 换道判定：本车道前方有障碍物 → 切邻道
+        # 换道判定：本车道前方有障碍物 → 切邻道；距终点 15 m 内不再换道
         blocked = False
-        for o in obstacles:
-            if getattr(getattr(o, "type", None), "name", "") != "CAR":
-                continue
-            os_, oe = cur["path"].project(float(o.pos_x), float(o.pos_y))
-            if 0.5 < (os_ - s) < max(15.0, 2.5 * speed + 10.0) and abs(oe) < cur["width"] / 2 + o.width / 2 - 0.2:
-                blocked = True
-                break
+        if rem > 15.0:
+            for o in obstacles:
+                if getattr(getattr(o, "type", None), "name", "") != "CAR":
+                    continue
+                os_, oe = cur["path"].project(float(o.pos_x), float(o.pos_y))
+                if 0.5 < (os_ - s) < max(15.0, 2.5 * speed + 10.0) and abs(oe) < cur["width"] / 2 + o.width / 2 - 0.2:
+                    blocked = True
+                    break
         if blocked:
             for cand in (cur["left"], cur["right"]):
                 if cand in self.lanes and cand not in (-1, None):
@@ -233,4 +236,6 @@ class LaneFollower:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
 
