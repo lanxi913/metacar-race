@@ -107,6 +107,11 @@ class ParallelParkingController:
         self.slot: tuple[float, float, float, float, float] | None = None
         self.cars: list[tuple[float, float, float]] = []
         self.geom: dict[str, float] = {}
+        # ---- 坡度适配（默认 0 = 平地行为完全不变）----
+        # slope_thr  ：前进时的重力前馈油门（抵消坡道下滑分量）
+        # slope_brake：需要停住时的最小刹车（坡上 0.10 的常规刹车刹不住）
+        self.slope_thr = 0.0
+        self.slope_brake = 0.0
 
     # ---------- 场景解析 ----------
     def _parse_scene(self, obstacles, x: float) -> None:
@@ -182,7 +187,9 @@ class ParallelParkingController:
             gear = GearMode.REVERSE
             steer = -PARALLEL_STEER * min(1.0, dt_phase / 0.8)
             thr = PARALLEL_THROTTLE_MAX if abs(speed) < 0.3 else self.thr.update(0.6)
-            if yaw_err <= 3.0:
+            # 坡上这段圆弧的实际横向位移比规划大（实测每秒 2.9 m），
+            # 只按"航向对上"判会冲过头顶到路缘；再加一条"横向到位就切 FIT"
+            if yaw_err <= 3.0 or dx <= 0.90:
                 self.phase, self.phase_t = "FIT", 0.0
         elif self.phase == "FIT":
             if abs(dy) <= PARALLEL_TOL_DY_M and abs(dx) <= PARALLEL_TOL_DX_M:
@@ -204,8 +211,15 @@ class ParallelParkingController:
             gear, brk = GearMode.PARKING, 1.0
 
         self.phase_t += dt
+        # ---- 坡度适配：前进时补重力前馈；要停住时提高最小刹车 ----
+        if self.slope_thr > 0.0 and gear is GearMode.DRIVE and thr > 0.0:
+            thr = min(1.0, thr + self.slope_thr)
+        if self.slope_brake > 0.0 and brk > 0.0:
+            brk = max(brk, self.slope_brake)
         vc = VehicleControl(gear=gear, throttle=float(thr), brake=float(brk), steering=float(steer))
         return vc, ParallelInfo(self.phase, dx, dy, yaw_err, theta)
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
