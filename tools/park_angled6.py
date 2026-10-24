@@ -42,24 +42,23 @@ H_RA = 1.45
 K_STEER = 0.1834
 EGO_MARGIN_X = 0.0
 
-# ---------- 控制参数 ----------
-V_CRUISE = 2.2
-V_FWD = 1.0
-V_REV = 0.55
-THROTTLE_CAP = 0.06
-BRAKE_CAP = 0.10
-START_HOLD_S = 0.8
-START_THR = 0.005
+# ---------- 控制参数（速度层照抄 park_v8，垂直泊车 210 分那套）----------
+STAGE_THROTTLE = 0.14      # 巡航恒定油门（开环，不闭环追速度）
+SOFT_START_S = 3.0         # 起步前 2.5 s 油门封顶
+SOFT_START_THR = 0.02
+A_DEC_PLAN = 0.8           # 刹车规划用的减速度基准
+V_REV = 0.55               # 倒车目标速度
 STEER_SLEW = 0.12
-THR_SLEW = 0.0004
-BRK_SLEW = 0.0008
+THR_SLEW = 0.0015          # 每帧油门变化量（park_v8 实测值）
+BRK_SLEW = 0.004           # 每帧刹车变化量
+BRAKE_CAP = 0.10
 
 # 倒车级联
 K_YAW = 1.6
 K_DV = 20.0
 S_DV = -1.0
-DU_TARGET = 0.32
-DU_TOL = 0.06
+DU_TARGET = 0.18
+DU_TOL = 0.05
 DV_TOL = 0.12
 YAW_TOL = 5.0
 HOLD_SECONDS = 5.0
@@ -208,52 +207,28 @@ def pp_steer(x, y, yaw, path_pts, idx, lookahead, wheelbase=2.6, max_steer=0.6):
     return max(-1.0, min(1.0, -delta / max_steer)), idx
 
 
-class SpeedPI:
-    """平顺速度环。三条硬规则（都是实测教训）：
+def speed_cmd(v_meas: float, v_target: float):
+    """带死区的调速（park_v8 原样）：误差 0.06 以内不动，超速才轻刹。"""
+    err = v_target - abs(v_meas)
+    if abs(err) < 0.06:
+        return 0.0, 0.0
+    if err > 0:
+        return min(0.10, 0.01 + 0.04 * err), 0.0
+    return 0.0, min(0.10, -0.06 * err)
 
-    1. **油门与刹车互斥**——同时给会造成 0.4 s 内掉 2 m/s（−8 m/s²）
-    2. **刹车封顶 0.10**——实测减速度 ≈ 1.2 + 24·brake，0.10 约 3.6 m/s²
-    3. **起步油门极小**——平台低挡位特性：任何非零油门都会窜到 4.78 m/s，
-       0.005 起手，等车速建立后再交给 PI
+
+def drive_to_point(v_meas: float, dist: float, thr_cruise: float = 0.02):
+    """开环恒定油门 + 按剩余距离反推刹车（park_v8 的对位逻辑）。
+
+    倒车/前进都靠这个：不闭环追速度，车速自己会平滑收敛到稳态；
+    快到位时用 a_req = v²/(2d) 反推所需刹车量，减速是连续渐进的。
     """
-
-    def __init__(self):
-        self.integ = 0.0
-        self.v_cmd = 0.0
-        self.thr = 0.0
-        self.brk = 0.0
-
-    def reset(self, v_now=0.0):
-        self.integ = 0.0
-        self.v_cmd = v_now
-        self.thr = self.brk = 0.0
-
-    def update(self, v_now, v_target, dt, a_max=0.7):
-        step = a_max * dt
-        self.v_cmd += max(-step, min(step, v_target - self.v_cmd))
-        err = self.v_cmd - abs(v_now)
-        self.integ = max(-1.5, min(6.0, self.integ + err * dt))
-        u = 0.12 * err + 0.06 * self.integ
-
-        if u >= 0:
-            thr_t = min(THROTTLE_CAP, u)
-            brk_t = 0.0
-        else:
-            thr_t = 0.0
-            brk_t = min(BRAKE_CAP, -u * 0.5)
-
-        # 斜率限制（两者独立，但保证不会同时非零）
-        self.thr += max(-THR_SLEW, min(THR_SLEW, thr_t - self.thr))
-        self.brk += max(-BRK_SLEW, min(BRK_SLEW, brk_t - self.brk))
-        self.thr = max(0.0, min(THROTTLE_CAP, self.thr))
-        self.brk = max(0.0, min(BRAKE_CAP, self.brk))
-        if self.thr > 0.001 or brk_t > 0.0:
-            # 要么给油，要么刹车，绝不同时
-            if brk_t > 0.0:
-                self.thr = 0.0
-            else:
-                self.brk = 0.0
-        return self.thr, self.brk
+    if dist < 20.0 and v_meas > 0.4:
+        a_req = (v_meas * v_meas) / (2.0 * max(dist, 0.3))
+        brk = max(0.0, min(BRAKE_CAP, (a_req - A_DEC_PLAN) / 25.0))
+        if brk > 0.001:
+            return 0.0, brk
+    return thr_cruise, 0.0
 
 
 def main() -> int:
@@ -268,11 +243,16 @@ def main() -> int:
     geom = {}
 
     def send(gear, thr, brk, steer):
-        # 只对转向做斜率限制；油门/刹车已由 SpeedPI 内部做过 slew，避免双重合速
+        # 转向、刹车做斜率限制；油门是 PWM 脉冲，直接下发（否则会被抹平）
         st["steer"] += max(-STEER_SLEW, min(STEER_SLEW, steer - st["steer"]))
+        st["thr"] += max(-THR_SLEW, min(THR_SLEW, thr - st["thr"]))
+        st["brk"] += max(-BRK_SLEW, min(BRK_SLEW, brk - st["brk"]))
         st["steer"] = max(-1.0, min(1.0, st["steer"]))
-        st["thr"] = max(0.0, min(1.0, thr))
-        st["brk"] = max(0.0, min(1.0, brk))
+        st["thr"] = max(0.0, min(1.0, st["thr"]))
+        st["brk"] = max(0.0, min(1.0, st["brk"]))
+        # 互斥：油门和刹车绝不同时非零
+        if st["brk"] > 0.002:
+            st["thr"] = 0.0
         api.set_vehicle_control(VehicleControl(gear=gear, throttle=st["thr"],
                                                brake=st["brk"], steering=st["steer"]))
 
@@ -291,7 +271,6 @@ def main() -> int:
     csv_w = _csv.writer(csv_fh)
     csv_w.writerow(["frame", "t", "phase", "x", "y", "yaw", "v", "thr", "brk", "steer", "gear"])
     frame_no = 0
-    spd = SpeedPI()
     t_prev = time.time()
 
     for msg, _f in api.main_loop():
@@ -363,23 +342,24 @@ def main() -> int:
         du = (x - slot[0]) * ux + (y - slot[1]) * uy
         dv = (x - slot[0]) * vx + (y - slot[1]) * vy
 
-        # ---------------- 0) 起步：先驻车稳定，再极小油门 ----------------
+        # ---------------- 0) 起步：先驻车稳住，再用极小油门点起来 ----------------
         if phase == "START":
-            if now - st["t0"] < START_HOLD_S:
+            if now - st["t0"] < 1.0:
                 send(GearMode.PARKING, 0.0, 1.0, 0.0)
-            elif abs(v) < 0.25:
-                send(GearMode.DRIVE, START_THR, 0.0, 0.0)
+            elif abs(v) < 0.35:
+                send(GearMode.DRIVE, 0.005, 0.0, 0.0)
             else:
-                spd.reset(v)
                 phase = "CRUISE"
-                print(f"[{now - st['t0']:5.1f}s] 起步完成 v={v:.2f}，转巡航", flush=True)
+                print(f"[{now - st['t0']:5.1f}s] 起步完成 v={v:.2f}", flush=True)
             continue
 
         # ---------------- 1) 车道巡航到预置点 ----------------
         if phase == "CRUISE":
             remaining = math.hypot(stg[0] - x, stg[1] - y)
-            v_des = min(V_CRUISE, max(0.35, 0.55 * remaining))
-            thr, brk = spd.update(v, v_des, dt)
+            if remaining < 18.0:
+                thr, brk = drive_to_point(v, remaining)
+            else:
+                thr, brk = (0.10 if v < 2.0 else 0.0), 0.0
             # 直线跟踪：目标点 = 预置点
             dx, dy = stg[0] - x, stg[1] - y
             th = heading_rad(yaw)
@@ -391,7 +371,15 @@ def main() -> int:
                 print(f"[{now - st['t0']:5.1f}s] CRUISE ({x:.2f},{y:.2f}) yaw={yaw:.1f} "
                       f"v={v:.2f} 剩余{remaining:.1f} 规划={'✓' if plan_holder['done'] else '…'}",
                       flush=True)
-            if remaining < 0.35:
+            if remaining < 1.2 and plan_holder["done"] and plan_holder["path"]:
+                # 规划已就绪就不停车，直接接摆头段，少一次起步瞬态
+                path = plan_holder["path"]
+                sw = plan_holder["sw"]
+                fwd_pts = [Pt(px, py) for px, py, _ in path[:sw + 1]]
+                fwd_idx = 0
+                phase = "FWD"
+                print(f"[{now - st['t0']:5.1f}s] 不停车直接接摆头（{len(fwd_pts)} 点）", flush=True)
+            elif remaining < 0.35:
                 phase = "WAITPLAN"
                 print(f"[{now - st['t0']:5.1f}s] 到预置点，等规划", flush=True)
             continue
@@ -408,8 +396,6 @@ def main() -> int:
                 sw = plan_holder["sw"]
                 fwd_pts = [Pt(px, py) for px, py, _ in path[:sw + 1]]
                 fwd_idx = 0
-                
-                spd.reset(0.0)
 
                 phase = "FWD"
                 print(f"[{now - st['t0']:5.1f}s] 开始摆头（{len(fwd_pts)} 点）", flush=True)
@@ -418,7 +404,13 @@ def main() -> int:
         # ---------------- 3) 前进摆头 ----------------
         if phase == "FWD":
             steer, fwd_idx = pp_steer(x, y, yaw, fwd_pts, fwd_idx, lookahead=1.8)
-            thr, brk = spd.update(v, V_FWD, dt)
+            remain_fwd = math.hypot(fwd_pts[-1].x - x, fwd_pts[-1].y - y)
+            # 只用 PWM 给油，绝不额外加大油门；只有"靠近终点且速度偏高"时才刹车
+            thr, brk = (0.10 if v < 2.0 else 0.0), 0.0
+            if remain_fwd < 5.0 and v > 0.4:
+                _, brk2 = drive_to_point(v, remain_fwd, 0.0)
+                if brk2 > 0.001:
+                    thr, brk = 0.0, brk2
             send(GearMode.DRIVE, thr, brk, steer)
             if now - last_log > 0.8:
                 last_log = now
@@ -434,7 +426,6 @@ def main() -> int:
             send(GearMode.DRIVE, 0.0, min(0.12, abs(v) * 2.0), 0.0)
             if abs(v) < 0.05:
                 st["thr"] = st["brk"] = 0.0
-                spd.reset(0.0)
                 phase = "REV"
                 print(f"[{now - st['t0']:5.1f}s] 停稳，挂倒挡  du={du:+.2f} dv={dv:+.2f}", flush=True)
             continue
@@ -443,7 +434,7 @@ def main() -> int:
         if phase == "REV":
             yaw_des = slot[2] + S_DV * K_DV * dv
             steer = max(-1.0, min(1.0, K_YAW * wrap(yaw - yaw_des)))
-            thr, brk = spd.update(v, V_REV, dt)
+            thr, brk = speed_cmd(v, V_REV)
             send(GearMode.REVERSE, thr, brk, steer)
             if now - last_log > 0.6:
                 last_log = now
@@ -492,6 +483,19 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
