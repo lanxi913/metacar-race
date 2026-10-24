@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 r"""连续场景 1 · 组合控制器入口
 
 组合思路（"用好已训练好的子赛题模型"）：
@@ -34,6 +34,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-seconds", type=float, default=900.0)
     ap.add_argument("--jsonl", type=str, default="logs/lianxu1.jsonl")
+    ap.add_argument("--no-park", action="store_true", help="禁用泊车接管（先测行驶元素基线分）")
     args = ap.parse_args()
 
     print("等待场景连接（先跑脚本，再点启动场景）...", flush=True)
@@ -78,8 +79,18 @@ def main() -> int:
                        (slot_now.pos_y - float(pose.pos_y)) ** 2) ** 0.5
                 near_slot = d_s < 8.0
             # 只有开到车位口（<8 m）且路线基本走完时才交给泊车控制器，避免远距离倒车入场
-            want_park = (PARK_KEYWORD in sub) and near_slot and (geo.path.total - (geo._s_hint or 0.0)) < 12.0
-            if want_park and mode != "PARK":
+            # 泊车元素：把"泊车起点"（由车位几何算出）接到循迹路径末尾，
+            # 让几何控制器把车精确送到 park_v4 期望的起弧点，再交给泊车控制器
+            want_park = (not args.no_park) and (PARK_KEYWORD in sub) and near_slot
+            if want_park and not getattr(geo, "_to_stage", False):
+                stage_pt = (float(slot_now.pos_x),
+                            float(slot_now.pos_y) - 5.26 + 0.30)
+                geo.path = type(geo.path)([(float(pose.pos_x), float(pose.pos_y)), stage_pt])
+                geo._s_hint = None
+                geo.done = False
+                geo._to_stage = True
+                print(f"  → 改道泊车起点 ({stage_pt[0]:.1f},{stage_pt[1]:.1f})", flush=True)
+            if want_park and getattr(geo, "_to_stage", False) and geo.done and mode != "PARK":
                 mode = "PARK"
                 park = VerticalPark()
                 park._latched = True      # 进入泊车模式后不再切回循迹，避免模式抖动
@@ -119,7 +130,8 @@ def main() -> int:
                       f"v={float(car.speed):5.2f}/{info['v_cmd']:5.2f} κ={info['k']:.3f} "
                       f"pos=({float(pose.pos_x):7.1f},{float(pose.pos_y):7.1f})", flush=True)
 
-            if (mode == "PARK" and park and park.done) or geo.done or st.used_time >= args.max_seconds:
+            park_pending = getattr(geo, "_to_stage", False) and mode != "PARK"
+            if (mode == "PARK" and park and park.done) or (geo.done and mode != "PARK" and not getattr(geo, "_to_stage", False)) or st.used_time >= args.max_seconds:
                 print(f"结束：mode={mode} geo_done={geo.done} frames={frame} "
                       f"s={info['s']:.1f}/{geo.path.total:.1f}", flush=True)
                 break
@@ -136,6 +148,10 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
 
 
 
