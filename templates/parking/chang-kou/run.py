@@ -5,7 +5,8 @@ r"""垂直车道泊车 · chang-kou 基线。
     1. 从车道直行，开过车位。
     2. 在车位中心前方约 5.6 m 停稳。
     3. 挂 R 挡，持续反向转向，让车尾扫进车位。
-    4. 车身与车位轴线平行、中心误差达标后驻车保持。
+    4. 倒车阶段用低速目标、速度迟滞和停车锁存，避免逐帧换挡式控制。
+    5. 车身与车位轴线平行、中心误差达标后驻车保持。
 
 运行顺序：
     .venv\Scripts\python.exe -u templates\parking\chang-kou\run.py
@@ -35,12 +36,26 @@ STAGE_STILL_SPEED_MS = 0.30
 STAGE_SETTLE_SECONDS = 0.80
 
 REVERSE_THROTTLE = 0.16
-REVERSE_BRAKE = 0.20
-REVERSE_MAX_SPEED_MS = 1.20
+REVERSE_ENGAGE_SECONDS = 0.50
+REVERSE_ENGAGE_BRAKE = 1.00
+REVERSE_TARGET_SPEED_MS = 0.80
+REVERSE_RESUME_SPEED_MS = 0.55
+REVERSE_SOFT_LIMIT_SPEED_MS = 1.15
+REVERSE_SOFT_LIMIT_BRAKE = 0.05
+REVERSE_THROTTLE_RAMP_PER_SEC = 0.08
+REVERSE_SPEED_FILTER_ALPHA = 0.20
+REVERSE_CONTROL_INTERVAL_SECONDS = 0.10
 REVERSE_STOP_START_M = 1.50
-REVERSE_CREEP_THROTTLE = 0.04
+REVERSE_FINAL_SPEED_GAIN = 0.30
+REVERSE_FINAL_MIN_SPEED_MS = 0.08
+REVERSE_FINAL_MAX_SPEED_MS = 0.40
+REVERSE_FINAL_SPEED_BAND_MS = 0.03
+REVERSE_FINAL_OVERSHOOT_BAND_MS = 0.12
+REVERSE_FINAL_BRAKE = 0.03
+REVERSE_CREEP_THROTTLE = 0.02
 REVERSE_STEER_SIGN = -1.0
 CENTER_TOL_M = 0.35
+HOLD_STILL_SPEED_MS = 0.06
 HEADING_TOL_DEG = 8.0
 HOLD_SECONDS = 5.0
 
@@ -100,6 +115,7 @@ def main() -> int:
             "steering",
             "throttle",
             "brake",
+            "reverse_mode",
         ]
     )
 
@@ -108,6 +124,14 @@ def main() -> int:
     stage_ready = False
     phase = "approach"
     stationary_seconds = 0.0
+    reverse_mode = "idle"
+    reverse_stop_latched = False
+    reverse_throttle_command = 0.0
+    reverse_speed_filtered = 0.0
+    reverse_control_elapsed = 0.0
+    reverse_engage_elapsed = 0.0
+    reverse_final_overspeed = False
+    reverse_max_abs_speed = 0.0
     hold_seconds = 0.0
     final_x = final_y = final_yaw = 0.0
     frame = 0
@@ -122,6 +146,13 @@ def main() -> int:
             final_yaw = float(pose.ori_z)
             speed = float(car.speed)
             dt = 1.0 / 30.0
+            if phase == "reverse":
+                reverse_speed_filtered += REVERSE_SPEED_FILTER_ALPHA * (
+                    abs(speed) - reverse_speed_filtered
+                )
+                reverse_max_abs_speed = max(
+                    reverse_max_abs_speed, abs(speed)
+                )
 
             if slot is None:
                 slot = find_slot(msg.obstacles)
@@ -195,7 +226,7 @@ def main() -> int:
                 if (
                     center_distance <= CENTER_TOL_M
                     and abs(heading_error) <= HEADING_TOL_DEG
-                    and abs(speed) <= STAGE_STILL_SPEED_MS
+                    and abs(speed) <= HOLD_STILL_SPEED_MS
                 ):
                     phase = "hold"
                     hold_seconds = 0.0
@@ -213,18 +244,116 @@ def main() -> int:
                             REVERSE_STEER_SIGN * heading_error / 30.0,
                         ),
                     )
-                    if center_distance <= REVERSE_STOP_START_M:
-                        throttle = 0.0
-                        brake = REVERSE_BRAKE
-                        if abs(speed) <= 0.10:
-                            throttle = REVERSE_CREEP_THROTTLE
-                            brake = 0.0
-                    else:
-                        throttle = REVERSE_THROTTLE
-                        brake = 0.0
-                        if abs(speed) > REVERSE_MAX_SPEED_MS:
+                    if (
+                        not reverse_stop_latched
+                        and center_distance <= REVERSE_STOP_START_M
+                    ):
+                        reverse_stop_latched = True
+                        reverse_throttle_command = 0.0
+                        print(
+                            f"锁存最终停车：d={center_distance:.3f} "
+                            f"v={speed:+.2f}",
+                            flush=True,
+                        )
+
+                    if reverse_stop_latched:
+                        remaining = max(
+                            0.0, center_distance - CENTER_TOL_M
+                        )
+                        target_speed = max(
+                            REVERSE_FINAL_MIN_SPEED_MS,
+                            min(
+                                REVERSE_FINAL_MAX_SPEED_MS,
+                                REVERSE_FINAL_SPEED_GAIN * remaining,
+                            ),
+                        )
+                        if center_distance <= CENTER_TOL_M:
+                            reverse_mode = "final_stop"
                             throttle = 0.0
-                            brake = REVERSE_BRAKE
+                            brake = REVERSE_FINAL_BRAKE
+                        else:
+                            if (
+                                abs(speed)
+                                > target_speed
+                                + REVERSE_FINAL_OVERSHOOT_BAND_MS
+                            ):
+                                reverse_final_overspeed = True
+                            elif (
+                                abs(speed)
+                                <= target_speed
+                                + REVERSE_FINAL_OVERSHOOT_BAND_MS * 0.5
+                            ):
+                                reverse_final_overspeed = False
+
+                            reverse_control_elapsed += dt
+                            if (
+                                reverse_control_elapsed
+                                >= REVERSE_CONTROL_INTERVAL_SECONDS
+                            ):
+                                reverse_control_elapsed = 0.0
+                                if (
+                                    reverse_speed_filtered
+                                    <= target_speed
+                                    - REVERSE_FINAL_SPEED_BAND_MS
+                                ):
+                                    reverse_mode = "final_accel"
+                                elif (
+                                    reverse_speed_filtered
+                                    >= target_speed
+                                    + REVERSE_FINAL_SPEED_BAND_MS
+                                ):
+                                    reverse_mode = "final_coast"
+
+                            if reverse_final_overspeed:
+                                reverse_mode = "final_trim"
+                                throttle = 0.0
+                                brake = REVERSE_FINAL_BRAKE
+                            elif reverse_mode == "final_accel":
+                                throttle = REVERSE_CREEP_THROTTLE
+                                brake = 0.0
+                            else:
+                                throttle = 0.0
+                                brake = 0.0
+                    else:
+                        if reverse_engage_elapsed < REVERSE_ENGAGE_SECONDS:
+                            reverse_engage_elapsed += dt
+                            reverse_mode = "engage"
+                            throttle = 0.0
+                            brake = REVERSE_ENGAGE_BRAKE
+                        else:
+                            reverse_control_elapsed += dt
+                            if (
+                                reverse_control_elapsed
+                                >= REVERSE_CONTROL_INTERVAL_SECONDS
+                            ):
+                                reverse_control_elapsed = 0.0
+                                if (
+                                    reverse_speed_filtered
+                                    >= REVERSE_TARGET_SPEED_MS
+                                ):
+                                    reverse_mode = "coast"
+                                elif (
+                                    reverse_speed_filtered
+                                    <= REVERSE_RESUME_SPEED_MS
+                                ):
+                                    reverse_mode = "accelerate"
+
+                            if reverse_mode == "accelerate":
+                                reverse_throttle_command = min(
+                                    REVERSE_THROTTLE,
+                                    reverse_throttle_command
+                                    + REVERSE_THROTTLE_RAMP_PER_SEC * dt,
+                                )
+                                throttle = reverse_throttle_command
+                            else:
+                                reverse_throttle_command = 0.0
+                                throttle = 0.0
+                            brake = 0.0
+                            if abs(speed) > REVERSE_SOFT_LIMIT_SPEED_MS:
+                                reverse_mode = "soft_limit"
+                                reverse_throttle_command = 0.0
+                                throttle = 0.0
+                                brake = REVERSE_SOFT_LIMIT_BRAKE
                     vc = VehicleControl(
                         gear=GearMode.REVERSE,
                         throttle=throttle,
@@ -257,6 +386,7 @@ def main() -> int:
                     round(vc.steering, 4),
                     round(vc.throttle, 4),
                     round(vc.brake, 4),
+                    reverse_mode,
                 ]
             )
             if frame % 10 == 1:
@@ -266,7 +396,7 @@ def main() -> int:
                     f"yaw={final_yaw:7.2f} err={heading_error:+6.2f} "
                     f"d={center_distance:5.2f} v={speed:5.2f} "
                     f"st={vc.steering:+5.2f} th={vc.throttle:5.3f} "
-                    f"br={vc.brake:4.2f}",
+                    f"br={vc.brake:4.2f} mode={reverse_mode}",
                     flush=True,
                 )
             if status.used_time >= args.max_seconds:
@@ -292,6 +422,8 @@ def main() -> int:
         "phase": phase,
         "frames": frame,
         "stage_ready": stage_ready,
+        "reverse_stop_latched": reverse_stop_latched,
+        "reverse_max_abs_speed": round(reverse_max_abs_speed, 4),
         "slot_center": (
             None if slot is None else [round(slot.pos_x, 4), round(slot.pos_y, 4)]
         ),
