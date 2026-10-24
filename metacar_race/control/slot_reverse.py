@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """斜列/平行车位的「解析 S 弯 + 倒车纯跟踪」，带坡度适配。
 
 为什么需要它
@@ -76,6 +76,7 @@ class SlotReverseParker:
         self.fine_sub = "Y"    # FINE 子阶段：Y=先修纵向，YAW=再修航向
         self.cycles = 0        # 已重规划的 S 弯次数
         self.rev_thr = 0.0     # 倒车油门基准（只升不降）
+        self.pulse = 0         # 油门脉冲计数
 
     # ---------- 场景解析 ----------
     def _parse(self, obstacles, x: float) -> None:
@@ -263,11 +264,11 @@ class SlotReverseParker:
             # 倒车油门"只升不降"地爬到 0.20 并保持（坡上低于 0.18 推不动），
             # 速度只用刹车调，避免油门被刹车打断后又要几秒才能重建
             self.rev_thr = min(0.20, self.rev_thr + 0.002)
+            # 比例刹车：油门保持 0.20，用"和超速量成正比"的刹车稳定控速（不会振荡）
+            over = abs(speed) - v_target
+            brk = max(0.0, min(0.25, 0.40 * over)) if over > 0 else 0.0
             thr = self.rev_thr
-            if abs(speed) > v_target + 0.12:
-                return (VehicleControl(gear=gear, throttle=thr, brake=0.18, steering=steer),
-                        SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
-            return (VehicleControl(gear=gear, throttle=thr, steering=steer),
+            return (VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer),
                     SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
             thr = 0.0
             # 最后 2 m 超速就主动刹（坡上下滑会让车越溜越快）
@@ -358,6 +359,8 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
 
 
 
