@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 r"""连续场景 · 垂直泊车 · 单圆弧移植版。
 
 策略直接照搬已在单场景拿到 200 分的 chang-kou 基线（提交 5f72206）：
@@ -276,8 +276,13 @@ def main() -> int:
                 tx, ty = math.cos(rad), math.sin(rad)
             remaining = dsx * tx + dsy * ty
 
+            # 到位判据只在准备点附近才成立：连续转弯段是蛇形，route 切线会让
+            # stage 的投影提前变负（实测在 642 m 外就误判"到达准备点"并开始倒车）。
+            near_stage = d_stage <= AIM_NEAR_M
+
             if phase == "approach":
-                if remaining <= STOP_AT_STAGE_M or d_stage <= STOP_AT_STAGE_M:
+                if near_stage and (remaining <= STOP_AT_STAGE_M
+                                   or d_stage <= STOP_AT_STAGE_M):
                     if speed <= STAGE_STILL_SPEED_MS:
                         vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
                         stationary += dt
@@ -292,7 +297,7 @@ def main() -> int:
                         print(f"到达倒车准备点 ({x:.2f},{y:.2f}) yaw={yaw:.1f} "
                               f"剩余={remaining:+.2f} 距准备点={d_stage:.2f} "
                               f"du={met['du']:+.2f} dv={met['dv']:+.2f}", flush=True)
-                elif d_stage < AIM_NEAR_M:
+                elif near_stage:
                     # 车位附近：不再跟赛道（赛道末段会拐进车位），直接对准准备点并减速
                     v_des = min(2.20, max(0.35, 0.90 * remaining))
                     steer = aim_steering(x, y, yaw, stage)
@@ -320,7 +325,15 @@ def main() -> int:
                                             brake=brk, steering=steer)
 
             elif phase == "reverse":
-                if (met["dist"] <= CENTER_TOL_M and abs(heading_error) <= HEADING_TOL_DEG
+                if d_stage > 15.0:
+                    # 兜底：误判进倒车段时退回接近段，不许在路中间倒车
+                    phase = "approach"
+                    approach_t0 = sim_t
+                    print(f"倒车位置异常（距准备点 {d_stage:.1f} m，剩 {remaining:+.1f}），"
+                          f"退回接近段", flush=True)
+                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
+                                        brake=0.12, steering=0.0)
+                elif (met["dist"] <= CENTER_TOL_M and abs(heading_error) <= HEADING_TOL_DEG
                         and abs(speed) <= STAGE_STILL_SPEED_MS):
                     phase = "hold"
                     hold = 0.0
