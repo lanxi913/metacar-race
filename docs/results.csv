@@ -31,3 +31,8 @@
 2026-10-24 06:53:51,车辆变道,cheliangbiandao,tools\track_bonus.py --offset 0.8,210.00,2026/10/23 20:13:38
 2026-10-24 16:53:53,车辆跟随,follow,tools/follow_run.py,100.00,加速度违规1次(16:22:12)
 2026-10-24 17:03:06,车辆紧急停止,emergency_stop,tools/emergency_stop_run.py,110.00,一次通过
+2026-10-24 20:41:02,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,200.00,首次跑通入位；差加速度+10；du=+0.28 dv=+0.03 航向差-0.7°
+2026-10-24 21:07:35,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,200.00,第6次复现；平顺化后违规帧168→8 max|a| 21.7→9.2；du=+0.37 dv=+0.04
+2026-10-24 21:58:21,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,200.00,速度层照抄park_v8；du=+0.21 dv=+0.04 航向差-0.9 29.5s
+2026-10-24 22:07:10,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,210.00,满分！du=+0.23 dv=+0.03 航向差-0.5 28.5s
+2026-10-24 22:27:34,异形车道泊车,yixingchedaoboche,tools/park_angled6.py,210.00,平滑版：S形换道+纯跟踪；du=+0.21 dv=+0.04 航向差-0.8 28.3s
