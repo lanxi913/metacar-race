@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """几何循迹控制器（规则 / 车辆 / 场景数据驱动，输出平滑）
 
 设计目标（按用户反馈修正）：**不摇摆、不冲速**。
@@ -296,7 +296,7 @@ class GeoFollower:
                         if getattr(getattr(o, "type", None), "name", "") != "CAR":
                             continue
                         os_, oe = self.path.project(float(o.pos_x), float(o.pos_y), s, window=90.0)
-                        if -8.0 < (os_ - s) < block[0] + 30.0 and abs(oe - off) < half_corridor:
+                        if -2.0 < (os_ - s) < block[0] + 10.0 and abs(oe - off) < half_corridor:
                             return False
                     return True
                 cands = self._valid_offsets(s, (self.lane_w, -self.lane_w,
@@ -381,6 +381,8 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
 
 
 
