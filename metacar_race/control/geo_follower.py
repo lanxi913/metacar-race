@@ -404,16 +404,11 @@ class GeoFollower:
             a_raw = (v - self._v_prev) / dt
             # 一阶低通，压制单帧噪声
             self._a_lp += (a_raw - self._a_lp) * min(1.0, dt / 0.08)
-            if self._a_lp > A_LONG_MAX * 0.8:        # 加速过猛 → 收油
-                thr_t = 0.0
+            if self._a_lp > A_LONG_MAX * 0.8:        # 加速过猛 → 缓慢收油（不能一下归零，会一顿一顿）
+                thr_t = min(thr_t, max(0.0, self._lim_thr - 0.004))
             elif self._a_lp < -A_LONG_MAX * 0.8:     # 减速过猛 → 松刹
-                brk_t = max(0.0, brk_t - 0.05)
-        # 起步：车一动（v>0.05）立刻松油门滑 2.5 s，让车速自己慢慢爬
-        # （用户反馈"起步太猛"，滑行段加长；加速度限制是全局的）
-        if self._launch_v is None and v > 0.05:
-            self._launch_v = self.t
-        if self._launch_v is not None and self.t < self._launch_v + 2.5:
-            thr_t = 0.0
+                brk_t = max(0.0, brk_t - 0.15)
+        # 起步不再"滑行"（滑行会造成一顿一顿），改为极慢的油门斜坡自然加速
         # 油门硬上限：台阶标定显示 0.18 仍是 4.78 m/s，0.22 起会跳挡/抖动，
         # 一旦跳挡车速 4.78→13+，平台判「加速度高于允许上限」丢 +10
         thr_t = min(thr_t, THR_CAP)
@@ -443,6 +438,7 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
 
 
 
