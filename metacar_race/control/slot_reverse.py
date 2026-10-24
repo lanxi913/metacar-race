@@ -206,8 +206,10 @@ class SlotReverseParker:
             nx, ny = -ty / tn, tx / tn                     # 路径左法向
             e_ct = (x - px) * nx + (y - py) * ny           # 横向误差（正 = 在路径左侧）
             steer = max(-1.0, min(1.0, ff + CT_GAIN * e_ct))
-            # 必须位置和航向都到位才算入位（只判位置会斜着停进去）
-            if best_i >= len(self.path) - 2 and abs(dx) < 0.35 and abs(dy) < 0.35 and yaw_err < 8.0:
+            # 靠近车位中心就减速，并在 0.45 m 内停住（不再依赖"走到路径末端"）
+            dist = math.hypot(dx, dy)
+            v_target = 0.35 if dist < 1.6 else V_REVERSE
+            if dist < 0.60 and yaw_err < 15.0:
                 self.phase = "SETTLE"
                 self.hold = 0.0
             elif abs(speed) > V_REVERSE + 0.30:
@@ -218,7 +220,12 @@ class SlotReverseParker:
             fx, fy = math.cos(syaw_rad), -math.sin(syaw_rad)
             ahead = (sx - x) * fx + (sy - y) * fy
             gear = GearMode.DRIVE if (best_i >= b2 and ahead > 0.10) else GearMode.REVERSE
-            thr = 0.10 if abs(speed) < V_REVERSE else 0.0
+            # 油门必须 ≥0.18 才推得动（实测 0.10~0.16 在坡上会卡住），用 PWM 控速
+            thr = 0.20 if abs(speed) < v_target else 0.0
+            # 最后 2 m 超速就主动刹（坡上下滑会让车越溜越快）
+            if dist < 2.0 and abs(speed) > v_target + 0.15:
+                return (VehicleControl(gear=gear, brake=0.20, steering=steer),
+                        SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
             if self.slope_thr > 0 and gear is GearMode.REVERSE:
                 thr += self.slope_thr
             # 坡上静止起步要更大油门，否则卡在静摩擦里（实测 v 一直为 0）
@@ -245,6 +252,9 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
+
 
 
 
