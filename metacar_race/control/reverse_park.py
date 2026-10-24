@@ -20,7 +20,7 @@ import math
 
 PARKING_SLOT_TYPE = 30
 
-DEFAULT_RADIUS = 5.26          # 满舵倒车半径（实测）
+DEFAULT_RADIUS = 5.26          # 倒车弧半径（staging 点的几何基准）
 APPROACH_SPEED = 2.30          # 对位段的目标车速（m/s）
 APPROACH_DECEL = 0.80          # 对位段规划减速度（m/s²）
 STAGE_SPEED = 0.14             # 兼容旧脚本：对位段的油门量（≈2.3 m/s）
@@ -30,6 +30,7 @@ STOP_LONG_TOL = 0.06           # 沿轴线距车位中心多近算入库
 STOP_LAT_TOL = 0.15            # 横向容差（只用于日志判定）
 HOLD_SECONDS = 5.0             # 连续场景要求停稳保持 5 s
 ARC_TOL_RAD = math.radians(2.0)
+ARC_STEER = 0.74               # 倒车弧的转向量：steering=1.0 实测半径只有 3.61 m
 TIMEOUT_SECONDS = 120.0
 GOAL_TOL = 0.08                # 距「停车检查点」多近算到位（平台 end_point）
 GOAL_MAX_OFFSET = 1.50         # 检查点离车位中心超过这个距离就不当停车点用
@@ -78,10 +79,16 @@ class ReversePark:
     """倒车入库：approach → stop → arc → straight → hold。"""
 
     def __init__(self, radius=DEFAULT_RADIUS, hold_seconds=HOLD_SECONDS,
-                 timeout=TIMEOUT_SECONDS, goal=None, goal_tol=GOAL_TOL):
+                 timeout=TIMEOUT_SECONDS, goal=None, goal_tol=GOAL_TOL,
+                 arc_steer=ARC_STEER):
         self.radius = float(radius)
         self.hold_seconds = float(hold_seconds)
         self.timeout = float(timeout)
+        # 倒车弧的转向量。20261024-142117 实测：steering=1.0 倒车画出来的半径只有
+        # 3.61 m（最小二乘拟合残差 4 mm，转角 80.3°、弧长 5.06 m），而 staging 点是
+        # 按 5.26 m 算的，两者差 1.65 m —— 弧末端横向误差 0.73 m 全从这里来。
+        # 反推满舵前轮角 35.7°（≈0.623 rad），要凑出 5.26 m 需 steering≈0.74。
+        self.arc_steer = float(arc_steer)
         # 平台给的「停车检查点」（static.sub_scenes[i].end_point）。车必须停到这
         # 个点上，元素才算完成——20261024-133827 那次停在车位中心，离检查点
         # 0.40 m，垂直泊车直接 0 分，430 分里少了 200。
@@ -208,16 +215,16 @@ class ReversePark:
         if self.phase == "stop":
             if abs(v) < STOPPED_SPEED:
                 self.phase = "arc"
-                return "reverse", 0.0, 0.0, side
+                return "reverse", 0.0, 0.0, side * self.arc_steer
             return "drive", 0.0, 0.10, 0.0
 
-        # ---------- 3) 满舵倒车，车头摆到车位轴线 ----------
+        # ---------- 3) 定半径倒车，车头摆到车位轴线 ----------
         if self.phase == "arc":
             if abs(heading_err) < ARC_TOL_RAD:
                 self.phase = "straight"
                 return "reverse", 0.0, 0.0, 0.0
             thr, brk = speed_cmd(v, ARC_SPEED)
-            return "reverse", thr, brk, side
+            return "reverse", thr, brk, side * self.arc_steer
 
         # ---------- 4) 直线倒进车位 ----------
         if self.phase == "straight":

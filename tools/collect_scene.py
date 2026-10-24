@@ -347,6 +347,8 @@ def parse_args() -> argparse.Namespace:
                         help="进入非目标元素后先停多少仿真秒再跳关")
     parser.add_argument("--skip-to-index", type=int, default=0,
                         help="探针用：只跑第 N 个元素（1 起算），避免命令行传中文元素名")
+    parser.add_argument("--park-shift-radius", type=float, default=45.0,
+                        help="离对位点多远之内才开始借位（太早借位会让车整段路偏着走）")
     parser.add_argument("--max-skips", type=int, default=6,
                         help="最多跳关次数，防止配置错误时无限跳")
     parser.add_argument("--kick", action="store_true",
@@ -622,6 +624,7 @@ def main() -> int:
                         if sub.name == current_sub and sub.end_point is not None:
                             park_goal = (float(sub.end_point.x), float(sub.end_point.y))
                             break
+                pinfo = None
                 if slot_now is not None and args.park_shift > 0 and proj["idx"] >= 1:
                     i = proj["idx"]
                     j = min(i + 1, projector.n - 1)
@@ -632,6 +635,11 @@ def main() -> int:
                     # 对位点在车的哪一侧，就往哪一侧借位；借多少看线/余量
                     probe = ReversePark(hold_seconds=0.0)
                     pinfo = probe.begin(pose.pos_x, pose.pos_y, pose.ori_z, slot_now, now)
+                    # 只在临近车位时借位：车位在传感器里 90 m 外就能看见，太早借位
+                    # 会让车整段路都偏 1 m 走（20261024-142117 实测横偏恒为 +1.00）。
+                    if pinfo["d_stage"] > args.park_shift_radius:
+                        pinfo = None
+                if pinfo is not None:
                     toward = ((pinfo["stage_x"] - pose.pos_x) * lx
                               + (pinfo["stage_y"] - pose.pos_y) * ly)
                     if toward >= 0.0:
