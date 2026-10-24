@@ -60,21 +60,20 @@ BLOCK_SLOW_M = 30.0         # 进入这个距离开始限速
 BLOCK_STOP_M = 7.0          # 这个距离内直接刹停
 FOLLOW_DECEL = 0.45         # 限速曲线 v = FOLLOW_DECEL * (d - 6)
 
-OVERTAKE_OFFSET_M = 3.50    # 绕行时往相邻车道偏多少（车道宽 3.5~3.8）
-OVERTAKE_TRIGGER_M = 30.0   # 前方这个距离内出现静止车就开始准备绕
-OVERTAKE_WAIT_S = 0.60      # 连续判定这么久才真正开始
-OVERTAKE_CLEAR_M = 60.0     # 目标车道要空出这么远才敢进
-OVERTAKE_BAND_M = 2.20      # 目标车道占用判定的横向半宽
-OVERTAKE_SPEED = 6.0        # 绕行时的目标速度上限
-OVERTAKE_RAMP_RATE = 0.25   # 每行驶 1 m 允许横移多少米（3.5 m 需跑 14 m）
-OVERTAKE_TIMEOUT_S = 30.0
+OVERTAKE_OFFSET_M = 3.50    # 只往左并 3.5 m（车道宽 3.5~3.8）
+OVERTAKE_PREP_M = 50.0      # 本道前方这么远内见静止车就开始并线（8 m/s 下 5 s 余量）
+PASS_CLEAR_M = 60.0         # 左道正前方要空出这么远才敢并
+RETURN_CLEAR_M = 45.0       # 回中间前本道前方的净空要求（上一版 14 m 不够）
+RETURN_BEHIND_M = 8.0       # 最后一辆被超车必须在身后这么远
+ABORT_GAP_M = 12.0          # 目标道出现这么近的车就退回原道
+SHIFT_LENGTH_M = 20.0       # 横移用掉多少纵向行程（余弦 S 曲线按距离算，8 m/s 下即 2.5 s）
+SHIFT_SECONDS = 2.5         # 仅作参考/超时换算，实际以 SHIFT_LENGTH_M 为准
+SHIFT_HOLD_MIN_MS = 4.00    # 低于这个速度横移不锁速（低速时横向加速度按 v^2 缩，可同时提速）
+SHIFT_TIMEOUT_S = 30.0      # 横移卡住的兜底
+PASS_MAX_S = 30.0           # 左侧待太久就找机会回去，别影响后面的转弯
+OVERTAKE_BAND_M = 2.20      # 车道占用判定的横向半宽
 LANE_MAX_M = 60.0           # 车道净空的上限
-LANE_KEEP_M = 14.0          # 本车道前方还有这么远就不动
-LANE_ADV_M = 4.0            # 换道至少要多空出这么多
-LANE_DECIDE_S = 0.20        # 车道决策间隔
-LANE_MOVING_MS = 1.00       # 前车比这个快就是跟车，不换道绕
-LANE_PREP_M = 40.0          # P1：前方这个距离内出现静止车就提前决策换道
-LANE_SHIFT_MS = 1.20        # P3：横移速率下限（m/s），不再只看行驶距离
+LANE_MOVING_MS = 1.00       # 前车比这个快就是跟车，不算障碍
 FOLLOW_BAND_SWITCH = 0.30   # P2：|lat_off| 超过它，跟车带中心按目标车道算
 
 K_HEADING = 2.0             # Stanley 航向增益（与 roundabout/main.py 同值）
@@ -433,103 +432,186 @@ class ShiftRoute:
 
 
 class Overtaker:
-    """按"前方可用空间"选车道：本车道被占就并到更空的一侧，过了再回来。
+    """左道超车状态机：CRUISE → SHIFT_OUT → PASS → SHIFT_BACK → CRUISE。
 
-    每条候选车道（本车道 / 左 off / 右 off）各算一个前方净空，净空低于
-    LANE_KEEP_M 才换道，且要求目标车道至少多空出 LANE_ADV_M；三条都不行就
-    报 blocked 让上层刹停。横移按行驶距离限速（OVERTAKE_RAMP_RATE），不会
-    原地打方向。
+    流程按队友反馈定的：**先向左变道 → 提速 → 超越右侧车辆 → 向右变道回来**，
+    全程不撞车。三条硬约束：
 
-    为什么改成这样：早先的版本是"锁一辆车、触发一次、挑一侧并过去"，
-    在场景4 的错位停车场里并到右侧后 4 m 就顶上了第二辆车。这类路段是一排
-    错位停放的车，必须每 0.2 s 重新挑车道。
+    1. **只往左并**。左道不空就老实跟车，绝不往右并——场景4 这一段是四辆车
+       错位停放（本道 / 右道交替、跨度 34 m），右道同样有车，上一版并到右侧
+       4 m 就顶上第二辆。
+    2. **横向和纵向不同时做**。横移用余弦 S 曲线，起止横向速度都是 0；
+       横移期间速度保持不变（`v_hold`），提速只放在直线段（PASS）。
+       这样 |a_lat| 峰值 (A/2)(π/T)² = 1.75×(π/2.5)² ≈ 2.8 m/s² 和纵向
+       1.5 m/s² 不叠加，离平台 5 m/s² 的限制还有一倍余量。
+       上一版按行驶距离线性横移，横移速率只有 0.26 m/s，3.5 m 拖了 12 s。
+    3. **回中间要等两件事**：本道前方 `RETURN_CLEAR_M` 内无车，且最后一辆
+       被超的车已经在身后 `RETURN_BEHIND_M` 以上。上一版只看本道净空 14 m，
+       那排车跨度 34 m，14 m 就插回第二辆车前面。
+
+    状态机是显式的：每帧只推进一步，什么时候该做什么写死，不再"每 0.2 s
+    按净空重挑一次车道"——那种写法在换道半途改主意，车会左右摆。
     """
 
-    def __init__(self, offset: float = OVERTAKE_OFFSET_M, enabled: bool = True) -> None:
+    CRUISE, SHIFT_OUT, PASS, SHIFT_BACK = 0, 1, 2, 3
+    NAMES = ("CRUISE", "SHIFT_OUT", "PASS", "SHIFT_BACK")
+
+    def __init__(self, offset: float = OVERTAKE_OFFSET_M, enabled: bool = True,
+                 shift_seconds: float = SHIFT_SECONDS) -> None:
         self.offset = float(offset)
-        self.enabled = enabled
+        self.enabled = bool(enabled)
+        self.shift_seconds = max(0.2, float(shift_seconds))
+        self.state = self.CRUISE
+        self.t_state = 0.0
         self.lat_off = 0.0
-        self.target = 0.0
-        self.active = False
-        self.blocked = False
-        self.side = 0.0
-        self.decide_t = 0.0
+        self.from_off = 0.0
+        self.shift_dist = 0.0
+        self.v_hold = None
+        self.last_block = None
 
-    def clearance(self, items, off: float) -> float:
-        """这条车道前方最近的障碍有多远（LANE_MAX_M 封顶）。"""
-        best = LANE_MAX_M
-        for o in items:
-            if o["type"] in IGNORE_TYPES or o["dist"] < -3.0:
-                continue
-            if abs(o["lat"] - off) < OVERTAKE_BAND_M and o["dist"] < best:
-                best = o["dist"]
-        return best
+    # ---------------- 车道占用查询 ----------------
 
-    def nearest(self, items, off: float):
-        """这条车道前方最近的障碍（dict）或 None。"""
+    @staticmethod
+    def _usable(o) -> bool:
+        return o["type"] not in IGNORE_TYPES and o["dist"] > -200.0
+
+    def _in_band(self, o, off: float) -> bool:
+        return abs(o["lat"] - off) <= OVERTAKE_BAND_M
+
+    def nearest_forward(self, items, off: float):
+        """这条车道正前方最近的障碍（dict）或 None。"""
         best = None
         for o in items:
-            if o["type"] in IGNORE_TYPES or o["dist"] < -1.0:
+            if not self._usable(o) or not self._in_band(o, off):
                 continue
-            if abs(o["lat"] - off) > OVERTAKE_BAND_M:
+            if o["dist"] < 0.0:
                 continue
             if best is None or o["dist"] < best["dist"]:
                 best = o
         return best
 
-    def _pick(self, items, cur: float) -> tuple[float, bool]:
-        """返回 (目标横向偏移, 是否三条车道全堵)。"""
-        cur_clear = self.clearance(items, cur)
-        near = self.nearest(items, cur)
-        # P1：前方 LANE_PREP_M 内出现静止车就提前决策，不再等它压到 LANE_KEEP_M。
-        # 上一轮就是等到 13.6 m 才动，横移还没走完就贴到车上去了。
-        prep = (near is not None and near["v"] < LANE_MOVING_MS
-                and near["dist"] <= LANE_PREP_M)
-        if cur_clear >= LANE_KEEP_M and not prep:
-            if abs(cur) > 1e-6 and self.clearance(items, 0.0) >= LANE_KEEP_M:
-                return 0.0, False        # 让出车道：回中间
-            return cur, False
-        # 前方那辆在动：这是跟车，不是绕障，老老实实跟在后面
-        if near is not None and near["v"] >= LANE_MOVING_MS:
-            return cur, False
-        best_off, best_clear = cur, cur_clear
-        for c in (self.offset, -self.offset, 0.0):
-            if abs(c - cur) < 1.0:
-                continue
-            cl = self.clearance(items, c)
-            # 只考虑"够空"的车道；同时在够空的车道里优先回中间（少动一次方向）
-            if cl < LANE_KEEP_M or cl < cur_clear + LANE_ADV_M:
-                continue
-            if best_off == cur or abs(c) < abs(best_off):
-                best_off, best_clear = c, cl
-        if best_off != cur:
-            return best_off, False
-        return cur, True
+    def clearance(self, items, off: float) -> float:
+        """这条车道正前方净空（LANE_MAX_M 封顶）。"""
+        near = self.nearest_forward(items, off)
+        return LANE_MAX_M if near is None else min(LANE_MAX_M, near["dist"])
 
-    def update(self, t: float, block, items, dt: float, ds: float) -> dict:
-        # P3：横移按时间（1.2 m/s 下限）而不是只看行驶距离——低速跟车时
-        # 按距离算会把 3.5 m 的横移拖成 12 s，上一轮就是这么把车顶死的。
-        step = max(LANE_SHIFT_MS * dt, max(ds, 0.0) * OVERTAKE_RAMP_RATE)
-        self.decide_t += dt
-        # 上一段横移基本走完才重新决策，避免半路改主意
-        if self.enabled and self.decide_t >= LANE_DECIDE_S and abs(self.target - self.lat_off) < 0.30:
-            self.decide_t = 0.0
-            self.target, self.blocked = self._pick(items, self.target)
+    def beside(self, items, off: float, gap: float = 3.0):
+        """这条车道上紧贴车身（±gap）的障碍，用来判断"并进去会被撞"。"""
+        for o in items:
+            if not self._usable(o) or not self._in_band(o, off):
+                continue
+            if -gap <= o["dist"] < gap:
+                return o
+        return None
 
-        tgt = self.target
-        if abs(tgt - self.lat_off) <= step:
-            self.lat_off = tgt
+    def rear_gap(self, items, off: float) -> float:
+        """这条车道**身后**最近的障碍还差多少米（没有则 999）。"""
+        best = 999.0
+        for o in items:
+            if not self._usable(o) or not self._in_band(o, off):
+                continue
+            if o["dist"] <= 0.0:
+                best = min(best, -o["dist"])
+        return best
+
+    # ---------------- 状态推进 ----------------
+
+    def _enter(self, state: int, t: float, speed: float) -> None:
+        self.state = state
+        self.t_state = float(t)
+        self.from_off = self.lat_off
+        if state in (self.SHIFT_OUT, self.SHIFT_BACK):
+            self.shift_dist = 0.0
+            # 高速时锁速横移（不同时加速）；低速时横向加速度按 v^2 缩，允许继续提速
+            self.v_hold = float(speed) if speed >= SHIFT_HOLD_MIN_MS else None
+        if state == self.CRUISE:
+            self.v_hold = None
+
+    def _cosine(self, t: float) -> float:
+        """余弦 S 曲线：起止横向速度都是 0，所以没有横向加速度冲量。
+
+        按**走过的纵向距离**推进，而不是墙钟时间：车速低的时候横移自动拉长，
+        不会出现"低速时要在 3 m 行程里横移 3.5 m"这种物理上做不到的动作。
+        """
+        u = self.shift_dist / max(SHIFT_LENGTH_M, 0.1)
+        u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+        s = 0.5 * (1.0 - math.cos(math.pi * u))
+        dst = self.offset if self.state == self.SHIFT_OUT else 0.0
+        return self.from_off + (dst - self.from_off) * s
+
+    def _shift_done(self, el: float) -> bool:
+        return self.shift_dist >= SHIFT_LENGTH_M or el >= SHIFT_TIMEOUT_S
+
+    def _step(self, t: float, items, speed: float) -> None:
+        st = self.state
+        el = t - self.t_state
+
+        if st == self.CRUISE:
+            self.lat_off = 0.0
+            self.v_hold = None
+            near = self.nearest_forward(items, 0.0)
+            if near is None or near["v"] >= LANE_MOVING_MS:
+                return                       # 前车在动 → 跟车，不算障碍
+            if near["dist"] > OVERTAKE_PREP_M:
+                return                       # 还远，先不提速也别刹车
+            # 左道要够空：正前方 PASS_CLEAR_M 内没车，且车身旁边也没有
+            if self.clearance(items, self.offset) < PASS_CLEAR_M:
+                return
+            if self.beside(items, self.offset) is not None:
+                return
+            self.last_block = near
+            self._enter(self.SHIFT_OUT, t, speed)
+            return
+
+        if st == self.SHIFT_OUT:
+            if (self.beside(items, self.offset) is not None
+                    or self.clearance(items, self.offset) < ABORT_GAP_M):
+                self._enter(self.SHIFT_BACK, t, speed)   # 目标道被占，原路退回
+                return
+            self.lat_off = self._cosine(t)
+            if self._shift_done(el):
+                self.lat_off = self.offset
+                self._enter(self.PASS, t, speed)
+            return
+
+        if st == self.PASS:
+            self.lat_off = self.offset
+            if (self.clearance(items, 0.0) >= RETURN_CLEAR_M
+                    and self.rear_gap(items, 0.0) >= RETURN_BEHIND_M):
+                self._enter(self.SHIFT_BACK, t, speed)
+            elif el >= PASS_MAX_S and self.clearance(items, 0.0) >= ABORT_GAP_M:
+                # 兜底：在左侧待太久会影响后面的转弯，本道够空就回去
+                self._enter(self.SHIFT_BACK, t, speed)
+            return
+
+        if st == self.SHIFT_BACK:
+            if (self.beside(items, 0.0) is not None
+                    or self.clearance(items, 0.0) < ABORT_GAP_M):
+                self._enter(self.SHIFT_OUT, t, speed)    # 本道又堵，回左侧
+                return
+            self.lat_off = self._cosine(t)
+            if self._shift_done(el):
+                self.lat_off = 0.0
+                self._enter(self.CRUISE, t, speed)
+
+    def update(self, t: float, items, dt: float, speed: float) -> dict:
+        prev = self.state
+        if self.enabled:
+            if self.state in (self.SHIFT_OUT, self.SHIFT_BACK):
+                self.shift_dist += max(float(speed), 0.0) * max(float(dt), 0.0)
+            self._step(t, items, speed)
         else:
-            self.lat_off += step if tgt > self.lat_off else -step
-
-        now_active = abs(self.target) > 1e-6
-        started = now_active and not self.active
-        finished = (not now_active) and self.active
-        self.active = now_active
-        self.side = 1.0 if self.target > 0 else (-1.0 if self.target < 0 else 0.0)
-        return {"lat_off": self.lat_off, "active": self.active, "started": started,
-                "finished": finished, "side": self.side, "target": self.target,
-                "blocked": self.blocked}
+            self.state = self.CRUISE
+            self.lat_off = 0.0
+            self.v_hold = None
+        return {
+            "lat_off": self.lat_off,
+            "state": self.NAMES[self.state],
+            "changed": self.state != prev,
+            "target": self.offset if self.state in (self.SHIFT_OUT, self.PASS) else 0.0,
+            "v_hold": self.v_hold,
+            "blocked": False,
+        }
 
 
 def main() -> int:
@@ -590,7 +672,7 @@ def main() -> int:
         "frame", "sim_t", "sub_scene", "elem_i", "phase", "x", "y", "yaw", "speed",
         "gear", "throttle", "brake", "steering", "v_tgt", "route_s", "lat_err",
         "blk_dist", "blk_type", "blk_id", "obs_n", "stuck", "lat_off",
-        "light", "stop_gap",
+        "light", "stop_gap", "ov_state",
     ])
     obs_fh = (out_dir / "obs.jsonl").open("w", encoding="utf-8")
     ev_fh = (out_dir / "events.jsonl").open("w", encoding="utf-8")
@@ -705,22 +787,18 @@ def main() -> int:
                       f"block={block}", flush=True)
 
             # ---- 选道 / 绕行 ----
-            ds = max(abs(speed) * dt, 0.0)
-            ov = overtaker.update(sim_t, block, obs_items, dt, ds)
+            ov = overtaker.update(sim_t, obs_items, dt, speed)
             lat_off = ov["lat_off"]
             if shift_route is not None:
                 pursuit.route = shift_route.apply(lat_off, i_now)
-            if ov["started"]:
-                emit("lane_shift", target=round(ov["target"], 2),
-                     s=round(float(track.s[i_now]), 1))
-                print(f"[{sim_t:6.1f}s] 换道 -> {ov['target']:+.1f} m  "
-                      f"v={speed:.2f}", flush=True)
-            if ov["finished"]:
-                emit("lane_shift_end", s=round(float(track.s[i_now]), 1))
-                print(f"[{sim_t:6.1f}s] 回到本车道", flush=True)
-            if ov["blocked"] and sim_t - last_break_log > 2.0:
-                last_break_log = sim_t
-                emit("all_lanes_blocked", lat_off=round(lat_off, 2), n=obs_n)
+            if ov["changed"]:
+                emit("overtake_" + ov["state"].lower(),
+                     s=round(float(track.s[i_now]), 1),
+                     lat_off=round(lat_off, 2), v=round(speed, 2),
+                     blk=(round(block["dist"], 1) if block else None))
+                print(f"[{sim_t:6.1f}s] 超车 {ov['state']:10s} "
+                      f"s={track.s[i_now]:7.1f} lat_off={lat_off:+.2f} v={speed:.2f}",
+                      flush=True)
 
             # 当前车道（含横移）正前方的最近障碍，才是跟车/刹停目标。
             # P2：横移还没走完时，按**目标车道**算带心，否则被超越的那辆车一直在
@@ -747,8 +825,14 @@ def main() -> int:
                         v_tgt = v_cap
             if ov["blocked"]:
                 v_tgt = 0.0
-            elif ov["active"]:
-                v_tgt = min(v_tgt, OVERTAKE_SPEED)
+            elif ov["state"] in ("SHIFT_OUT", "SHIFT_BACK"):
+                # 高速横移时速度保持不变：既不因被超的车减速，也不额外加速，
+                # 让横向 2.8 m/s^2 和纵向 1.5 m/s^2 不叠加。
+                # 低速（< SHIFT_HOLD_MIN_MS）不锁速：横向加速度按 v^2 缩，此时提速是安全的。
+                v_hold = ov["v_hold"]
+                if v_hold is not None:
+                    v_tgt = min(v_tgt, max(v_hold, speed))
+            # PASS 段不再压速度：按曲率剖面全速超越（--vmax 默认 8）
 
             # ---- 信号灯 / 停止线（移植 crossroad/main.py，那里实测十字路口 210 分）----
             stop_gap = None
@@ -827,6 +911,7 @@ def main() -> int:
                     obs_n, int(stuck_now), round(lat_off, 2),
                     "" if light is None else light.straight_state.name,
                     "" if stop_gap is None else round(stop_gap, 2),
+                    ov["state"],
                 ])
                 if frame % 60 == 0:
                     run_fh.flush()
@@ -855,6 +940,7 @@ def main() -> int:
                 round(lat_off, 2),
                 "" if light is None else light.straight_state.name,
                 "" if stop_gap is None else round(stop_gap, 2),
+                ov["state"],
             ])
             if frame % 30 == 0:
                 run_fh.flush()
