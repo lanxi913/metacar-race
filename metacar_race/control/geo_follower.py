@@ -40,6 +40,7 @@ STEER_FULL_SCALE = 0.6
 WHEELBASE_DEFAULT = 2.6
 MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
 CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
+PLATEAU_EXIT_MS = 6.5       # m/s，超过它说明已越过低速挡位平台，可以撤 boost
 
 
 def wrap180(a: float) -> float:
@@ -156,6 +157,7 @@ class GeoFollower:
         self._k_plant = 60.0        # 油门→速度 增益（在线估计）
         self._lim_thr = 0.0
         self._lim_brk = 0.0
+        self._v_prev = None            # 上一帧速度（加速度保护用）
         self._boost = 0.0               # 速度平台突破量（油门增量，自适应）
         self._v_hist = deque(maxlen=30)
         self._steer_lp = 0.0
@@ -248,6 +250,8 @@ class GeoFollower:
             v_req = rem / time_left
             if v_req > v_cmd:
                 v_cmd = min(V_RULE, v_req)
+            # 只跑到"够用"的 1.2 倍：既不超时也不触发高速挡位跳变（|a| 会爆）
+            v_cmd = min(v_cmd, max(v_req * 1.2, 5.0))
         # 前车净距保护：安全距离 = 车身长 4 m + 2 m 余量
         if obstacles and self.lane_w:
             gap = None
@@ -348,23 +352,30 @@ class GeoFollower:
                 self._k_plant = 0.98 * self._k_plant + 0.02 * k_obs
         kp = 1.5 / max(self._k_plant, 20.0)
         err = v_cmd - v
-        # 速度平台突破：油门给到却长时间不提速（变速箱/挡位平台），逐步加 boost
+        # 速度平台突破：只在**低速**（<5 m/s）且长时间不提速时用，避免高速冲过头
         self._v_hist.append(v)
         dv = (max(self._v_hist) - min(self._v_hist)) if len(self._v_hist) > 8 else 1.0
         if err > 0.4 and dv < 0.15:
-            self._boost = min(0.6, self._boost + 0.01)
-        elif err < 0.1:
-            self._boost = max(0.0, self._boost - 0.02)
+            self._boost = min(0.35, self._boost + 0.01)
+        elif v > PLATEAU_EXIT_MS or err < 0.5:
+            # 越过低速平台后立刻撤掉 boost，避免冲到限速
+            self._boost = max(0.0, self._boost - 0.20)
         if err >= 0:
             thr_t = min(1.0, v_cmd / max(self._k_plant, 20.0) + kp * err + self._boost)
             brk_t = 0.0
         else:
             thr_t = 0.0
             brk_t = min(1.0, (-err) / 1.2)
-        # 硬限速：超过规则限速就强制收油+轻刹（超速每题 −10，不能碰）
-        if v > V_RULE:
+        # 硬限速：接近规则限速就收油，超过就刹（超速每题 −10，不能碰）
+        if v > V_RULE * 0.97:
             thr_t = 0.0
-            brk_t = max(brk_t, 0.15)
+            self._boost = 0.0
+            brk_t = max(brk_t, 0.30 if v > V_RULE else 0.15)
+        # 加速度保护：|a|>4 时减油门（比赛要求 |a|≤5 才有 +10）
+        if self._v_prev is not None and dt > 0:
+            a_now = (v - self._v_prev) / dt
+            if a_now > 4.0:
+                thr_t = min(thr_t, max(0.0, self._lim_thr - 0.02))
         # 油门小斜率限幅（平滑）；刹车直通（该刹就刹）
         self._lim_thr += max(-0.02, min(0.02, thr_t - self._lim_thr))
         self._lim_thr = max(0.0, min(1.0, self._lim_thr))
@@ -388,6 +399,10 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
+
 
 
 
