@@ -30,7 +30,7 @@ from metacar import GearMode, VehicleControl
 
 WHEELBASE = 2.60
 MAX_STEER_RAD = 0.60
-STEER_CMD = 0.65            # 打舵量：0.75 太大（刮擦）、0.50 太小（横移不够），取 0.65
+STEER_CMD = 0.65            # 打舵量实测最优：0.50 → dx 1.37 / 0.70 → 188.95 / 0.65 → 192.99
 V_APPROACH = 2.60           # 对位段目标速度 m/s
 V_REVERSE = 0.55            # 倒车目标速度 m/s（撞车扣 5×v，慢一点更安全）
 LOOKAHEAD = 0.9             # 倒车纯跟踪前视距离 m（小一点才贴得住圆弧）
@@ -359,6 +359,8 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
 
 
 
