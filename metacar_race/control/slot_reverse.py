@@ -72,6 +72,7 @@ class SlotReverseParker:
         self.breaks: list[int] = [0, 0, 0]
         self.stuck = 0.0
         self.fine_t = 0.0
+        self.thr_lim = 0.0     # 油门斜率限制后的实际输出
 
     # ---------- 场景解析 ----------
     def _parse(self, obstacles, x: float) -> None:
@@ -143,6 +144,18 @@ class SlotReverseParker:
         self.breaks = [len1, len1 + len2, len(pts)]
         return pts
 
+    def _slew(self, thr_t: float) -> float:
+        """油门斜率限制：加得慢、收得快。
+
+        仿真的发动机对油门台阶有阶跃响应，直接给 0.20 会窜到 5+ m/s²，
+        平台连报「加速度高于允许上限」。用 0.0015/帧 的斜坡爬上去就平顺。
+        """
+        if thr_t < self.thr_lim:
+            self.thr_lim = thr_t
+        else:
+            self.thr_lim = min(thr_t, self.thr_lim + 0.0015)
+        return self.thr_lim
+
     # ---------- 主循环 ----------
     def update(self, pose, speed: float, obstacles, dt: float):
         x, y = float(pose.pos_x), float(pose.pos_y)
@@ -169,7 +182,7 @@ class SlotReverseParker:
             thr = 0.11 if speed < v_des else 0.05
             if self.slope_thr > 0:
                 thr += self.slope_thr
-            return (VehicleControl(gear=GearMode.DRIVE, throttle=min(0.5, thr)),
+            return (VehicleControl(gear=GearMode.DRIVE, throttle=self._slew(min(0.5, thr))),
                     SlotInfo("APPROACH", dx, dy, yaw_err, 0.0))
 
         if self.phase == "STOP":
@@ -241,7 +254,7 @@ class SlotReverseParker:
                     thr = 0.16
             else:
                 self.stuck = 0.0
-            return (VehicleControl(gear=gear, throttle=min(0.5, thr),
+            return (VehicleControl(gear=gear, throttle=self._slew(min(0.5, thr)),
                                    steering=steer),
                     SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
 
@@ -277,7 +290,7 @@ class SlotReverseParker:
                     thr = 0.22
             else:
                 self.stuck = 0.0
-            return (VehicleControl(gear=gear, throttle=thr, steering=steer),
+            return (VehicleControl(gear=gear, throttle=self._slew(thr), steering=steer),
                     SlotInfo("FINE", dx, dy, yaw_err, 1.0))
 
         # SETTLE / DONE
@@ -292,6 +305,7 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
 
 
 
