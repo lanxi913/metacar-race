@@ -172,6 +172,7 @@ def main() -> int:
     closest = None
     stage_ready = False
     stationary = 0.0
+    approach_t0 = 0.0
     hold = 0.0
     frame = 0
     sim_t = 0.0
@@ -208,6 +209,7 @@ def main() -> int:
                     api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
                     continue
                 phase = "approach"
+                approach_t0 = sim_t
                 if pursuit is not None:
                     pursuit.sync(x, y, max_jump_m=1.0)
                 print(f"进入 {sub}，开始沿路线接近车位", flush=True)
@@ -275,8 +277,9 @@ def main() -> int:
                     vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
                                         brake=brk, steering=steer)
                 else:
-                    if speed > 3.0:
-                        # 平台瞬移时会注入初速，先刹到 3 m/s 以下再接纯跟踪
+                    if speed > 3.0 and sim_t - approach_t0 < 2.5:
+                        # 平台瞬移时会注入初速（实测 8.2 m/s），前 2.5 s 先刹下去；
+                        # 之后交回闭环，否则 3 m/s 的门槛会和加速段形成来回打刹的极限环。
                         vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
                                             brake=0.15, steering=0.0)
                     else:
