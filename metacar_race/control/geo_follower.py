@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """几何循迹控制器（规则 / 车辆 / 场景数据驱动，输出平滑）
 
 设计目标（按用户反馈修正）：**不摇摆、不冲速**。
@@ -162,6 +162,7 @@ class GeoFollower:
         self._v_prev = None            # 上一帧速度（加速度保护用）
         self._a_lp = 0.0               # 实测加速度低通值（加速度闭环用）
         self._launch_v = None          # 起步时刻（用于"一动就滑行"）
+        self.stop_margin = 1.7         # 场景到达点比路径终点提前的米数（实测）
         self._boost = 0.0               # 速度平台突破量（油门增量，自适应）
         self._v_hist = deque(maxlen=30)
         self._steer_lp = 0.0
@@ -227,7 +228,10 @@ class GeoFollower:
         rem = self.path.total - s
         # 终点主动停稳：减速到 0（而不是留给仿真强制停车），这样收尾那一下不会判加速度超标
         # 终点：按 4 m/s² 减速到 0.3 m/s 再爬过线，避免仿真强制停车造成加速度超标
-        v_end = max(0.3, math.sqrt(max(2.0 * 4.0 * max(rem - 0.1, 0.0), 0.0)))
+        # 场景实际在"路径终点前 stop_margin 米"就判定到达（实测 1.7 m），
+        # 所以要把车减速到 0 停在那里，否则会被仿真强制停车判加速度超标
+        rem_stop = max((self.path.total - self.stop_margin) - s, 0.0)
+        v_end = math.sqrt(max(2.0 * 4.0 * rem_stop, 0.0))
         v_best = min(v_best, v_end)
         if self.v_meas_max > 0.5:
             v_best = min(v_best, self.v_meas_max * 1.02)
@@ -259,6 +263,9 @@ class GeoFollower:
             # 只跑到"够用"的 1.2 倍：既不超时也不触发高速挡位跳变（|a| 会爆）
             # 最后 10 m 不再给"赶时间"的速度下限，让终点减速曲线接管（爬过终点线）
             v_cmd = min(v_cmd, max(v_req * 1.15, 5.0) if rem > 10.0 else 0.3)
+        # 终点减速曲线必须是"最后一道闸"：时间压力不能把它顶掉，
+        # 否则车会以 4.8 m/s 冲线，被仿真强制停车判加速度超标
+        v_cmd = min(v_cmd, max(0.3, math.sqrt(max(8.0 * (rem - 0.1), 0.0))))
         # 前车净距保护：安全距离 = 车身长 4 m + 2 m 余量
         if obstacles and self.lane_w:
             gap = None
@@ -313,6 +320,8 @@ class GeoFollower:
             # 本车道被堵（<25 m）时允许**随时重新选道**，实现 0→1→0→1 的绕行；
             # 未被堵时才用滞回等 0.8 s 回原车道。
             re_pick = block is not None and block[0] < 25.0
+            # 必须在到达第一辆车（26 m）之前完成并线，所以一起步就得开始换道；
+            # 试过"先直行到 3 m/s 再并线"，会在 t=13.5 s 撞上第一辆车（实测 |a|=130）
             if (self.lane_state == 0 or re_pick) and block is not None and block[0] < 45.0:
                 # 候选车道：左 1、右 1、左 2、右 2；要求该车道在"当前车到障碍车 + 30 m"内无车
                 def lane_free(off):
@@ -334,7 +343,7 @@ class GeoFollower:
                         break
             # 横向偏移限速（用横向加速度上限反解），平滑切入切出
             # 换道横移速度：实测 2 m/s 会蹭到相邻车（170 分），0.5 m/s 稳妥（190 分）
-            max_rate = min(1.5, A_LAT_MAX / max(v, 1.0) * 0.5)
+            max_rate = min(1.2, A_LAT_MAX / max(v, 1.0) * 0.5)
             step = max_rate * dt
             if self.offset < self.offset_target:
                 self.offset = min(self.offset_target, self.offset + step)
@@ -396,11 +405,11 @@ class GeoFollower:
                 thr_t = 0.0
             elif self._a_lp < -A_LONG_MAX * 0.8:     # 减速过猛 → 松刹
                 brk_t = max(0.0, brk_t - 0.05)
-        # 团队在 110 分场景验证过的起步法：车一动（v>0.05）立刻松油门滑 1.5 s，
-        # 让车速自己慢慢爬上来，避开静止起步那一次冲击（加速度限制是全局的）
+        # 起步：车一动（v>0.05）立刻松油门滑 2.5 s，让车速自己慢慢爬
+        # （用户反馈"起步太猛"，滑行段加长；加速度限制是全局的）
         if self._launch_v is None and v > 0.05:
             self._launch_v = self.t
-        if self._launch_v is not None and self.t < self._launch_v + 1.5:
+        if self._launch_v is not None and self.t < self._launch_v + 2.5:
             thr_t = 0.0
         # 油门硬上限：台阶标定显示 0.18 仍是 4.78 m/s，0.22 起会跳挡/抖动，
         # 一旦跳挡车速 4.78→13+，平台判「加速度高于允许上限」丢 +10
@@ -431,6 +440,10 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
+
 
 
 
