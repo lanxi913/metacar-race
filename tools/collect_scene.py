@@ -68,7 +68,8 @@ from metacar_race.config import (  # noqa: E402
 from metacar_race.control.tracking import PurePursuit, SpeedController  # noqa: E402
 
 FRAME_FIELDS = [
-    "frame", "wall_t", "sim_t", "dt_sim", "sub_scene", "sub_idx", "sub_progress",
+    "frame", "wall_t", "sim_t", "dt_sim", "elem_t", "elem_limit", "elem_remain",
+    "sub_scene", "sub_idx", "sub_progress", "restart",
     "x", "y", "z", "yaw_deg", "vx", "vy", "vz", "speed", "speed_kmh",
     "accel", "accel_raw",
     "gear", "throttle", "brake", "steering",
@@ -365,6 +366,9 @@ def main() -> int:
     max_accel = 0.0
     lat_abs_sum = 0.0
     lat_abs_max = 0.0
+    sim_t = 0.0          # 全局仿真时钟（累加，不随元素重开归零）
+    elem_start = 0.0     # 当前元素开始的 sim_t
+    clean_since = 0.0    # 元素重开后到这一刻之前的帧不计入极值统计
 
     visited: list[dict] = []
     current_sub: str | None = None
@@ -386,25 +390,54 @@ def main() -> int:
             car = msg.main_vehicle
             pose = msg.pose_gnss
 
-            sim_t = float(status.used_time)
-            dt_sim = 0.0 if prev_sim is None else max(0.0, sim_t - prev_sim)
+            # scene_status.used_time 是「当前元素内已用时间」：元素切换、元素重开（超时没跑完
+            # 会被平台拉回起点重来）都会归零，所以它不能当全局时钟。
+            # sim_t 由逐帧增量累加；elem_t 才是 used_time 的原始值。
+            elem_t = float(status.used_time)
+            dropped = prev_sim is not None and elem_t < prev_sim - 1.0
+            if prev_sim is None:
+                dt_sim = 0.0
+            elif dropped:
+                dt_sim = elem_t               # 归零那一下，把新的 used_time 整段算进来
+            else:
+                dt_sim = max(0.0, elem_t - prev_sim)
+            sim_t += dt_sim
             dt_wall = max(0.0, now - prev_wall)
-            prev_sim, prev_wall = sim_t, now
+            prev_sim, prev_wall = elem_t, now
+            limit = float(status.time_limit)
             if frame_no == 1:
                 emit("first_frame", sim_t=round(sim_t, 3), sub_scene=status.sub_scene_name,
                      x=round(pose.pos_x, 3), y=round(pose.pos_y, 3),
                      yaw=round(pose.ori_z, 3), cameras=[frame.id for frame in camera_frames])
 
-            # ---- 元素切换 ----
+            # ---- 元素切换 / 元素重开 ----
+            step = 0.0
+            if last_xy is not None:
+                step = math.hypot(pose.pos_x - last_xy[0], pose.pos_y - last_xy[1])
+            restart = status.sub_scene_name == current_sub and (dropped or step > 20.0)
             if status.sub_scene_name != current_sub:
                 if visited:
                     visited[-1]["t1"] = round(sim_t, 2)
-                visited.append({"name": status.sub_scene_name, "t0": round(sim_t, 2), "t1": None})
+                visited.append({"name": status.sub_scene_name, "t0": round(sim_t, 2),
+                                "t1": None, "limit": round(limit, 1), "restarts": 0})
                 current_sub = status.sub_scene_name
+                elem_start = sim_t
                 sub_first_t.setdefault(current_sub, sim_t)
                 emit("sub_scene", name=current_sub, sim_t=round(sim_t, 3),
                      s=round(projector.project(pose.pos_x, pose.pos_y)["s"], 2),
-                     time_limit=round(float(status.time_limit), 2))
+                     time_limit=round(limit, 2))
+            elif restart:
+                if visited:
+                    visited[-1]["t1"] = round(sim_t, 2)
+                    visited[-1]["restarts"] = visited[-1].get("restarts", 0) + 1
+                visited.append({"name": current_sub, "t0": round(sim_t, 2), "t1": None,
+                                "limit": round(limit, 1), "restarts": 0})
+                elem_start = sim_t
+                clean_since = sim_t + 2.0
+                emit("restart", sub_scene=current_sub, sim_t=round(sim_t, 3),
+                     elem_t=round(elem_t, 2), limit=round(limit, 2),
+                     jump_m=round(step, 1),
+                     s=round(projector.project(pose.pos_x, pose.pos_y)["s"], 2))
 
             # ---- 里程与横向偏差 ----
             proj = projector.project(pose.pos_x, pose.pos_y)
@@ -414,15 +447,24 @@ def main() -> int:
 
             # ---- 加速度 ----
             speed = float(car.speed)
-            a_raw = (speed - prev_v) / dt_sim if dt_sim > 1e-4 else 0.0
-            a_raw = max(-20.0, min(20.0, a_raw))
-            accel_f += 0.25 * (a_raw - accel_f)
-            prev_v = speed
-            max_speed = max(max_speed, abs(speed))
-            max_accel = max(max_accel, abs(accel_f))
+            if restart:
+                # 平台把车拉回起点重开，速度是它塞进来的，不能当成我们的加减速
+                speed_ctl.reset(speed)
+                accel_f = 0.0
+                prev_v = speed
+                a_raw = 0.0
+            else:
+                a_raw = (speed - prev_v) / dt_sim if dt_sim > 1e-4 else 0.0
+                a_raw = max(-20.0, min(20.0, a_raw))
+                accel_f += 0.25 * (a_raw - accel_f)
+                prev_v = speed
+            if sim_t >= clean_since:
+                max_speed = max(max_speed, abs(speed))
+                max_accel = max(max_accel, abs(accel_f))
 
-            if last_xy is not None:
-                travelled += math.hypot(pose.pos_x - last_xy[0], pose.pos_y - last_xy[1])
+            # 位移跳变（元素重开、跳关）不计入里程
+            if last_xy is not None and step <= 20.0:
+                travelled += step
             last_xy = (pose.pos_x, pose.pos_y)
 
             # ---- 控制 ----
@@ -521,9 +563,13 @@ def main() -> int:
                 "wall_t": f3(now - t0, 2),
                 "sim_t": f3(sim_t, 3),
                 "dt_sim": f3(dt_sim, 4),
+                "elem_t": f3(elem_t, 3),
+                "elem_limit": f3(limit, 1),
+                "elem_remain": f3(max(0.0, limit - elem_t), 2),
                 "sub_scene": current_sub,
                 "sub_idx": sub_idx,
                 "sub_progress": f3(progress, 4) if progress >= 0 else "",
+                "restart": 1 if restart else 0,
                 "x": f3(pose.pos_x, 3), "y": f3(pose.pos_y, 3), "z": f3(pose.pos_z, 3),
                 "yaw_deg": f3(pose.ori_z, 2),
                 "vx": f3(pose.vel_x, 3), "vy": f3(pose.vel_y, 3), "vz": f3(pose.vel_z, 3),
@@ -564,7 +610,8 @@ def main() -> int:
                         f"v={speed:5.2f}({speed * 3.6:5.1f}) a={accel_f:+5.2f} "
                         f"s={proj['s']:6.1f}/{projector.total:6.1f} "
                         f"横={proj['lat']:+5.2f} 障碍={len(msg.obstacles)} "
-                        f"最近={nearest_dist:5.1f}m"
+                        f"最近={nearest_dist:5.1f}m "
+                        f"元素{elem_t:5.1f}/{limit:5.0f}s"
                         + (f" 进度={progress * 100:4.0f}%" if progress >= 0 else ""))
                 print(line, flush=True)
                 try:
@@ -587,7 +634,7 @@ def main() -> int:
         print(f"\n{stop_reason}", flush=True)
     finally:
         if visited and visited[-1]["t1"] is None:
-            visited[-1]["t1"] = round(float(prev_sim or 0.0), 2)
+            visited[-1]["t1"] = round(sim_t, 2)
         try:
             api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
         except Exception:  # noqa: BLE001
@@ -599,13 +646,14 @@ def main() -> int:
     summary = {
         "stop_reason": stop_reason,
         "frames": frame_no,
-        "sim_seconds": round(float(prev_sim or 0.0), 2),
+        "sim_seconds": round(sim_t, 2),
         "wall_seconds": round(time.time() - t0, 2),
         "travelled_m": round(travelled, 2),
         "max_speed_ms": round(max_speed, 3),
         "max_accel_ms2": round(max_accel, 3),
         "lat_abs_mean": round(lat_abs_sum / frame_no, 4) if frame_no else 0.0,
         "lat_abs_max": round(lat_abs_max, 3),
+        "restarts": sum(item.get("restarts", 0) for item in visited),
         "visited": visited,
         "skipped": sorted(skipped),
         "output": str(out_dir),
@@ -635,12 +683,15 @@ def main() -> int:
 
     print("\n" + "=" * 72, flush=True)
     print(f"采集结束：{stop_reason}", flush=True)
-    print(f"帧数 {frame_no}  仿真 {float(prev_sim or 0.0):.1f}s  "
-          f"墙钟 {time.time() - t0:.1f}s", flush=True)
+    print(f"帧数 {frame_no}  仿真 {sim_t:.1f}s  墙钟 {time.time() - t0:.1f}s", flush=True)
     print(f"里程 {travelled:.1f} m  最高速度 {max_speed:.2f} m/s  "
           f"最大 |a| {max_accel:.2f} m/s²", flush=True)
     print("元素：" + " -> ".join(
-        f"{item['name']}({item['t0']}~{item['t1']}s)" for item in visited), flush=True)
+        f"{item['name']}({item['t0']}~{item['t1']}s"
+        + (f",限{item.get('limit', 0):.0f}s" if item.get("limit") else "")
+        + (f",重开{item['restarts']}次" if item.get("restarts") else "")
+        + ")"
+        for item in visited), flush=True)
     print(f"数据在 {out_dir}", flush=True)
     print("=" * 72, flush=True)
     return 0
