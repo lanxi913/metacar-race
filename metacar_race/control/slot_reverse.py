@@ -89,9 +89,11 @@ class SlotReverseParker:
         if self.slot is not None:
             sx, sy, syaw = self.slot
             self.lane_x = x
+            # 必须先开过车位（y 更小侧），再倒车 +Y 进空档；
+            # 停在车位前方会变成"倒着开走"，方向就反了（实测 y 从 4.6 涨到 19）
             far = [c for c in cars if c[1] < sy]
             if far:
-                stage_y = far[0][1] + STAGE_MARGIN + STAGE_SHIFT
+                stage_y = far[0][1] + STAGE_MARGIN
             else:
                 stage_y = sy - 3.0
             self.stage = (x, stage_y)
@@ -330,6 +332,8 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
 
 
 
