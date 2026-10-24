@@ -67,6 +67,11 @@ OVERTAKE_BAND_M = 2.20      # 目标车道占用判定的横向半宽
 OVERTAKE_SPEED = 6.0        # 绕行时的目标速度上限
 OVERTAKE_RAMP_RATE = 0.25   # 每行驶 1 m 允许横移多少米（3.5 m 需跑 14 m）
 OVERTAKE_TIMEOUT_S = 30.0
+LANE_MAX_M = 60.0           # 车道净空的上限
+LANE_KEEP_M = 14.0          # 本车道前方还有这么远就不动
+LANE_ADV_M = 4.0            # 换道至少要多空出这么多
+LANE_DECIDE_S = 0.20        # 车道决策间隔
+LANE_MOVING_MS = 1.00       # 前车比这个快就是跟车，不换道绕
 
 STALL_SPEED_MS = 0.25       # "推不动"的速度阈值
 STALL_THROTTLE = 0.50       # 油门给到这个值还推不动就开始补油
@@ -147,14 +152,20 @@ class RouteTrack:
         return tx / n, ty / n
 
     def project(self, x: float, y: float, lo: int, hi: int) -> tuple[int, float]:
-        """在 [lo,hi) 里找最近点，返回 (idx, 横向距离)。"""
+        """在 [lo,hi) 里找最近点，返回 (idx, 横向偏移)。
+
+        偏移**带符号**：左正右负，与自车的 lat_err 同一套约定。
+        必须带符号，否则左右两条相邻车道分不开——踩过一次坑。
+        """
         best, bd = lo, float("inf")
         for i in range(lo, hi):
             px, py = self.pts[i]
             d = (px - x) ** 2 + (py - y) ** 2
             if d < bd:
                 bd, best = d, i
-        return best, math.sqrt(bd)
+        px, py = self.pts[best]
+        tx, ty = self.tangent(best)
+        return best, (x - px) * (-ty) + (y - py) * tx
 
 
 class ObstacleScan:
@@ -168,6 +179,7 @@ class ObstacleScan:
         items = 每个障碍的投影结果，供日志用
         """
         hi = min(track.n, i_now + int(horizon_m) + 30)
+        lo = max(0, i_now - 40)      # 往后看一点，后方障碍才会落到负距离
         s_now = track.s[i_now]
         items = []
         block = None
@@ -177,7 +189,7 @@ class ObstacleScan:
             except Exception:  # noqa: BLE001
                 otype = -1
             ox, oy = float(obs.pos_x), float(obs.pos_y)
-            j, lat = track.project(ox, oy, i_now, hi)
+            j, lat = track.project(ox, oy, lo, hi)
             dist = track.s[j] - s_now
             vmag = math.hypot(float(getattr(obs, "vel_x", 0.0) or 0.0),
                               float(getattr(obs, "vel_y", 0.0) or 0.0))
@@ -196,7 +208,7 @@ class ObstacleScan:
             items.append(item)
             if otype in IGNORE_TYPES:
                 continue
-            if dist < -1.0 or dist > horizon_m or lat > LANE_HALF_M:
+            if dist < -1.0 or dist > horizon_m or abs(lat) > LANE_HALF_M:
                 continue
             if block is None or dist < block["dist"]:
                 block = item
@@ -289,84 +301,97 @@ class ShiftRoute:
 
 
 class Overtaker:
-    """前方车道被静止车堵死时，平移到相邻车道绕过去，过了再回本车道。
+    """按"前方可用空间"选车道：本车道被占就并到更空的一侧，过了再回来。
 
-    只在"前车几乎不动（v<0.6）且在本车道走廊里"时触发；目标车道要空出
-    OVERTAKE_CLEAR_M 才敢并进去。横移按行驶距离限速（OVERTAKE_RAMP_RATE），
-    不会原地打方向。
+    每条候选车道（本车道 / 左 off / 右 off）各算一个前方净空，净空低于
+    LANE_KEEP_M 才换道，且要求目标车道至少多空出 LANE_ADV_M；三条都不行就
+    报 blocked 让上层刹停。横移按行驶距离限速（OVERTAKE_RAMP_RATE），不会
+    原地打方向。
+
+    为什么改成这样：早先的版本是"锁一辆车、触发一次、挑一侧并过去"，
+    在场景4 的错位停车场里并到右侧后 4 m 就顶上了第二辆车。这类路段是一排
+    错位停放的车，必须每 0.2 s 重新挑车道。
     """
 
     def __init__(self, offset: float = OVERTAKE_OFFSET_M, enabled: bool = True) -> None:
         self.offset = float(offset)
         self.enabled = enabled
-        self.active = False
-        self.side = -1.0          # -1 往右（lat 减小），+1 往左
         self.lat_off = 0.0
-        self.target_id = None
-        self.wait_t = 0.0
-        self.t_enter = 0.0
-        self.done: set[int] = set()
+        self.target = 0.0
+        self.active = False
+        self.blocked = False
+        self.side = 0.0
+        self.decide_t = 0.0
 
-    def _free(self, items, off: float) -> bool:
-        """目标车道在 0~OVERTAKE_CLEAR_M 内是否空着。"""
+    def clearance(self, items, off: float) -> float:
+        """这条车道前方最近的障碍有多远（LANE_MAX_M 封顶）。"""
+        best = LANE_MAX_M
         for o in items:
-            if o["type"] in IGNORE_TYPES:
+            if o["type"] in IGNORE_TYPES or o["dist"] < -3.0:
                 continue
-            if o["dist"] < -3.0 or o["dist"] > OVERTAKE_CLEAR_M:
+            if abs(o["lat"] - off) < OVERTAKE_BAND_M and o["dist"] < best:
+                best = o["dist"]
+        return best
+
+    def nearest(self, items, off: float):
+        """这条车道前方最近的障碍（dict）或 None。"""
+        best = None
+        for o in items:
+            if o["type"] in IGNORE_TYPES or o["dist"] < -1.0:
                 continue
-            if abs(o["lat"] - off) < OVERTAKE_BAND_M:
-                return False
-        return True
+            if abs(o["lat"] - off) > OVERTAKE_BAND_M:
+                continue
+            if best is None or o["dist"] < best["dist"]:
+                best = o
+        return best
+
+    def _pick(self, items, cur: float) -> tuple[float, bool]:
+        """返回 (目标横向偏移, 是否三条车道全堵)。"""
+        cur_clear = self.clearance(items, cur)
+        if cur_clear >= LANE_KEEP_M:
+            if abs(cur) > 1e-6 and self.clearance(items, 0.0) >= LANE_KEEP_M:
+                return 0.0, False        # 让出车道：回中间
+            return cur, False
+        # 前方那辆在动：这是跟车，不是绕障，老老实实跟在后面
+        near = self.nearest(items, cur)
+        if near is not None and near["v"] >= LANE_MOVING_MS:
+            return cur, False
+        best_off, best_clear = cur, cur_clear
+        for c in (self.offset, -self.offset, 0.0):
+            if abs(c - cur) < 1.0:
+                continue
+            cl = self.clearance(items, c)
+            # 只考虑"够空"的车道；同时在够空的车道里优先回中间（少动一次方向）
+            if cl < LANE_KEEP_M or cl < cur_clear + LANE_ADV_M:
+                continue
+            if best_off == cur or abs(c) < abs(best_off):
+                best_off, best_clear = c, cl
+        if best_off != cur:
+            return best_off, False
+        return cur, True
 
     def update(self, t: float, block, items, dt: float, ds: float) -> dict:
-        out = {"lat_off": self.lat_off, "active": self.active, "started": False,
-               "finished": False, "side": self.side, "target_id": self.target_id}
         step = max(ds, 0.02) * OVERTAKE_RAMP_RATE
+        self.decide_t += dt
+        # 上一段横移基本走完才重新决策，避免半路改主意
+        if self.enabled and self.decide_t >= LANE_DECIDE_S and abs(self.target - self.lat_off) < 0.30:
+            self.decide_t = 0.0
+            self.target, self.blocked = self._pick(items, self.target)
 
-        if self.active:
-            tgt = self.side * self.offset
-            if abs(tgt - self.lat_off) <= step:
-                self.lat_off = tgt
-            else:
-                self.lat_off += step if tgt > self.lat_off else -step
-            blk = None
-            for o in items:
-                if o["id"] == self.target_id:
-                    blk = o
-                    break
-            if blk is None or blk["dist"] < -2.5 or t - self.t_enter > OVERTAKE_TIMEOUT_S:
-                self.active = False
-                self.done.add(self.target_id)
-                out["finished"] = True
+        tgt = self.target
+        if abs(tgt - self.lat_off) <= step:
+            self.lat_off = tgt
         else:
-            if abs(self.lat_off) <= step:
-                self.lat_off = 0.0
-            else:
-                self.lat_off += -step if self.lat_off > 0 else step
-            blocked = (self.enabled and self.lat_off == 0.0 and block is not None
-                       and block["id"] not in self.done and block["v"] < 0.60
-                       and 4.0 < block["dist"] < OVERTAKE_TRIGGER_M)
-            self.wait_t = self.wait_t + dt if blocked else 0.0
-            if self.wait_t >= OVERTAKE_WAIT_S:
-                # 先试左侧（国内超车侧；本场景左侧是可并行的同向车道，边界为虚线），
-                # 左侧被占才退到右侧。
-                for side in (1.0, -1.0):
-                    if self._free(items, side * self.offset):
-                        self.active = True
-                        self.side = side
-                        self.target_id = block["id"]
-                        self.t_enter = t
-                        self.wait_t = 0.0
-                        out["started"] = True
-                        break
-                else:
-                    self.wait_t = 0.0
+            self.lat_off += step if tgt > self.lat_off else -step
 
-        out["lat_off"] = self.lat_off
-        out["active"] = self.active
-        out["side"] = self.side
-        out["target_id"] = self.target_id
-        return out
+        now_active = abs(self.target) > 1e-6
+        started = now_active and not self.active
+        finished = (not now_active) and self.active
+        self.active = now_active
+        self.side = 1.0 if self.target > 0 else (-1.0 if self.target < 0 else 0.0)
+        return {"lat_off": self.lat_off, "active": self.active, "started": started,
+                "finished": finished, "side": self.side, "target": self.target,
+                "blocked": self.blocked}
 
 
 def main() -> int:
@@ -516,24 +541,33 @@ def main() -> int:
                 print(f"[{sim_t:6.1f}s] 卡死 pos=({x:8.2f},{y:8.2f}) v={speed:.2f} "
                       f"block={block}", flush=True)
 
-            # ---- 绕行（超车）----
+            # ---- 选道 / 绕行 ----
             ds = max(abs(speed) * dt, 0.0)
             ov = overtaker.update(sim_t, block, obs_items, dt, ds)
             lat_off = ov["lat_off"]
             if shift_route is not None:
                 pursuit.route = shift_route.apply(lat_off, i_now)
             if ov["started"]:
-                emit("overtake_start", side=ov["side"], target_id=ov["target_id"],
+                emit("lane_shift", target=round(ov["target"], 2),
                      s=round(float(track.s[i_now]), 1))
-                print(f"[{sim_t:6.1f}s] 开始绕行 side={ov['side']:+.0f} "
-                      f"id={ov['target_id']} v={speed:.2f}", flush=True)
+                print(f"[{sim_t:6.1f}s] 换道 -> {ov['target']:+.1f} m  "
+                      f"v={speed:.2f}", flush=True)
             if ov["finished"]:
-                emit("overtake_end", s=round(float(track.s[i_now]), 1))
-                print(f"[{sim_t:6.1f}s] 绕行完成，回本车道", flush=True)
+                emit("lane_shift_end", s=round(float(track.s[i_now]), 1))
+                print(f"[{sim_t:6.1f}s] 回到本车道", flush=True)
+            if ov["blocked"] and sim_t - last_break_log > 2.0:
+                last_break_log = sim_t
+                emit("all_lanes_blocked", lat_off=round(lat_off, 2), n=obs_n)
 
-            blk_ctrl = block
-            if ov["active"] and block is not None and block["id"] == ov["target_id"]:
-                blk_ctrl = None   # 正在绕的车不再当跟车目标
+            # 当前车道（含横移）正前方的最近障碍，才是跟车/刹停目标
+            blk_ctrl = None
+            for o in obs_items:
+                if o["type"] in IGNORE_TYPES or o["dist"] < -1.0:
+                    continue
+                if abs(o["lat"] - lat_off) > OVERTAKE_BAND_M:
+                    continue
+                if blk_ctrl is None or o["dist"] < blk_ctrl["dist"]:
+                    blk_ctrl = o
 
             # ---- 速度指令 ----
             v_tgt = profile.target(i_now, speed) if profile is not None else args.vmax
@@ -543,7 +577,9 @@ def main() -> int:
                     v_cap = max(0.0, FOLLOW_DECEL * (d_eff - 1.5))
                     if v_cap < v_tgt:
                         v_tgt = v_cap
-            if ov["active"]:
+            if ov["blocked"]:
+                v_tgt = 0.0
+            elif ov["active"]:
                 v_tgt = min(v_tgt, OVERTAKE_SPEED)
 
             steer = pursuit.steering(x, y, yaw) if pursuit is not None else 0.0
@@ -568,9 +604,9 @@ def main() -> int:
                     frame, round(sim_t, 3), sub, elem_i, "hold", round(x, 3), round(y, 3),
                     round(yaw, 2), round(speed, 3), car.gear.name, 0.0, 1.0, 0.0,
                     round(v_tgt, 2), round(track.s[i_now], 1), 0.0,
-                    "" if block is None else round(block["dist"], 2),
-                    "" if block is None else block["type"],
-                    "" if block is None else block["id"], obs_n, int(stuck_now),
+                    "" if blk_ctrl is None else round(blk_ctrl["dist"], 2),
+                    "" if blk_ctrl is None else blk_ctrl["type"],
+                    "" if blk_ctrl is None else blk_ctrl["id"], obs_n, int(stuck_now),
                     round(lat_off, 2),
                 ])
                 if frame % 60 == 0:
@@ -594,9 +630,9 @@ def main() -> int:
                 round(yaw, 2), round(speed, 3), car.gear.name,
                 round(thr, 3), round(brk, 2), round(steer, 3), round(v_tgt, 2),
                 round(track.s[i_now], 1), round(lat_err, 3),
-                "" if block is None else round(block["dist"], 2),
-                "" if block is None else block["type"],
-                "" if block is None else block["id"], obs_n, int(stuck_now),
+                "" if blk_ctrl is None else round(blk_ctrl["dist"], 2),
+                "" if blk_ctrl is None else blk_ctrl["type"],
+                "" if blk_ctrl is None else blk_ctrl["id"], obs_n, int(stuck_now),
                 round(lat_off, 2),
             ])
             if frame % 30 == 0:
