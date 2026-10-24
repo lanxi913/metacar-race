@@ -307,6 +307,7 @@ class GeoFollower:
                         self.offset_target = cand
                         break
             # 横向偏移限速（用横向加速度上限反解），平滑切入切出
+            # 换道横移速度：实测 2 m/s 会蹭到相邻车（170 分），0.5 m/s 稳妥（190 分）
             max_rate = min(1.5, A_LAT_MAX / max(v, 1.0) * 0.5)
             step = max_rate * dt
             if self.offset < self.offset_target:
@@ -381,6 +382,8 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
 
 
 
