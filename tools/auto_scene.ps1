@@ -211,6 +211,21 @@ if (-not $target) {
 $ok = Invoke-El $target
 Write-Host "scene launch: $ok"
 
+# The client sometimes swallows the first click (still busy closing the previous
+# scene): SmartCar never spawns and the python script sits in connect() forever.
+# Poll for the scene process and re-click a few times before giving up.
+if ($proc) {
+    for ($i = 1; $i -le 3; $i++) {
+        Start-Sleep -Seconds 5
+        if (Get-Process -Name SmartCar -ErrorAction SilentlyContinue) {
+            Write-Host "scene process is up"
+            break
+        }
+        Write-Host "scene process missing, re-clicking start ($i)"
+        Invoke-El $target | Out-Null
+    }
+}
+
 if ($proc) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while (-not $proc.HasExited -and $sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {

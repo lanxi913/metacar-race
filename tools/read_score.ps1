@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Url = "https://www.i-mylab.com/icv/history.html?id=93C092E5A4A9E8B9AFE8B5B0E58F917465",
     [int]$Wait = 9,
     [int]$MaxLines = 120
@@ -44,14 +44,14 @@ function Get-Text([System.Windows.Automation.AutomationElement]$root) {
 Start-Process "msedge.exe" -ArgumentList "--new-window", $Url | Out-Null
 Start-Sleep -Seconds $Wait
 
-# 顶层窗口里挑标题含 "元动力训练营" 的那个（Edge 多窗口时 MainWindowHandle 不一定是它）
+# 椤跺眰绐楀彛閲屾寫鏍囬鍚?"鍏冨姩鍔涜缁冭惀" 鐨勯偅涓紙Edge 澶氱獥鍙ｆ椂 MainWindowHandle 涓嶄竴瀹氭槸瀹冿級
 $h = [IntPtr]::Zero
 $best = $null
 $top = $AE::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
 foreach ($w in $top) {
     $nm = ''
     try { $nm = $w.Current.Name } catch { }
-    if ($nm -and $nm -match [char]0x5143 -and $nm -match [char]0x8BAD) { $best = $w; break }
+    if ($nm -and $nm -match [char]0x8BAD -and $nm -match [char]0x8425) { $best = $w; break }
 }
 if (-not $best) {
     $proc = Get-Process msedge -ErrorAction SilentlyContinue |
@@ -96,3 +96,4 @@ foreach ($t in $texts) {
     $i++
 }
 Write-Output ("TOTAL=" + $texts.Count)
+
