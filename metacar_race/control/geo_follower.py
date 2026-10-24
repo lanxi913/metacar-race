@@ -41,7 +41,7 @@ WHEELBASE_DEFAULT = 2.6
 MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
 CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
 PLATEAU_EXIT_MS = 6.5       # m/s，超过它说明已越过低速挡位平台，可以撤 boost
-BRAKE_MAX = 0.02            # 刹车指令上限（0.12→13 m/s²，0.05→~8，0.02≈4~5 m/s²）
+BRAKE_MAX = 0.08            # 刹车指令上限：仿真刹车 <0.05 有死区（几乎不减速），0.08≈4 m/s²
 THR_CAP = 0.105             # 油门硬上限：0.11 以上仿真会出现非线性弹跳（实测 14 m/s²）
 
 
@@ -161,6 +161,7 @@ class GeoFollower:
         self._lim_brk = 0.0
         self._v_prev = None            # 上一帧速度（加速度保护用）
         self._a_lp = 0.0               # 实测加速度低通值（加速度闭环用）
+        self._launch_v = None          # 起步时刻（用于"一动就滑行"）
         self._boost = 0.0               # 速度平台突破量（油门增量，自适应）
         self._v_hist = deque(maxlen=30)
         self._steer_lp = 0.0
@@ -225,7 +226,8 @@ class GeoFollower:
             ds += step
         rem = self.path.total - s
         # 终点主动停稳：减速到 0（而不是留给仿真强制停车），这样收尾那一下不会判加速度超标
-        v_end = math.sqrt(max(2.0 * 2.0 * max(rem - 0.2, 0.0), 0.0))
+        # 终点：按 4 m/s² 减速到 0.3 m/s 再爬过线，避免仿真强制停车造成加速度超标
+        v_end = max(0.3, math.sqrt(max(2.0 * 4.0 * max(rem - 0.1, 0.0), 0.0)))
         v_best = min(v_best, v_end)
         if self.v_meas_max > 0.5:
             v_best = min(v_best, self.v_meas_max * 1.02)
@@ -255,7 +257,8 @@ class GeoFollower:
             if v_req > v_cmd:
                 v_cmd = min(V_RULE, v_req)
             # 只跑到"够用"的 1.2 倍：既不超时也不触发高速挡位跳变（|a| 会爆）
-            v_cmd = min(v_cmd, max(v_req * 1.15, 5.0))
+            # 最后 10 m 不再给"赶时间"的速度下限，让终点减速曲线接管（爬过终点线）
+            v_cmd = min(v_cmd, max(v_req * 1.15, 5.0) if rem > 10.0 else 0.3)
         # 前车净距保护：安全距离 = 车身长 4 m + 2 m 余量
         if obstacles and self.lane_w:
             gap = None
@@ -393,9 +396,12 @@ class GeoFollower:
                 thr_t = 0.0
             elif self._a_lp < -A_LONG_MAX * 0.8:     # 减速过猛 → 松刹
                 brk_t = max(0.0, brk_t - 0.05)
-        # 起步 1.2 s 内油门只到 0.03：仿真从静止起步有一次性冲击，必须极轻给油
-        if self.t < 1.2:
-            thr_t = min(thr_t, 0.03 * (self.t / 1.2))
+        # 团队在 110 分场景验证过的起步法：车一动（v>0.05）立刻松油门滑 1.5 s，
+        # 让车速自己慢慢爬上来，避开静止起步那一次冲击（加速度限制是全局的）
+        if self._launch_v is None and v > 0.05:
+            self._launch_v = self.t
+        if self._launch_v is not None and self.t < self._launch_v + 1.5:
+            thr_t = 0.0
         # 油门硬上限：台阶标定显示 0.18 仍是 4.78 m/s，0.22 起会跳挡/抖动，
         # 一旦跳挡车速 4.78→13+，平台判「加速度高于允许上限」丢 +10
         thr_t = min(thr_t, THR_CAP)
@@ -423,6 +429,10 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
+
 
 
 
