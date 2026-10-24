@@ -39,6 +39,26 @@ class PurePursuit:
     def reset(self):
         self.idx = 0
 
+    def sync(self, x: float, y: float, max_jump_m: float = 8.0) -> None:
+        """把索引对齐到车辆附近（跳关/重开后车辆被瞬移时必须调）。
+
+        只在当前索引点离车超过 max_jump_m 时才全局重搜，避免在相邻平行车道上跳错分支。
+        """
+        n = len(self.route)
+        if n == 0:
+            return
+        i = min(self.idx, n - 1)
+        p = self.route[i]
+        if math.hypot(p.x - x, p.y - y) <= max_jump_m:
+            return
+        best_i, best_d = 0, float("inf")
+        for k in range(n):
+            q = self.route[k]
+            d = math.hypot(q.x - x, q.y - y)
+            if d < best_d:
+                best_i, best_d = k, d
+        self.idx = best_i
+
     def _nearest(self, x: float, y: float):
         """在 [idx, idx+40] 窗口里找最近点，索引只许往前，不许回退。"""
         n = len(self.route)

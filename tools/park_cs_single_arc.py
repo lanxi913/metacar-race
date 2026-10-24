@@ -141,8 +141,12 @@ def main() -> int:
     print(f"已连接。元素 {len(static.sub_scenes)} 个，赛道 {len(static.route)} 点", flush=True)
 
     target = ""
+    elem_start = None
     if 1 <= args.skip_to_index <= len(static.sub_scenes):
-        target = static.sub_scenes[args.skip_to_index - 1].name
+        _elem = static.sub_scenes[args.skip_to_index - 1]
+        target = _elem.name
+        if _elem.start_point is not None:
+            elem_start = (float(_elem.start_point.x), float(_elem.start_point.y))
         print(f"目标元素：{target}（其余自动跳关）", flush=True)
 
     pursuit = PurePursuit(static.route, lookahead=LOOKAHEAD_M) if len(static.route) >= 2 else None
@@ -195,7 +199,17 @@ def main() -> int:
                 api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
                 continue
             if phase == "skip":
+                # 元素名会先于位姿跳变（车还在上一个元素终点），必须等车真的落位再开始跑，
+                # 否则会带着上一段注入的 8 m/s 初速、按旧位置的路线索引乱打方向。
+                arrived = elem_start is None
+                if elem_start is not None:
+                    arrived = math.hypot(elem_start[0] - x, elem_start[1] - y) <= 20.0
+                if not arrived:
+                    api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+                    continue
                 phase = "approach"
+                if pursuit is not None:
+                    pursuit.sync(x, y, max_jump_m=1.0)
                 print(f"进入 {sub}，开始沿路线接近车位", flush=True)
 
             slot_now = find_slot(msg.obstacles)
@@ -220,6 +234,9 @@ def main() -> int:
                 i_near = min(range(len(static.route)),
                              key=lambda k: (static.route[k].x - x) ** 2
                              + (static.route[k].y - y) ** 2)
+                # 跳关会把车瞬移到元素起点，纯跟踪的内部索引还停在路线开头，
+                # 不移位就会朝 700 m 外的起点打满方向（把车甩出赛道）。
+                pursuit.sync(x, y)
                 j_near = min(len(static.route) - 1, i_near + 3)
                 tx = static.route[j_near].x - static.route[i_near].x
                 ty = static.route[j_near].y - static.route[i_near].y
@@ -258,14 +275,19 @@ def main() -> int:
                     vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
                                         brake=brk, steering=steer)
                 else:
-                    steer = pursuit.steering(x, y, yaw) if pursuit is not None else 0.0
-                    v_tgt = args.vmax
-                    if profile is not None and pursuit is not None:
-                        v_tgt = profile.target(i_near, speed)
-                    speed_ctl.v_target = v_tgt
-                    thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
-                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
-                                        brake=brk, steering=steer)
+                    if speed > 3.0:
+                        # 平台瞬移时会注入初速，先刹到 3 m/s 以下再接纯跟踪
+                        vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
+                                            brake=0.15, steering=0.0)
+                    else:
+                        steer = pursuit.steering(x, y, yaw) if pursuit is not None else 0.0
+                        v_tgt = args.vmax
+                        if profile is not None and pursuit is not None:
+                            v_tgt = profile.target(i_near, speed)
+                        speed_ctl.v_target = v_tgt
+                        thr, brk = speed_ctl.update(speed, dt, v_ceiling=args.vmax)
+                        vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr,
+                                            brake=brk, steering=steer)
 
             elif phase == "reverse":
                 if (met["dist"] <= CENTER_TOL_M and abs(heading_error) <= HEADING_TOL_DEG
