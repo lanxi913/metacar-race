@@ -75,6 +75,7 @@ class SlotReverseParker:
         self.thr_lim = 0.0     # 油门斜率限制后的实际输出
         self.fine_sub = "Y"    # FINE 子阶段：Y=先修纵向，YAW=再修航向
         self.cycles = 0        # 已重规划的 S 弯次数
+        self.rev_thr = 0.0     # 倒车油门基准（只升不降）
 
     # ---------- 场景解析 ----------
     def _parse(self, obstacles, x: float) -> None:
@@ -186,6 +187,7 @@ class SlotReverseParker:
             thr = 0.11 if speed < v_des else 0.05
             if self.slope_thr > 0:
                 thr += self.slope_thr
+            # 接近段也必须走斜率限制：直接给 0.19 会让起步加速度到 10 m/s²
             return (VehicleControl(gear=GearMode.DRIVE, throttle=self._slew(min(0.5, thr))),
                     SlotInfo("APPROACH", dx, dy, yaw_err, 0.0))
 
@@ -257,12 +259,17 @@ class SlotReverseParker:
             ahead = (sx - x) * fx + (sy - y) * fy
             gear = GearMode.DRIVE if (best_i >= b2 and ahead > 0.10) else GearMode.REVERSE
             # 油门必须 ≥0.18 才推得动（实测 0.10~0.16 在坡上会卡住），用 PWM 控速
-            # 坡上不能"给一下停一下"（会卡在静摩擦），油门常开、用刹车限速
-            thr = 0.20
-            if abs(speed) > v_target + 0.08:
-                return (VehicleControl(gear=gear, throttle=self._slew(thr), brake=0.15,
-                                       steering=steer),
+            # 油门/刹车必须带死区：否则两者每帧互相打架，实测 ±18 m/s² 抖动
+            # 倒车油门"只升不降"地爬到 0.20 并保持（坡上低于 0.18 推不动），
+            # 速度只用刹车调，避免油门被刹车打断后又要几秒才能重建
+            self.rev_thr = min(0.20, self.rev_thr + 0.002)
+            thr = self.rev_thr
+            if abs(speed) > v_target + 0.12:
+                return (VehicleControl(gear=gear, throttle=thr, brake=0.18, steering=steer),
                         SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
+            return (VehicleControl(gear=gear, throttle=thr, steering=steer),
+                    SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
+            thr = 0.0
             # 最后 2 m 超速就主动刹（坡上下滑会让车越溜越快）
             if dist < 2.0 and abs(speed) > v_target + 0.15:
                 return (VehicleControl(gear=gear, brake=0.20, steering=steer),
@@ -351,6 +358,9 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
+
 
 
 
