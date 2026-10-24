@@ -27,6 +27,24 @@ logs/ring_turn_20261023-220810.json
 tools/probe_ring_turn.py
 ```
 
+### 跨机器复现：连续 3 次 110.00（2026-10-24）
+
+在另一台机器（Windows 11 / Python 3.12.4 venv）直接运行 `tools/ring_turn_run.py`，
+未改任何代码，连续三次满分：
+
+| # | 平台记录 | 用时 | 终点剩余 | 得分 |
+|---|---|---|---|---|
+| 1 | 12:56:04 → 12:57:38 | 93.6 s | 1.23 m | **110.00** |
+| 2 | 12:58 → 12:59 | 93.6 s | 1.26 m | **110.00** |
+| 3 | 13:00:14 → 13:01:48 | 93.7 s | 1.18 m | **110.00** |
+
+三局最大速度约 6.9 m/s、横向偏差 ≤ 0.62 m、终点前约 1.2 m 交给平台判定，
+与前一次记录的特征一致。日志：`logs/ring_turn_20261024-*.csv/json`。
+
+> 该机器原先未安装 `huanxingzhuanwan` 场景包，执行
+> `.venv\Scripts\python.exe -u tools\download_scenes.py --only huanxingzhuanwan`
+> 下载 v4（163 MB）后即可运行，不需要改代码。
+
 ## 2. 场景观测
 
 探针从运行时静态数据读取，不使用训练场景固定坐标：
@@ -64,8 +82,8 @@ tools/probe_ring_turn.py
 ## 5. 复现
 
 ```powershell
-Set-Location D:\metacar-race-ring-turn
-D:\metacar-race\.venv\Scripts\python.exe -u tools\ring_turn_run.py
+Set-Location <仓库目录>
+.venv\Scripts\python.exe -u tools\ring_turn_run.py
 ```
 
 先运行脚本，看到“等待场景连接...”后，再在客户端启动“环形转弯”。
