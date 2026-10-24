@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """斜列/平行车位的「解析 S 弯 + 倒车纯跟踪」，带坡度适配。
 
 为什么需要它
@@ -34,6 +34,8 @@ V_APPROACH = 2.60           # 对位段目标速度 m/s
 V_REVERSE = 0.75            # 倒车目标速度 m/s
 LOOKAHEAD = 0.9             # 倒车纯跟踪前视距离 m（小一点才贴得住圆弧）
 STAGE_MARGIN = 0.60         # staging 相对远端车中心往外的余量
+STAGE_SHIFT = -1.67        # 实测两段弧会多走 2.27 m，把 staging 前移同样的量抵消
+CT_GAIN = 0.35              # 横向误差反馈增益（1/m 量纲）
 
 
 def wrap180(a: float) -> float:
@@ -66,6 +68,8 @@ class SlotReverseParker:
         self.idx = 0
         self.hold = 0.0
         self.lane_x: float | None = None
+        self.breaks: list[int] = [0, 0, 0]
+        self.stuck = 0.0
 
     # ---------- 场景解析 ----------
     def _parse(self, obstacles, x: float) -> None:
@@ -83,7 +87,7 @@ class SlotReverseParker:
             self.lane_x = x
             far = [c for c in cars if c[1] < sy]
             if far:
-                stage_y = far[0][1] + STAGE_MARGIN
+                stage_y = far[0][1] + STAGE_MARGIN + STAGE_SHIFT
             else:
                 stage_y = sy - 3.0
             self.stage = (x, stage_y)
@@ -105,12 +109,14 @@ class SlotReverseParker:
         v = -V_REVERSE
         yaw_end1 = yaw0 - theta
         nav = 0.0
+        len1 = 0
         while (yaw - yaw_end1) > 0.05 and nav < 200.0:
             yaw += math.degrees(v * math.tan(delta) / self.L * (step / abs(v)))
             x += v * math.cos(math.radians(yaw)) * (step / abs(v))
             y += -v * math.sin(math.radians(yaw)) * (step / abs(v))
             pts.append((x, y))
             nav += step
+        len1 = len(pts)
         nav = 0.0
         while (yaw0 - yaw) > 0.05 and nav < 200.0:
             yaw += math.degrees(v * math.tan(-delta) / self.L * (step / abs(v)))
@@ -118,6 +124,7 @@ class SlotReverseParker:
             y += -v * math.sin(math.radians(yaw)) * (step / abs(v))
             pts.append((x, y))
             nav += step
+        len2 = len(pts) - len1
         syaw_rad = math.radians(syaw)
         fx, fy = math.cos(syaw_rad), -math.sin(syaw_rad)
         nav = 0.0
@@ -130,6 +137,8 @@ class SlotReverseParker:
             y += sgn * fy * step
             pts.append((x, y))
             nav += step
+        # 记录换段位置（按点序号），倒车时用"走到哪一段"决定曲率前馈
+        self.breaks = [len1, len1 + len2, len(pts)]
         return pts
 
     # ---------- 主循环 ----------
@@ -181,15 +190,22 @@ class SlotReverseParker:
                 if d < best_d:
                     best_d, best_i = d, i
             self.idx = best_i
-            j = min(len(self.path) - 1, best_i + int(LOOKAHEAD / 0.05))
-            tx, ty = self.path[j]
-            head = math.radians(yaw)
-            bx, by = -math.cos(head), math.sin(head)     # 倒车方向
-            vx, vy = tx - x, ty - y
-            alpha = math.atan2(bx * vy - by * vx, bx * vx + by * vy)
-            delta = math.atan2(2.0 * self.L * math.sin(alpha), LOOKAHEAD)
-            # 舵角限制在 0.75（满舵会顶静摩擦，且会让倒车弧转得比规划多）
-            steer = max(-STEER_CMD, min(STEER_CMD, delta / MAX_STEER_RAD))
+            # ---- 曲率前馈 + 横向反馈（比纯跟踪稳：纯跟踪在等曲率圆弧上没有修正余量）----
+            b1, b2, bn = self.breaks
+            if best_i < b1:
+                ff = +STEER_CMD          # 第一段圆弧（倒车、yaw 减小、车尾往 -x 走）
+            elif best_i < b2:
+                ff = -STEER_CMD          # 反向圆弧回正
+            else:
+                ff = 0.0                 # 沿车位轴线直线倒入
+            i0 = min(best_i, len(self.path) - 2)
+            px, py = self.path[i0]
+            qx, qy = self.path[i0 + 1]
+            tx, ty = qx - px, qy - py
+            tn = math.hypot(tx, ty) or 1.0
+            nx, ny = -ty / tn, tx / tn                     # 路径左法向
+            e_ct = (x - px) * nx + (y - py) * ny           # 横向误差（正 = 在路径左侧）
+            steer = max(-1.0, min(1.0, ff + CT_GAIN * e_ct))
             # 必须位置和航向都到位才算入位（只判位置会斜着停进去）
             if best_i >= len(self.path) - 2 and abs(dx) < 0.35 and abs(dy) < 0.35 and yaw_err < 8.0:
                 self.phase = "SETTLE"
@@ -197,10 +213,23 @@ class SlotReverseParker:
             elif abs(speed) > V_REVERSE + 0.30:
                 return (VehicleControl(gear=GearMode.REVERSE, brake=0.15, steering=steer),
                         SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
+            # 最后一段沿车位轴线：车位中心在"车头方向"就用前进，否则倒车
+            syaw_rad = math.radians(syaw)
+            fx, fy = math.cos(syaw_rad), -math.sin(syaw_rad)
+            ahead = (sx - x) * fx + (sy - y) * fy
+            gear = GearMode.DRIVE if (best_i >= b2 and ahead > 0.10) else GearMode.REVERSE
             thr = 0.10 if abs(speed) < V_REVERSE else 0.0
-            if self.slope_thr > 0:
+            if self.slope_thr > 0 and gear is GearMode.REVERSE:
                 thr += self.slope_thr
-            return (VehicleControl(gear=GearMode.REVERSE, throttle=min(0.5, thr),
+            # 坡上静止起步要更大油门，否则卡在静摩擦里（实测 v 一直为 0）
+            # 注意：仿真里油门 0.30 反而会让车停住，0.12~0.18 才动
+            if abs(speed) < 0.06:
+                self.stuck += dt
+                if self.stuck > 0.8:
+                    thr = 0.16
+            else:
+                self.stuck = 0.0
+            return (VehicleControl(gear=gear, throttle=min(0.5, thr),
                                    steering=steer),
                     SlotInfo("REVERSE", dx, dy, yaw_err, best_i / max(1, len(self.path))))
 
@@ -216,6 +245,12 @@ class SlotReverseParker:
 
     def done(self) -> bool:
         return self.phase == "DONE"
+
+
+
+
+
+
 
 
 
