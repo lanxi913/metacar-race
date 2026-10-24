@@ -41,7 +41,8 @@ WHEELBASE_DEFAULT = 2.6
 MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
 CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
 PLATEAU_EXIT_MS = 6.5       # m/s，超过它说明已越过低速挡位平台，可以撤 boost
-BRAKE_MAX = 0.05            # 刹车指令上限（实测 0.12 也有 ~13 m/s²，压到 0.05）
+BRAKE_MAX = 0.02            # 刹车指令上限（0.12→13 m/s²，0.05→~8，0.02≈4~5 m/s²）
+THR_CAP = 0.12              # 油门硬上限：台阶标定 0.18 仍是 4.78 m/s，0.22 起跳挡/抖动
 
 
 def wrap180(a: float) -> float:
@@ -222,7 +223,8 @@ class GeoFollower:
             v_best = min(v_best, v_allow)
             ds += step
         rem = self.path.total - s
-        v_end = math.sqrt(max(2.0 * A_LONG_MAX * max(rem - 0.3, 0.0), 0.0))
+        # 终点别把速度降到 0：留 1.2 m/s 缓慢通过终点线，仿真收尾停车才不会被判加速度超标
+        v_end = max(1.2, math.sqrt(max(2.0 * 2.0 * max(rem - 0.3, 0.0), 0.0)))
         v_best = min(v_best, v_end)
         if self.v_meas_max > 0.5:
             v_best = min(v_best, self.v_meas_max * 1.02)
@@ -387,6 +389,9 @@ class GeoFollower:
         # 起步 1 s 内油门从 0 平滑爬升：抑制仿真第一帧的速度跳变（|a| 尖峰）
         if self.t < 0.5:
             thr_t = min(thr_t, 0.002 + 0.02 * self.t)   # 轻起步 0.5 s 内到 0.012
+        # 油门硬上限：台阶标定显示 0.18 仍是 4.78 m/s，0.22 起会跳挡/抖动，
+        # 一旦跳挡车速 4.78→13+，平台判「加速度高于允许上限」丢 +10
+        thr_t = min(thr_t, THR_CAP)
         # 油门小斜率限幅（平滑）；刹车直通（该刹就刹）
         self._lim_thr += max(-0.02, min(0.02, thr_t - self._lim_thr))
         self._lim_thr = max(0.0, min(1.0, self._lim_thr))
@@ -397,7 +402,8 @@ class GeoFollower:
         if thr > 0.05 and abs(v) < 0.10:
             self._stall += dt
             if self._stall > 0.6:
-                thr = 1.0
+                # 破静摩擦的补油必须温和：直接给 1.0 会触发挡位跳变（加速度超标）
+                thr = min(0.18, THR_CAP + 0.06)
         else:
             self._stall = 0.0
         if v_cmd <= 0.05 and abs(v) < 0.05:
@@ -410,6 +416,10 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
+
+
 
 
 

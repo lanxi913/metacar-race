@@ -82,7 +82,8 @@ def main() -> int:
     finally:
         fh.close()
         try:
-            api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+            # 收尾不要一脚刹死：急停会让平台判「加速度高于允许上限」
+            api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=0.10))
         except Exception:  # noqa: BLE001
             pass
     return 0
@@ -90,5 +91,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
