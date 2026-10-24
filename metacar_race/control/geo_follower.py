@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """几何循迹控制器（规则 / 车辆 / 场景数据驱动，输出平滑）
 
 设计目标（按用户反馈修正）：**不摇摆、不冲速**。
@@ -41,6 +41,7 @@ WHEELBASE_DEFAULT = 2.6
 MIN_TURN_RADIUS_DEFAULT = WHEELBASE_DEFAULT / math.tan(STEER_FULL_SCALE)
 CAR_HALF_WIDTH = 0.9        # m，乘用车半宽（用于走廊判定）
 PLATEAU_EXIT_MS = 6.5       # m/s，超过它说明已越过低速挡位平台，可以撤 boost
+BRAKE_MAX = 0.35            # 刹车指令上限（实测 1.0 ≈ 18 m/s²，0.35 ≈ 5 m/s²）
 
 
 def wrap180(a: float) -> float:
@@ -251,7 +252,7 @@ class GeoFollower:
             if v_req > v_cmd:
                 v_cmd = min(V_RULE, v_req)
             # 只跑到"够用"的 1.2 倍：既不超时也不触发高速挡位跳变（|a| 会爆）
-            v_cmd = min(v_cmd, max(v_req * 1.2, 5.0))
+            v_cmd = min(v_cmd, max(v_req * 1.35, 5.0))
         # 前车净距保护：安全距离 = 车身长 4 m + 2 m 余量
         if obstacles and self.lane_w:
             gap = None
@@ -365,7 +366,7 @@ class GeoFollower:
             brk_t = 0.0
         else:
             thr_t = 0.0
-            brk_t = min(1.0, (-err) / 1.2)
+            brk_t = min(BRAKE_MAX, (-err) / 1.2)   # 刹车限幅：|a|≤5 需要较小的刹车量
         # 硬限速：接近规则限速就收油，超过就刹（超速每题 −10，不能碰）
         if v > V_RULE * 0.97:
             thr_t = 0.0
@@ -374,8 +375,11 @@ class GeoFollower:
         # 加速度保护：|a|>4 时减油门（比赛要求 |a|≤5 才有 +10）
         if self._v_prev is not None and dt > 0:
             a_now = (v - self._v_prev) / dt
-            if a_now > 4.0:
-                thr_t = min(thr_t, max(0.0, self._lim_thr - 0.02))
+            if a_now > A_LONG_MAX * 0.9:      # 超了就整帧收油，靠限斜率慢慢加回来
+                thr_t = 0.0
+        # 起步 1 s 内油门从 0 平滑爬升：抑制仿真第一帧的速度跳变（|a| 尖峰）
+        if self.t < 1.0:
+            thr_t = min(thr_t, 0.02 + 0.04 * self.t)
         # 油门小斜率限幅（平滑）；刹车直通（该刹就刹）
         self._lim_thr += max(-0.02, min(0.02, thr_t - self._lim_thr))
         self._lim_thr = max(0.0, min(1.0, self._lim_thr))
@@ -399,6 +403,8 @@ class GeoFollower:
                 "k": self.path.curvature_at(s), "L": L,
                 "k_steer": self.k_steer, "steer": steer, "k_plant": self._k_plant}
         return VehicleControl(gear=gear, throttle=thr, brake=brk, steering=steer), info
+
+
 
 
 
