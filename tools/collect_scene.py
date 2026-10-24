@@ -296,6 +296,8 @@ def parse_args() -> argparse.Namespace:
                         help="采集多少仿真秒后停（0=一直采到场景结束）")
     parser.add_argument("--skip-after", type=float, default=0.0,
                         help="hold 模式下每个元素停留多少秒后跳关（0=不跳）")
+    parser.add_argument("--kick", action="store_true",
+                        help="允许升挡 kick：低挡位下油门再大也卡在 17.2 km/h，开这个才会升挡")
     parser.add_argument("--detail", action="store_true", help="额外写逐帧完整消息 frames_detail.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="输出目录（默认 logs\\collect\\<时间戳>）")
     parser.add_argument("--max-wall", type=float, default=3600.0, help="墙钟保护上限 s")
@@ -487,7 +489,7 @@ def main() -> int:
                     emit("warning", what="建议轨迹为空，退回静态 route")
                 dt_ctl = dt_sim if dt_sim > 1e-4 else (dt_wall if dt_wall > 1e-4 else 0.2)
                 cmd_throttle, cmd_brake = speed_ctl.update(
-                    speed, dt_ctl, a_now=accel_f, allow_kick=False)
+                    speed, dt_ctl, a_now=accel_f, allow_kick=args.kick)
                 cmd_gear = GearMode.DRIVE
                 vc = VehicleControl(
                     gear=cmd_gear, throttle=cmd_throttle,
