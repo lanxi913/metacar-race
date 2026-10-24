@@ -34,6 +34,8 @@ TIMEOUT_SECONDS = 120.0
 GOAL_TOL = 0.08                # 距「停车检查点」多近算到位（平台 end_point）
 GOAL_MAX_OFFSET = 1.50         # 检查点离车位中心超过这个距离就不当停车点用
 GOAL_MAX_LATERAL = 0.60
+GOAL_STOP_TOL = 0.08           # 沿车位轴看，离检查点多远就停车（二维距离永远到不了 0）
+GOAL_STOP_LOOKAHEAD = 0.20      # 提前量：rem <= tol + k*|v| 就判到位，抵消平台响应延迟
 
 
 def wrap(angle: float) -> float:
@@ -87,6 +89,7 @@ class ReversePark:
         self.goal_tol = float(goal_tol)
         self.goal_dist = float("inf")
         self.goal_a_long = 0.0
+        self.goal_a_lat = 0.0
         self.phase = "approach"
         self.done = False
         self.slot = None
@@ -125,6 +128,7 @@ class ReversePark:
             ga = (self.goal[0] - sx) * ux + (self.goal[1] - sy) * uy
             gb = (self.goal[0] - sx) * vx + (self.goal[1] - sy) * vy
             self.goal_a_long = ga
+            self.goal_a_lat = gb
             if abs(ga) > GOAL_MAX_OFFSET or abs(gb) > GOAL_MAX_LATERAL:
                 self.goal = None
         self.t_begin = float(now)
@@ -220,11 +224,13 @@ class ReversePark:
                     self.lat_sign = -self.lat_sign
                 self._lat_prev, self._lat_check_t = a_lat, now
 
+            rem = a_long - (self.goal_a_long if self.goal is not None else 0.0)
             if self.goal is not None:
-                # 有检查点时一路倒到检查点上，不能停在车位中心
+                # 检查点不在车位轴线的正投影上（实测偏 0.13~0.16 m），二维距离永远
+                # 收不到 GOAL_TOL，只能看「沿轴还剩多远」，再按车速留一点提前量。
                 gd = math.hypot(self.goal[0] - x, self.goal[1] - y)
                 self.goal_dist = gd
-                if gd <= self.goal_tol or a_long < -1.20:
+                if rem <= GOAL_STOP_TOL + GOAL_STOP_LOOKAHEAD * abs(v):
                     self.phase = "hold"
                     self.t_hold = float(now)
                     return "parking", 0.0, 0.35, 0.0
@@ -233,11 +239,19 @@ class ReversePark:
                 self.t_hold = float(now)
                 return "parking", 0.0, 0.35, 0.0
 
-            vt = max(0.15, min(0.80, 1.1 * max(abs(a_long) - 0.10, 0.0) + 0.22))
-            if self.goal is not None and self.goal_dist < 3.0:
-                vt = min(vt, max(0.08, 0.9 * self.goal_dist))
+            if self.goal is not None:
+                # 越接近检查点越慢：0.75 m/s per metre，最后 0.2 m 只剩 0.2 m/s
+                vt = max(0.06, min(0.80, 0.75 * max(rem, 0.0) + 0.05))
+            else:
+                vt = max(0.15, min(0.80, 1.1 * max(abs(a_long) - 0.10, 0.0) + 0.22))
             thr, brk = speed_cmd(v, vt)
-            steer = max(-0.45, min(0.45, 1.6 * heading_err + self.lat_sign * 0.5 * a_lat))
+            if abs(v) > vt + 0.10:
+                # 倒挡不给油也会一直滑（实测 0.5 m/s 不衰减），必须主动刹车
+                thr = 0.0
+                brk = max(brk, min(0.30, 0.45 * (abs(v) - vt)))
+            lat_err = a_lat - self.goal_a_lat if self.goal is not None else a_lat
+            steer = max(-0.50, min(0.50,
+                                   1.6 * heading_err + self.lat_sign * 0.6 * lat_err))
             return "reverse", thr, brk, steer
 
         # ---------- 5) 驻车保持 ----------
