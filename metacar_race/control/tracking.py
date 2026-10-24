@@ -201,3 +201,52 @@ def distance_left(route, x, y, from_idx=0) -> float:
         total += math.hypot(b.x - a.x, b.y - a.y)
     return total + best_d
 
+
+class OutputLimiter:
+    """油门/刹车的最后一道闸：按帧限幅 + 软起步。
+
+    平台的车辆模型对油门是「往稳态速度快跟随」：油门从 0 跳到 0.11，车速一帧就
+    涨 0.52 m/s（≈15.7 m/s²，见 logs/collect/20261024-131247 起步段）。加速度闭环
+    只管指令，压不住这个台阶，必须再限制**输出**的变化率。
+
+    这两个速率抄自已拿满分的 tools/park_v8.py（垂直泊车 200 分），那边实测 1 s
+    窗口加速度峰值 < 1 m/s²。收油比给油快（thr_down_step），否则从 0.85 收到 0
+    要 19 s，刹不住车。
+    """
+
+    def __init__(self, thr_step=0.0015, thr_down_step=0.006, brk_step=0.004,
+                 soft_start_seconds=2.5, soft_start_throttle=0.02):
+        self.thr_step = float(thr_step)
+        self.thr_down_step = float(thr_down_step)
+        self.brk_step = float(brk_step)
+        self.soft_start_seconds = float(soft_start_seconds)
+        self.soft_start_throttle = float(soft_start_throttle)
+        self._thr = 0.0
+        self._brk = 0.0
+        self._t0 = None
+
+    def reset(self, t0=None):
+        self._thr = 0.0
+        self._brk = 0.0
+        self._t0 = t0
+
+    def soft_start(self, now=None) -> bool:
+        """起步阶段：油门不许超过 soft_start_throttle。"""
+        if self._t0 is None or now is None:
+            return False
+        return 0.0 <= now - self._t0 < self.soft_start_seconds
+
+    def apply(self, throttle, brake, now=None):
+        thr = max(0.0, min(1.0, throttle))
+        brk = max(0.0, min(1.0, brake))
+        if self.soft_start(now):
+            thr = min(thr, self.soft_start_throttle)
+
+        delta = thr - self._thr
+        step = self.thr_step if delta > 0 else self.thr_down_step
+        self._thr += max(-step, min(step, delta))
+        self._brk += max(-self.brk_step, min(self.brk_step, brk - self._brk))
+        self._thr = max(0.0, min(1.0, self._thr))
+        self._brk = max(0.0, min(1.0, self._brk))
+        return self._thr, self._brk
+

@@ -65,8 +65,9 @@ from metacar_race.config import (  # noqa: E402
     LIMIT_SCENE_ELEMENT_KMH,
     LOOKAHEAD_M,
 )
-from metacar_race.control.tracking import PurePursuit, SpeedController  # noqa: E402
+from metacar_race.control.tracking import OutputLimiter, PurePursuit, SpeedController  # noqa: E402
 from metacar_race.control.profile import SpeedProfile  # noqa: E402
+from metacar_race.control.reverse_park import ReversePark, find_slot  # noqa: E402
 
 FRAME_FIELDS = [
     "frame", "wall_t", "sim_t", "dt_sim", "elem_t", "elem_limit", "elem_remain",
@@ -287,10 +288,38 @@ def export_static(out_dir: Path, static, projector: RouteProjector) -> dict:
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
+PARK_GEARS = {"drive": GearMode.DRIVE,
+              "reverse": GearMode.REVERSE,
+              "parking": GearMode.PARKING}
+
+CAR_HALF_WIDTH = 0.90      # 车宽 1.8 m 的一半
+LINE_MARGIN = 0.25         # 贴线时额外留的余量
+
+
+def midline_points(static) -> np.ndarray:
+    """所有中心线（borderType=1，双黄线）的采样点。
+
+    park 模式要"靠近双黄线但不要压线"，得先知道线在哪。
+    """
+    pts: list[tuple[float, float]] = []
+    for road in static.roads:
+        for lane in road.lanes:
+            for border in (lane.left_border, lane.right_border):
+                kind = getattr(border.type, "value", border.type)
+                try:
+                    is_middle = int(kind) == 1
+                except (TypeError, ValueError):
+                    is_middle = False
+                if is_middle:
+                    pts.extend((float(p.x), float(p.y)) for p in border.path_points)
+    return np.array(pts, dtype=float) if pts else np.zeros((0, 2), dtype=float)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="连续场景数据采集")
-    parser.add_argument("--mode", choices=["hold", "traj", "route"], default="hold",
-                        help="hold=驻车只采几何（默认）；traj=沿建议轨迹低速跑；route=沿静态路线跑")
+    parser.add_argument("--mode", choices=["hold", "traj", "route", "park"], default="hold",
+                        help="hold=驻车只采几何（默认）；traj=沿建议轨迹低速跑；route=沿静态路线跑；"
+                             "park=跟车+泊车元素内自动变道并倒车入库")
     parser.add_argument("--speed", type=float, default=3.0, help="traj/route 模式的目标速度 m/s")
     parser.add_argument("--vmax", type=float, default=0.0,
                         help="按曲率剖面跑时的直道速度上限 m/s（>0 时接管 --speed）")
@@ -314,6 +343,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--park-speed", type=float, default=2.0, help="泊车元素内的限速 m/s")
     parser.add_argument("--park-stop-m", type=float, default=8.0,
                         help="在泊车元素终点前多少米驻车（正值=提前停）")
+    parser.add_argument("--park-shift", type=float, default=1.0,
+                        help="park 模式进车位前先往路的另一侧借位多少米（会被双黄线余量卡住）")
+    parser.add_argument("--park-engage", type=float, default=30.0,
+                        help="看到车位且对位点距离小于该值时接管倒车入库（0=一看到就接管）")
+    parser.add_argument("--park-hold", type=float, default=5.0, help="入库后保持驻车秒数")
     parser.add_argument("--detail", action="store_true", help="额外写逐帧完整消息 frames_detail.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="输出目录（默认 logs\\collect\\<时间戳>）")
     parser.add_argument("--max-wall", type=float, default=3600.0, help="墙钟保护上限 s")
@@ -416,6 +450,19 @@ def main() -> int:
     stop_reason = "场景结束"
     detail_route_warned = False
 
+    limiter = OutputLimiter()
+    limiter.reset(t0)
+    park: ReversePark | None = None
+    last_park_phase: str | None = None
+    mid_pts = midline_points(static) if args.mode == "park" else np.zeros((0, 2), dtype=float)
+
+    def mid_clear(x: float, y: float) -> float:
+        """到最近双黄线采样点的距离；没有中心线时给个大数。"""
+        if mid_pts.size == 0:
+            return 99.0
+        return float(np.hypot(mid_pts[:, 0] - x, mid_pts[:, 1] - y).min())
+
+
     try:
         for msg, camera_frames in api.main_loop():
             frame_no += 1
@@ -506,41 +553,108 @@ def main() -> int:
             cmd_gear = GearMode.PARKING
             v_tgt = args.speed
             park_hold = False
+            shift_used = 0.0
+            in_park_elem = bool(current_sub and "泊车" in current_sub)
             if args.mode == "hold":
                 vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
                 cmd_brake = 1.0
+            elif park is not None:
+                # 倒车入库接管：开到位、摆正、倒进去、驻车保持
+                gear_name, thr, brk, steer = park.update(
+                    pose.pos_x, pose.pos_y, pose.ori_z, speed, now)
+                cmd_gear = PARK_GEARS.get(gear_name, GearMode.PARKING)
+                cmd_steer = steer
+                if cmd_gear == GearMode.PARKING:
+                    cmd_throttle, cmd_brake = 0.0, max(brk, 0.5)
+                else:
+                    cmd_throttle, cmd_brake = limiter.apply(thr, brk, now)
+                if park.phase != last_park_phase:
+                    last_park_phase = park.phase
+                    emit("park_phase", phase=park.phase, sim_t=round(sim_t, 3),
+                         d_stage=round(park.d_stage, 2), a_long=round(park.a_long, 2),
+                         a_lat=round(park.a_lat, 2))
+                vc = VehicleControl(gear=cmd_gear, throttle=cmd_throttle,
+                                    brake=cmd_brake, steering=cmd_steer)
             else:
                 points = None
-                if args.mode == "traj" and msg.trajectory:
+                if args.mode in ("traj", "park") and msg.trajectory:
                     points = msg.trajectory
+                # park 模式进车位前先往路的另一侧借位：把「虚拟本车」摆在真车右侧
+                # shift 米处，纯跟踪就会把真车带到偏左 shift 米的位置。能借多少由
+                # 双黄线的实际距离决定，不会压线。
+                off_x = off_y = 0.0
+                slot_now = find_slot(msg.obstacles) if (args.mode == "park" and in_park_elem) else None
+                if slot_now is not None and args.park_shift > 0 and proj["idx"] >= 1:
+                    i = proj["idx"]
+                    j = min(i + 1, projector.n - 1)
+                    tx = projector.pts[j, 0] - projector.pts[i, 0]
+                    ty = projector.pts[j, 1] - projector.pts[i, 1]
+                    norm = math.hypot(tx, ty) or 1.0
+                    lx, ly = -ty / norm, tx / norm        # 路线左法向
+                    # 对位点在车的哪一侧，就往哪一侧借位；借多少看线/余量
+                    probe = ReversePark(hold_seconds=0.0)
+                    pinfo = probe.begin(pose.pos_x, pose.pos_y, pose.ori_z, slot_now, now)
+                    toward = ((pinfo["stage_x"] - pose.pos_x) * lx
+                              + (pinfo["stage_y"] - pose.pos_y) * ly)
+                    if toward >= 0.0:
+                        room = mid_clear(pose.pos_x, pose.pos_y) - CAR_HALF_WIDTH - LINE_MARGIN
+                    else:
+                        room = 1.5      # 往泊车侧没有线可卡，只给保守上限
+                    shift_used = max(0.0, min(args.park_shift, room))
+                    if toward < 0.0:
+                        shift_used = -shift_used
+                    off_x, off_y = -shift_used * lx, -shift_used * ly
                 if points is not None:
                     tracker = PurePursuit(points, lookahead=args.lookahead)
-                    cmd_steer = tracker.steering(pose.pos_x, pose.pos_y, pose.ori_z)
+                    cmd_steer = tracker.steering(
+                        pose.pos_x + off_x, pose.pos_y + off_y, pose.ori_z)
                 elif pursuit is not None:
-                    cmd_steer = pursuit.steering(pose.pos_x, pose.pos_y, pose.ori_z)
+                    cmd_steer = pursuit.steering(
+                        pose.pos_x + off_x, pose.pos_y + off_y, pose.ori_z)
                 elif args.mode == "traj" and not detail_route_warned:
                     detail_route_warned = True
                     emit("warning", what="建议轨迹为空，退回静态 route")
                 dt_ctl = dt_sim if dt_sim > 1e-4 else (dt_wall if dt_wall > 1e-4 else 0.2)
                 if profile is not None:
                     v_tgt = profile.target(proj["idx"], speed)
-                    speed_ctl.v_target = v_tgt
                 # 泊车探针：先降速，到元素终点前 park_stop_m 直接驻车，
                 # 让我们能在不撞车的前提下把车位附近的障碍物看全。
-                if args.park_probe and current_sub and "泊车" in current_sub:
+                if args.park_probe and in_park_elem:
                     park_end_s = sub_ranges.get(current_sub, (-1, 0.0, 0.0))[2]
                     if proj["s"] < park_end_s - args.park_stop_m:
                         v_tgt = min(v_tgt, args.park_speed)
                     else:
                         park_hold = True
-                    speed_ctl.v_target = v_tgt
+                if args.mode == "park" and in_park_elem:
+                    v_tgt = min(v_tgt, args.park_speed)
+                speed_ctl.v_target = v_tgt
                 cmd_throttle, cmd_brake = speed_ctl.update(
                     speed, dt_ctl, a_now=accel_f, allow_kick=args.kick)
+                cmd_throttle, cmd_brake = limiter.apply(cmd_throttle, cmd_brake, now)
                 cmd_gear = GearMode.DRIVE
                 vc = VehicleControl(
                     gear=cmd_gear, throttle=cmd_throttle,
                     brake=cmd_brake, steering=cmd_steer,
                 )
+                # 看到车位、且到了对位点附近，就把控制权交给倒车入库
+                if slot_now is not None and park is None and not park_hold:
+                    slot = slot_now
+                    if slot is not None:
+                        candidate = ReversePark(hold_seconds=args.park_hold)
+                        info0 = candidate.begin(
+                            pose.pos_x, pose.pos_y, pose.ori_z, slot, now)
+                        near = args.park_engage <= 0 or info0["d_stage"] <= args.park_engage
+                        if near:
+                            park = candidate
+                            last_park_phase = park.phase
+                            emit("park_begin", sim_t=round(sim_t, 3),
+                                 slot_x=round(float(slot.pos_x), 2),
+                                 slot_y=round(float(slot.pos_y), 2),
+                                 slot_ori=round(float(getattr(slot, "ori_z", 0.0)), 1),
+                                 stage_x=round(info0["stage_x"], 2),
+                                 stage_y=round(info0["stage_y"], 2),
+                                 d_stage=round(info0["d_stage"], 2),
+                                 shift=round(shift_used, 2))
             if park_hold:
                 cmd_throttle = 0.0
                 cmd_brake = 1.0
