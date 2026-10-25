@@ -109,3 +109,66 @@
 - 接管范围默认收窄为 4 处：起步段、环岛（**仅横向**）、十字路口、复杂路况超车；其余 8 个元素一律走通用栈（cont-r2 能跑到元素 8 的那套）。
 - `ElementControl` 的三个通道都可为 `None`，`None` = 该通道沿用通用栈。
 - 待办：十字路口与复杂路况超车尚未在全程跑次里验证；元素 8 紧急停止仍是既有停滞行为；后续按用户要求重构整个流程。
+
+## 10. 框架版（2026-10-25 下午，`metacar_race/scene4/`）
+
+旧的整体式驱动（1519 行）已经拆成包，`tools/park_cs4.py` 退化成 CLI 薄壳
+（`argv → DriverConfig → Driver.run()`）。旧实现留在 git 历史
+`9bdb2e8:tools/park_cs4.py`，需要对照行为时 `git show` 它；仓库里不再放第二份拷贝。
+`tools/scene4_elements.py` 同时标为 **deprecated**（框架版不再引用它）。
+
+| 模块 | 干什么 | 不干什么 |
+|---|---|---|
+| `config.py` | 全部参数 + `DriverConfig`（`caps` 在 `__post_init__` 里由 `--bonus` 推导） | 不含逻辑 |
+| `track.py` | 累计里程、局部投影、停止线/信号灯几何、车道宽 | 不产生控制量 |
+| `obstacles.py` | 障碍投影（`ObstacleScan`）、起步破挡（`StallGuard`）、卡死（`StuckWatch`）、瞬移（`TeleportWatch`） | 不决定速度 |
+| `lateral.py` | `Stanley`、并线状态机 `Overtaker`、横移路线 `ShiftRoute` | 不碰油门 |
+| `longitudinal.py` | 收油治理 `AccelGovernor`、指令限幅 `limit_command`、上升限幅 `SoftStart` | 不含第二个速度环 |
+| `safety.py` | 信号灯闸门 `LightGate`（每帧按 id 刷新 + 绿灯 ETA）、终点驻车 `EndPark` | 不选路线 |
+| `platform.py` | `SceneSession`（connect / frames / set_control / park）、`SceneLog`（四件产物） | 不含策略 |
+| `strategies.py` | `Command`（`steer/v_cap/throttle/brake/gear`，`None`=沿用基线）、`StartStraightStrategy`、`RingStrategy` | 不实现纵向闭环 |
+| `router.py` | 里程选元素、名称路由、瞬移复位、失败降级 | 不发控制量 |
+| `driver.py` | 唯一的主循环与唯一的速度环 | 不写元素特例 |
+
+### 10.1 通道契约（这次重构唯一的新约束）
+
+策略只声明自己接管哪条通道，没声明的（`None`）一律沿用基线：
+
+```python
+Command(steer=..., v_cap=..., throttle=..., brake=..., gear=...)
+```
+
+* 已占用的映射：`起步直行`/`车辆直行` → `straight`（定油门 0.55 + PurePursuit，实测 110）；
+  `环岛` → `ring`（**只给 steer**，纵向留 None）。
+* 其余元素（连续转弯/跟随/十字路口/超车/匝道/紧急停止/辅路/变道/切出/平行泊车）
+  目前一律 `None`，跑 cont-r2 那套能到元素 8 的通用栈；要接一个元素，先加策略、再加单元素跑次验证。
+
+### 10.2 控制量流水线（顺序即语义）
+
+```
+profile.target → 跟车收速 → 横移锁速 → 信号灯闸门 → 策略 v_cap
+  → accel_gov.apply_trim → speed_ctl.update → stall → soft_start → accel_gov.update
+  → blk_ctrl 硬刹 → 指令限幅 limit_command → 策略逐通道覆盖 → 终点驻车 → 下发
+```
+
+`limit_command` 之后才允许策略覆盖：起步段的定油门 0.55 是**故意**绕过限幅的
+（限幅在 `--bonus` 下把油门压到 `4.5/8=0.5625`，0.55 仍在预算内，两者不冲突）。
+
+### 10.3 离线验证
+
+```powershell
+.venv\Scripts\python.exe tools\_smoke_scene4_framework.py
+```
+
+18 项检查（2026-10-25 全绿）：起步段合成、13 段切分、直行接管且油门 0.55、
+连续转弯/跟随不接管、环岛只给 steer、`reset()` 后重建、指令限幅 0.5625、
+`EndPark` 滑行驻车、`LightGate` 绿灯 ETA 两例。
+
+### 10.4 已知取舍
+
+* 环岛在平坦直线合成路线上的 `steering=1.0`（控制器按真实几何算，合成数据不足为凭）；
+  真实环岛几何要在跑次里看 `[elem] 接管 ring` 那行。
+* `LightGate` 依赖 `static.roads[*].stop_line`；没有停止线就**不做**绿灯 ETA，
+  只在红灯时按老逻辑收速——cont-r2 的闯红灯正是没有停止线刷新导致的。
+* 元素 6/7/8/9–12 仍走基线，元素 8 的 4.89 m 静止车停滞是既有行为（改造前就停在那里）。
+
