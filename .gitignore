@@ -28,3 +28,6 @@ scenes/
 # 本地配置
 .env
 *.local
+
+# 本地临时产物（OCR 截图、路径图等）
+tmp/
