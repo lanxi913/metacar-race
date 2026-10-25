@@ -19,15 +19,20 @@ class ObstacleScan:
 
     @staticmethod
     def scan(track: RouteTrack, i_now: int, obstacles,
-             horizon_m: float = C.BLOCK_HORIZON_M):
+             horizon_m: float = C.BLOCK_HORIZON_M, lat_ref: float = 0.0):
         """返回 (block, items)。
 
         block：本道正前方最近的障碍（dict，含沿路线距离 dist 与横向 lat）或 None
         items：所有障碍的投影结果（按 dist 升序），供日志/超车状态机用
+
+        `lat_ref` 是自车当前的横向位置（相对路线中心，左正）：换道/切弯时把它传进来，
+        跟车与硬刹就只看**自车所在的那条带**，不会把隔壁道的前车当成本道堵点。
+        elem6-r1 那次在 +3.50 m 的左道上被右道静止车压到 0.03 m/s 就是这个 bug 的表现。
         """
         hi = min(track.n, i_now + int(horizon_m) + 30)
         lo = max(0, i_now - 40)      # 往后看一点，后方障碍才会落到负距离
         s_now = track.s[i_now]
+        lat_ref = float(lat_ref)
         items = []
         block = None
         for obs in obstacles:
@@ -55,7 +60,7 @@ class ObstacleScan:
             items.append(item)
             if otype in C.IGNORE_TYPES:
                 continue
-            if dist < -1.0 or dist > horizon_m or abs(lat) > C.LANE_HALF_M:
+            if dist < -1.0 or dist > horizon_m or abs(lat - lat_ref) > C.LANE_HALF_M:
                 continue
             if block is None or dist < block["dist"]:
                 block = item

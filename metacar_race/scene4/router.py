@@ -145,6 +145,17 @@ class ElementRouter:
                      f"v_cap={'--' if cmd.v_cap is None else '%.2f' % cmd.v_cap}")
         return cmd
 
+    # ------------------------------------------------------------------ 查询
+    def kind(self) -> str:
+        """当前元素被哪个策略接管（"" = 走基线）。driver 用它决定要不要开基线超车。"""
+        if self.current is None:
+            return ""
+        try:
+            from .strategies import kind_of
+            return kind_of(self.current.name)
+        except Exception:  # noqa: BLE001
+            return ""
+
     # ------------------------------------------------------------------ 复位
     def reset(self) -> None:
         """平台瞬移后调用：丢掉策略实例，下一帧按当前里程重建并 sync。"""

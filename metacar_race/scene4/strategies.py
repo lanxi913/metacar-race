@@ -208,10 +208,33 @@ class RingStrategy(Strategy):
         self.finish_reported = False
         self.ego = (float(ctx.ego_length or 4.70), float(ctx.ego_width or 1.90),
                     float(ctx.lane_width or 3.50))
+        self.last_steer = 0.0
+        self.profile = None
+        # 曲率限速剖面要用**整条静态路线**（ctx.s_now 是全局里程），而基类
+        # Strategy 只存了 route/s_start/s_end、并没有保存 ctx —— 所以在这里把
+        # 需要的东西抽出来存好，`_build()` 里不再碰 ctx（r15 就是在这里 AttributeError）。
+        self.base_route = getattr(getattr(ctx, "static", None), "route", None) or route
+        self.vmax = float(getattr(ctx, "vmax", 0.0) or 9.0)
         self._build()
 
     def _build(self) -> None:
         self.ctl = None
+        # 曲率限速剖面（2026-10-25）：用整条静态路线建、按全局里程查，
+        # 避免再为「切片带 8/18 m 余量」做里程换算。
+        try:
+            from .ring import RingProfile
+            self.profile = RingProfile(self.base_route,
+                                       float(self.s_start or 0.0),
+                                       float(self.s_end or 0.0),
+                                       v_max=self.vmax)
+            if self.log and self.profile.ok:
+                self.log("[ring] 限速剖面 %d 点 / %.0f m，最低 %.2f m/s，R_min=%.1f m"
+                         % (len(self.profile.s), self.profile.length,
+                            self.profile.floor(), self.profile.r_min))
+        except Exception as exc:  # noqa: BLE001
+            if self.log:
+                self.log(f"[ring] 限速剖面构造失败，只接方向盘: {exc!r}")
+            self.profile = None
         if not _RING_OK or len(self.route) < 3:
             return
         try:
@@ -225,6 +248,7 @@ class RingStrategy(Strategy):
         """瞬移后重建控制器（几何没变，内部里程/曲率缓存必须重算）。"""
         self._build()
         self.finish_reported = False
+        self.last_steer = 0.0
 
     def step(self, ctx: ElementContext) -> Command | None:
         if self.ctl is None:
@@ -249,8 +273,21 @@ class RingStrategy(Strategy):
             if self.log:
                 self.log("[ring] finish_mode，交回基线纵向")
             return None
-        return Command(steer=float(getattr(res, "steering", 0.0)),
-                       note="%s:%.2f" % (self.key, float(getattr(res, "target_speed_ms", 0.0))))
+        # 方向盘：限幅 + 逐帧限变率。r14 在入口 S 弯给到 0.73 满舵，那一下就
+        # 侧向 5.6 m/s²、横向 −1.71 m（压线），限到 0.50 且每帧最多动 0.02。
+        steer = float(getattr(res, "steering", 0.0))
+        steer = max(-C.RING_STEER_LIMIT, min(C.RING_STEER_LIMIT, steer))
+        lo = self.last_steer - C.RING_STEER_RATE
+        hi = self.last_steer + C.RING_STEER_RATE
+        steer = max(lo, min(hi, steer))
+        self.last_steer = steer
+        # 纵向：只给「上限」，具体给多少油仍由基线速度环决定（它才是唯一的纵向闭环）
+        cap = None
+        if self.profile is not None and self.profile.ok:
+            cap = self.profile.cap_at(float(ctx.s_now))
+            cap = max(C.RING_V_FLOOR_MS, min(float(ctx.vmax or 9.0), cap))
+        return Command(steer=steer, v_cap=cap,
+                       note="%s vcap=%s" % (self.key, "--" if cap is None else "%.2f" % cap))
 
 
 STRATEGY_BY_KIND = {
@@ -273,6 +310,13 @@ try:
 except Exception as _exc:  # noqa: BLE001
     _LANE_ERR = repr(_exc)
 
+# 元素 6「复杂路况超车」（`overtake.py`）：左并一次 → 超两车 → 回中线贴终点。
+try:
+    from .overtake import TwoCarOvertakeStrategy
+    STRATEGY_BY_KIND["overtake"] = TwoCarOvertakeStrategy
+except Exception as _exc:  # noqa: BLE001
+    _OVERTAKE_ERR = repr(_exc)
+
 
 def kind_of(name: str) -> str:
     """元素名 → 策略种类。只认**已经验证过**的映射，其余返回 ""（走基线）。"""
@@ -281,13 +325,19 @@ def kind_of(name: str) -> str:
     if C.START_SPAN_NAME in name:
         return "straight"
     if "环岛" in name:
-        # 元素 3（m03278）：和元素 2 一样走切弯——环半径小、内侧净空有限，
-        # 靠切弯把曲率降下来才敢在元素里维持 6 m/s 以上（稳在二挡）。
-        return "curve"
+        # 元素 3（2026-10-25 r14 复盘）：环岛内侧净空为负，切弯只切得动 18 m，
+        # 纯跟踪在入口 S 弯还要 0.73 满舵 → 侧向 5.6、横向 −1.71 m（压线）。
+        # 改回「只接管方向盘 + 曲率限速」：纵向仍归基线，侧向用 RingProfile 限。
+        return "ring"
     if "直行" in name:              # 元素 1：定油门 0.55 拿 +10
         return "straight"
     if "连续转弯" in name:          # 元素 2：切内弯
         return "curve"
+    if "复杂路况超车" in name:
+        # 元素 6（2026-10-25）：左并一次 → 确认超过右侧两辆车 → 回中线贴着 end_point。
+        # 之前一直 0 分不是超车失败，而是穿过终点时横向还差 2.75 m、没进平台的
+        # 近距离检查点，元素一直张着不结算（cont-r2 的证据见 elem6-r1 诊断）。
+        return "overtake"
     return ""
 
 

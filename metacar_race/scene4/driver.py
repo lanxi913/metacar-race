@@ -38,7 +38,7 @@ from .obstacles import ObstacleScan, StallGuard, StuckWatch, TeleportWatch
 from .platform import SceneLog, SceneSession, default_out_dir, save_shot
 from .router import ElementRouter
 from .safety import EndPark, LightGate
-from .strategies import ElementContext
+from .strategies import ElementContext, kind_of
 from .track import RouteTrack
 
 #: 信号灯状态 → CSV 里的数字。`LightGate` 存的是枚举名（"GREEN"），
@@ -85,7 +85,7 @@ class Driver:
         self.stall = StallGuard()
         self.stuck = StuckWatch()
         self.teleport = TeleportWatch()
-        self.light_gate = LightGate(enabled=cfg.light, log=self._say)
+        self.light_gate = LightGate(enabled=cfg.light, log=self._say, track=self.track)
         self.end_park = EndPark(hold_seconds=cfg.end_hold,
                                 coast_only=cfg.caps[1] <= 0.001)
         self.router: ElementRouter | None = None
@@ -110,6 +110,7 @@ class Driver:
         self.kick_until = -1.0
         self.last_kick = -1e9
         self.steer_prev = 0.0
+        self._last_hold_say = -10.0
         self.phase = "run"
         self.shot_t = -99.0
         self._last_used: float | None = None
@@ -135,6 +136,8 @@ class Driver:
     def _prepare(self, static) -> None:
         route = list(static.route)
         self.track = RouteTrack(route)
+        # 信号灯闸门要按里程盯「前方最近的停止线」，track 在 __init__ 时还没有
+        self.light_gate.track = self.track
         n = self.track.n
         if n >= 3:
             self.profile = SpeedProfile(route, v_max=self.cfg.vmax)
@@ -203,7 +206,12 @@ class Driver:
                     self.cur_sub = sub
                     self.elem_i += 1
                     self.light_gate.reset()
-                    ov_on = bool(self.cfg.overtake and "超车" in sub)
+                    # 元素 6 由 `overtake` 策略接管时关掉基线超车机（两套并线逻辑会打架）
+                    # 判据改成"按元素名"——router 在这一帧还没 step，用
+                    # router.kind() 会拿到上一个元素，elem6-r2 就是这样让基线
+                    # 超车机抢在策略前面把 v_hold 锁成 3.2 m/s 达 45 s。
+                    ov_on = bool(self.cfg.overtake and "超车" in sub
+                                 and kind_of(sub) != "overtake")
                     if ov_on != self.overtaker.enabled:
                         self.overtaker.enabled = ov_on
                         self.overtaker.reset(self.sim_t)
@@ -262,7 +270,9 @@ class Driver:
                     self._span_len = 0.0
                     self._span_end = 0.0
                     self._span_name = ""
-                block, obs_items = ObstacleScan.scan(self.track, i_now, list(msg.obstacles or []))
+                block, obs_items = ObstacleScan.scan(self.track, i_now,
+                                                     list(msg.obstacles or []),
+                                                     lat_ref=lat_err)
                 if len(msg.obstacles or []) > 0:
                     self.log.obstacle({"sim_t": round(self.sim_t, 3), "frame": frame,
                                        "n": len(obs_items), "items": obs_items,
@@ -338,6 +348,9 @@ class Driver:
                     and (blk_ctrl is None or float(blk_ctrl["dist"]) > C.BLOCK_SLOW_M)
                     and not bool(ov.get("blocked"))
                     and (light.v_cap is None or float(light.v_cap) >= C.LONG_SPAN_MIN_MS)
+                    # 环岛不吃这个下限（2026-10-25 r14）：它有曲率限速，硬抬到 6.0
+                    # 会像 r14 那样 9.1 m/s 冲进入口 S 弯，侧向直接过 5。
+                    and "环岛" not in str(getattr(self, "_span_name", ""))
                 )
                 if _floor_ok and float(v_tgt) < C.LONG_SPAN_MIN_MS:
                     if float(v_tgt) < C.LONG_SPAN_MIN_MS - 0.05:
@@ -363,12 +376,17 @@ class Driver:
                 thr, brk = self.speed_ctl.update(speed, self.dt, v_ceiling=self.cfg.vmax)
                 # 巡航段不踩刹车：加速度加分看的是指令，任何一次 brk 都吃掉 +10。
                 # 只有真的要把车停下（v_tgt < 1.2，例如红灯/前车/终点）才允许刹车。
-                if brk > 0.0 and float(v_tgt) > C.BRAKE_ONLY_BELOW_MS:
+                # 例外：`light.waiting` 时是「决定在路口停住等下一次绿灯」，必须允许刹。
+                if brk > 0.0 and float(v_tgt) > C.BRAKE_ONLY_BELOW_MS and not light.waiting:
                     self.log.event("coast_brake", v=round(float(speed), 2),
                                    tgt=round(float(v_tgt), 2), brk=round(float(brk), 3))
                     thr, brk = 0.0, 0.0
 
-                thr = self.stall.update(thr, speed, self.dt)
+                # 等灯期间不补油：stall 的「卡死补油门」会和路口刹车互相打架
+                # （curve-r19 线前 `thr=0.56` 与 `brk=0.35` 交替，速度在 ±0.7 m/s
+                #   抖了 20 s，车还往前蹭了 6 m —— 用户 m04149 说的「刹车位置不对」）
+                if not light.waiting:
+                    thr = self.stall.update(thr, speed, self.dt)
                 thr = self.soft.apply(thr)
                 if not self.stall.active:
                     thr, brk = self.accel_gov.update(self.sim_t, speed, v_tgt, thr, brk)
@@ -381,6 +399,54 @@ class Driver:
                 thr_cap, brk_cap, a_limit, slew = self.cfg.caps
                 thr = max(0.0, min(thr_cap, thr))
                 brk = max(0.0, min(brk_cap, brk))
+
+                # ---- 路口停住等灯（m04041 方案 + m04362 停车位置修正） --------
+                # 已决定在停止线前等「红转绿」：按「还差多远」反算需要的减速度，
+                # 只补「滑行（COAST_DECEL）给不了」的那部分。
+                # r21 的教训：固定给 0.35，1 s 内 3.24→0.47，停在线前 10 m，
+                # 平台判「红灯时停车位置不正确」−20。
+                if light.waiting and light.stop_gap is not None:
+                    _to_stop = float(light.stop_gap) - C.LIGHT_STOP_AT_M
+                    if _to_stop <= 0.20:
+                        # 已经到停车点：踩住，别往线上顶
+                        thr = 0.0
+                        brk = max(float(brk), C.LIGHT_WAIT_BRAKE)
+                        self.a_cmd_prev = None
+                    elif speed > 0.20:
+                        _need = (float(speed) ** 2) / (2.0 * max(_to_stop, 0.20))
+                        _extra = _need - C.LIGHT_COAST_DECEL_MS2
+                        if _extra > 0.10:
+                            # 需要的减速度超过滑行能力 → 补一点刹车（随差额渐增）
+                            thr = 0.0
+                            brk = max(float(brk),
+                                      min(C.LIGHT_WAIT_BRAKE,
+                                          C.LIGHT_WAIT_BRAKE * min(1.0, _extra / 2.0)))
+                            self.a_cmd_prev = None
+                    elif speed < C.LIGHT_CREEP_MS and _to_stop > C.LIGHT_CREEP_M:
+                        # 停早了：小油门爬到停车点（不踩刹车、不补 stall、不超 0.05）
+                        thr = min(max(float(thr), 0.02), C.LIGHT_CREEP_THROTTLE)
+                        brk = 0.0
+                if light.holding and speed < 1.20:
+                    thr = 0.0
+                    brk = max(float(brk), C.LIGHT_WAIT_BRAKE)
+                    self.a_cmd_prev = None
+                if (light.waiting or light.released) and \
+                        self.sim_t - getattr(self, "_last_hold_say", -10.0) > 2.0:
+                    self._last_hold_say = self.sim_t
+                    self.log.event("light_hold", v=round(float(speed), 2),
+                                   gap=None if light.stop_gap is None
+                                   else round(float(light.stop_gap), 2),
+                                   state=light.state, brk=round(float(brk), 3))
+                    self._say("[%.1fs] 路口等灯 gap=%.1f %s v=%.2f"
+                              % (self.sim_t, float(light.stop_gap or 0.0),
+                                 light.state, float(speed)))
+                if light.released:
+                    # 放行这一帧：把「卡死补油门」和「软启动」都复位，重新平稳起步
+                    self.stall.reset()
+                    try:
+                        self.soft.soft_start(self.sim_t)
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 # ---- 横向 -------------------------------------------------
                 steer = 0.0
