@@ -455,7 +455,6 @@ class Driver:
                     steer = float(self.stanley.steering(x, y, yaw))
                 elif self.pursuit is not None:
                     steer = float(self.pursuit.steering(x, y, yaw))
-                self.steer_prev = float(steer)
 
                 # ---- 指令限幅与元素覆盖 ------------------------------------
                 if self.cfg.fixed_throttle > 0.0:
@@ -484,6 +483,12 @@ class Driver:
                         thr, brk = 0.0, 0.0
                         a_cmd = None
                         self.a_cmd_prev = None
+
+                # 急转限速看的是**实际下发**的方向盘：之前这行在元素覆盖之前，
+                # 元素 6 并到 +3.50 m 左道后，基线纯跟踪仍在追没偏移的中心线，
+                # 每帧都算出 0.53 rad 的"回中"修正 → 急转限速永久把 v_tgt 压到
+                # 3.20 m/s（elem6-r3 实测 2369/2489 帧，整段 168 m 用了 81 s）。
+                self.steer_prev = float(steer)
 
                 # ---- 升挡闸门（一挡墙；唯一允许超过 0.62 油门的通道）---------
                 thr, brk = self._shift_gate(speed, v_tgt, thr, brk)
