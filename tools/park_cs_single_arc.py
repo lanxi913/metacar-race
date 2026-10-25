@@ -129,6 +129,8 @@ def main() -> int:
                         help="只跑第 N 个元素（垂直泊车=5），其余自动 skip_level")
     parser.add_argument("--vmax", type=float, default=8.0, help="沿路线行驶的最高速度")
     parser.add_argument("--stage-past", type=float, default=STAGE_PAST_M)
+    parser.add_argument("--stage-trim", type=float, default=0.26,
+                        help="对位点横向修正，补满舵半径差（同 park_v8 的 LAT_TRIM）")
     parser.add_argument("--hold", type=float, default=8.0, help="入库后保持驻车秒数")
     parser.add_argument("--max-seconds", type=float, default=260.0)
     parser.add_argument("--out", type=Path, default=None)
@@ -137,6 +139,22 @@ def main() -> int:
     print("连接仿真场景（先跑脚本，再点启动场景）...", flush=True)
     api = SceneAPI()
     api.connect()
+
+    # 驻车刹车加斜坡：从 0 一步到 1.0 会把残余车速一下刹死（实测 +7 m/s^2 尖峰），
+    # 这里把 PARKING 挡的刹车改成每帧 +0.05 的斜坡，约 0.4 s 到位，不影响驻车。
+    _raw_send = api.set_vehicle_control
+    _hold_brk = [0.0]
+
+    def _send_ramp(vc):
+        if vc.gear == GearMode.PARKING:
+            _hold_brk[0] = min(1.0, _hold_brk[0] + 0.05)
+            vc = VehicleControl(gear=vc.gear, throttle=0.0,
+                                brake=_hold_brk[0], steering=vc.steering)
+        else:
+            _hold_brk[0] = 0.0
+        _raw_send(vc)
+
+    api.set_vehicle_control = _send_ramp
     static = api.get_scene_static_data()
     print(f"已连接。元素 {len(static.sub_scenes)} 个，赛道 {len(static.route)} 点", flush=True)
 
@@ -152,6 +170,7 @@ def main() -> int:
     pursuit = PurePursuit(static.route, lookahead=LOOKAHEAD_M) if len(static.route) >= 2 else None
     profile = SpeedProfile(static.route, v_max=args.vmax) if len(static.route) >= 3 else None
     lim_thr = 0.0
+    rev_thr = 0.0     # reverse throttle slew state
     speed_ctl = SpeedController(v_target=args.vmax, accel_limit=1.5, throttle_max=0.85)
     speed_ctl.reset(0.0)
 
@@ -256,8 +275,10 @@ def main() -> int:
 
             # 倒车准备点：车位中心沿"出库方向"5.64 m、沿行进方向再退 5.57 m（与基线同构）
             ux, uy, vx, vy = slot_axes(slot)
-            stage = (float(slot.pos_x) + ux * STAGE_LATERAL_M - vx * args.stage_past,
-                     float(slot.pos_y) + uy * STAGE_LATERAL_M - vy * args.stage_past)
+            stage = (float(slot.pos_x) + ux * STAGE_LATERAL_M
+                     - vx * (args.stage_past - args.stage_trim),
+                     float(slot.pos_y) + uy * STAGE_LATERAL_M
+                     - vy * (args.stage_past - args.stage_trim))
             dsx, dsy = stage[0] - x, stage[1] - y
             d_stage = math.hypot(dsx, dsy)
             if pursuit is not None and static.route:
@@ -289,7 +310,7 @@ def main() -> int:
                         stationary += dt
                     else:
                         vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                            brake=0.12, steering=0.0)
+                                            brake=max(0.05, min(0.10, speed * 0.10)), steering=0.0)
                         stationary = 0.0
                     if stationary >= STAGE_SETTLE_SECONDS:
                         stage_ready = True
@@ -335,22 +356,45 @@ def main() -> int:
                     vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
                                         brake=0.12, steering=0.0)
                 elif (met["dist"] <= CENTER_TOL_M and abs(heading_error) <= HEADING_TOL_DEG
-                        and abs(speed) <= STAGE_STILL_SPEED_MS):
+                        and abs(speed) <= 0.06):
                     phase = "hold"
                     hold = 0.0
                     vc = VehicleControl(gear=GearMode.PARKING, brake=1.0)
                     print(f"入库条件满足 d={met['dist']:.3f} dv={met['dv']:+.3f} "
                           f"yaw_error={heading_error:+.2f} margin={met['margin']:+.3f}", flush=True)
+                elif (met["dist"] <= CENTER_TOL_M and abs(heading_error) <= HEADING_TOL_DEG
+                      and abs(speed) > 0.06):
+                    # 位置和航向都已到位，但还没停稳：只踩刹车把它刹住，
+                    # 否则 P 律在 ±0.1 m/s 死区内不给油也不给刹，车会匀速滑过车位。
+                    steering = max(-1.0, min(1.0, REVERSE_STEER_SIGN * heading_error / 30.0))
+                    vc = VehicleControl(gear=GearMode.REVERSE, throttle=0.0,
+                                        brake=min(0.08, max(0.03, abs(speed) * 0.30)),
+                                        steering=steering)
                 else:
                     steering = max(-1.0, min(1.0, REVERSE_STEER_SIGN * heading_error / 30.0))
-                    if met["dist"] <= REVERSE_STOP_START_M:
-                        throttle, brake = 0.0, REVERSE_BRAKE
-                        if abs(speed) <= 0.10:
-                            throttle, brake = REVERSE_CREEP_THROTTLE, 0.0
+                    # 连续 P 律（照 park_v8 的 speed_cmd）：油门连续给，只在明显超速时轻刹，
+                    # 避免 0.16 <-> 0.20 的开关切换造成 ±6~8 m/s^2 的加速度台阶
+                    vt_rev = 0.55 if met["dist"] > REVERSE_STOP_START_M else 0.20
+                    err_v = vt_rev - abs(speed)
+                    if err_v > 0.05:
+                        cmd_thr = min(0.12, 0.01 + 0.05 * err_v)
+                        cmd_brk = 0.0
+                    elif err_v < -0.10:
+                        cmd_thr = 0.0
+                        cmd_brk = min(0.10, -0.06 * err_v)
                     else:
-                        throttle, brake = REVERSE_THROTTLE, 0.0
-                        if abs(speed) > REVERSE_MAX_SPEED_MS:
-                            throttle, brake = 0.0, REVERSE_BRAKE
+                        cmd_thr = 0.0
+                        cmd_brk = 0.0
+
+                    # 倒挡起步油门斜率：静止时只给 0.006（离合器门槛内），每帧最多 +0.002；
+                    # 且**不得超过 P 律指令**、**刹车时绝不给油**——否则油刹同踩会冲过车位。
+                    if rev_thr < 0.006:
+                        rev_thr = 0.006
+                    if cmd_thr > 0.0 and cmd_brk == 0.0:
+                        rev_thr = min(cmd_thr, rev_thr + 0.002)
+                    else:
+                        rev_thr = max(0.0, rev_thr - 0.010)
+                    throttle, brake = (rev_thr if cmd_brk == 0.0 else 0.0), cmd_brk
                     vc = VehicleControl(gear=GearMode.REVERSE, throttle=throttle,
                                         brake=brake, steering=steering)
 
