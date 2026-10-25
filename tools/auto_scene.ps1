@@ -11,10 +11,10 @@
     code points.
 
     -SceneCp takes the scenario name as comma separated hex code points:
-        平行车道泊车 = 5E73,884C,8F66,9053,6CCA,8F66
-        限速行驶     = 9650,901F,884C,9A76
-        直角转弯     = 76F4,89D2,8F6C,5F2F
-        车辆直行     = 8F66,8F86,76F4,884C
+        ?????? = 5E73,884C,8F66,9053,6CCA,8F66
+        ????     = 9650,901F,884C,9A76
+        ????     = 76F4,89D2,8F6C,5F2F
+        ????     = 8F66,8F86,76F4,884C
 #>
 param(
     [string]$PythonArgs = "",
@@ -55,16 +55,35 @@ if ($SceneCp) {
 }
 
 function Stop-Leftovers {
+    # A killed run leaves TWO python processes behind (the .venv shim plus the real
+    # interpreter it spawns), and the survivor keeps listening on 5061/5063 - the
+    # next run's script then blocks in connect() forever while the scene talks to
+    # the zombie. So kill: the scene process, every python whose command line runs
+    # this repo's scripts, and whoever owns the SDK ports.
     Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $self = $PID
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'main\.py|probe' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Where-Object { $_.ProcessId -ne $self -and $_.CommandLine -and
+                       ($_.CommandLine -match 'main\.py|probe|park_cs4|\.py"|\.py -u| -u [\w\\]+\.py') } |
+        ForEach-Object {
+            Write-Host "stale python $($_.ProcessId) killed"
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    foreach ($port in 5061, 5063) {
+        Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
+            $owner = $_.OwningProcess
+            if ($owner -and $owner -ne $self) {
+                Write-Host "port $port held by $owner, killed"
+                Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     Start-Sleep -Seconds 1
 }
 
 function Get-ClientWindow {
-    # 主窗口有时不在 UIA 顶层枚举里（被隐藏/最小化），用进程的 MainWindowHandle 直接取，
-    # 并且必须先 restore + 置前，否则 UIA 树里是 0 个后代节点。
+    # ??????? UIA ?????????/????????? MainWindowHandle ????
+    # ????? restore + ????? UIA ??? 0 ??????
     for ($i = 1; $i -le 20; $i++) {
         $p = Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue |
              Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
@@ -83,12 +102,41 @@ function Get-ClientWindow {
     throw "client window not ready"
 }
 
+if (-not ('AutoSceneMouse' -as [type])) {
+    Add-Type -Namespace AutoScene -Name SceneMouse -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, System.IntPtr dwExtraInfo);
+'@
+}
+
+function Click-Point([double]$x, [double]$y) {
+    [AutoScene.SceneMouse]::SetCursorPos([int]$x, [int]$y) | Out-Null
+    Start-Sleep -Milliseconds 80
+    [AutoScene.SceneMouse]::mouse_event(0x0002, 0, 0, 0, [System.IntPtr]::Zero)
+    Start-Sleep -Milliseconds 50
+    [AutoScene.SceneMouse]::mouse_event(0x0004, 0, 0, 0, [System.IntPtr]::Zero)
+    Start-Sleep -Milliseconds 120
+}
+
 function Invoke-El($el) {
     if (-not $el) { return $false }
     $p = $null
-    if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) {
-        $p.Invoke(); return $true
+    try {
+        if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) {
+            $p.Invoke(); return $true
+        }
+    } catch {
+        # ElementNotEnabled / "unknown error" happens while the list is repainting;
+        # fall back to a real mouse click on the element centre.
+        Write-Host ("invoke failed ({0}), clicking by mouse" -f $_.Exception.GetType().Name)
     }
+    try {
+        $r = $el.Current.BoundingRectangle
+        if ($r.Width -gt 1 -and $r.Height -gt 1) {
+            Click-Point ($r.X + $r.Width / 2.0) ($r.Y + $r.Height / 2.0)
+            return $true
+        }
+    } catch { }
     return $false
 }
 
@@ -108,33 +156,45 @@ if (-not $NoLaunch) {
 
 # The client sometimes ends up with no visible main window (tray / crashed UI).
 # Start it when we cannot find one, and give it time to come up.
-function Test-ClientVisible {
-    $cpids = @(Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
-    if ($cpids.Count -eq 0) { return $false }
-    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
-    foreach ($cp in $cpids) {
-        $cond = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $cp)
-        $w = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond) |
-             Where-Object { $_.Current.BoundingRectangle.Width -gt 400 -and $_.Current.BoundingRectangle.Height -gt 300 }
-        if ($w) { return $true }
+$clientExe = 'D:\' + (-join ([char]0x65E0,[char]0x4EBA,[char]0x7B97,[char]0x6CD5)) + '\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
+
+function Start-Client {
+    if (Test-Path $clientExe) {
+        Start-Process -FilePath $clientExe -WorkingDirectory (Split-Path $clientExe)
+        Start-Sleep -Seconds 18
+    } else {
+        Write-Host "!! client exe not found: $clientExe"
     }
-    return $false
+}
+
+function Test-ClientVisible {
+    # Only decide whether the client PROCESS is running. Whether its window is
+    # currently minimised / behind Edge does not matter: Get-ClientWindow already
+    # restores the window by MainWindowHandle. Checking the UIA rectangle here used
+    # to return false for a perfectly healthy client, which made this script spawn a
+    # second instance and then fail with "client window not ready".
+    $cpids = @(Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    return ($cpids.Count -gt 0)
 }
 
 if (-not (Test-ClientVisible)) {
     Write-Host "client window missing, starting the client..."
-    # 2026-10-24: client lives under D:\download3 (the old D:\<renamed> path was stale).
-    $exe = 'D:\download3\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
-    if (Test-Path $exe) {
-        Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
-        Start-Sleep -Seconds 18
-    } else {
-        Write-Host "!! client exe not found: $exe"
-    }
+    Start-Client
 }
 
-$win = Get-ClientWindow
+# The client sometimes collapses into its 14x14 tray window after a scene run: the
+# process is alive with a MainWindowTitle, but the window has no UIA descendants.
+# In that state every click is impossible, so kill and relaunch it.
+$win = $null
+try {
+    $win = Get-ClientWindow
+} catch {
+    Write-Host "client window unusable, restarting the client..."
+    Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Start-Client
+    $win = Get-ClientWindow
+}
 [Win]::ShowWindow([IntPtr]$win.Current.NativeWindowHandle, 9) | Out-Null
 [Win]::SetForegroundWindow([IntPtr]$win.Current.NativeWindowHandle) | Out-Null
 Start-Sleep -Milliseconds 800
@@ -150,8 +210,31 @@ if (-not $SkipAuto) {
 # Walk pages until the scenario card is found. Card layout: the start button sits
 # to the lower-right of the title (measured dx ~ +175, dy ~ +258), so candidates
 # are filtered by that offset before picking the closest one.
+#
+# IMPORTANT: the list remembers the last visited page, so a later run can start on
+# page 4 and "walk forward" only sees the tail pages ("not found" everywhere).
+# Always jump back to page 1 first.
 $target = $null
-for ($page = 0; $page -le 4 -and -not $target; $page++) {
+try {
+    $allp = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    $first = $allp | Where-Object {
+        $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq 'Go to page 1'
+    } | Select-Object -First 1
+    if (-not $first) {
+        $first = $allp | Where-Object {
+            $_.Current.ControlType.ProgrammaticName -eq 'ControlType.ListItem' -and $_.Current.Name -eq '1'
+        } | Select-Object -First 1
+    }
+    if ($first) {
+        Invoke-El $first | Out-Null
+        Start-Sleep -Milliseconds 1200
+        Write-Host "pagination reset to page 1"
+    }
+} catch {
+    Write-Host "pagination reset skipped: $($_.Exception.Message)"
+}
+
+for ($page = 0; $page -le 8 -and -not $target; $page++) {
     for ($try = 1; $try -le 6; $try++) {
         $all = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
         $btns = @($all | Where-Object { $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq $U_START })
@@ -188,17 +271,32 @@ for ($page = 0; $page -le 4 -and -not $target; $page++) {
     }
 
     if (-not $target -and $sceneName) {
-        $next = $all | Where-Object {
-            $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq 'Next page'
+        # Prefer the explicit "Go to page N" button: it is a plain enabled button,
+        # whereas "Next page" is briefly disabled while the list repaints (that is
+        # what threw ElementNotEnabledException and aborted the whole launch).
+        $wantNum = $page + 2
+        $goto = $all | Where-Object {
+            $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and
+            $_.Current.Name -eq ("Go to page {0}" -f $wantNum)
         } | Select-Object -First 1
-        if ($next) {
-            Write-Host "page $page : not found, going next"
-            Invoke-El $next | Out-Null
+        if ($goto) {
+            Write-Host ("page {0} : not found, goto page {1}" -f $page, $wantNum)
+            Invoke-El $goto | Out-Null
             Start-Sleep -Milliseconds 1200
         }
         else {
-            Write-Host "page $page : not found, no next page"
-            break
+            $next = $all | Where-Object {
+                $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and $_.Current.Name -eq 'Next page'
+            } | Select-Object -First 1
+            if ($next) {
+                Write-Host "page $page : not found, going next"
+                Invoke-El $next | Out-Null
+                Start-Sleep -Milliseconds 1200
+            }
+            else {
+                Write-Host "page $page : not found, no next page"
+                break
+            }
         }
     }
 }
@@ -211,6 +309,21 @@ if (-not $target) {
 
 $ok = Invoke-El $target
 Write-Host "scene launch: $ok"
+
+# The client sometimes swallows the first click (still busy closing the previous
+# scene): SmartCar never spawns and the python script sits in connect() forever.
+# Poll for the scene process and re-click a few times before giving up.
+if ($proc) {
+    for ($i = 1; $i -le 3; $i++) {
+        Start-Sleep -Seconds 5
+        if (Get-Process -Name SmartCar -ErrorAction SilentlyContinue) {
+            Write-Host "scene process is up"
+            break
+        }
+        Write-Host "scene process missing, re-clicking start ($i)"
+        Invoke-El $target | Out-Null
+    }
+}
 
 if ($proc) {
     $sw = [Diagnostics.Stopwatch]::StartNew()

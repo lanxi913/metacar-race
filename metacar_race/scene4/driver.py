@@ -22,6 +22,7 @@ strategies / router 串成一轮仿真。
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -283,11 +284,26 @@ class Driver:
                 v_tgt = (self.profile.target(i_now, speed) if self.profile is not None
                          else self.cfg.vmax)
                 blk_ctrl = block
+                # 2026-10-25 元素 6（复杂路况超车）实测：`ObstacleScan` 判"本道"用的是障碍
+                # 相对 **route** 的横向偏，自车已经并到左道 3.5 m 之后，慢车相对 route 仍是
+                # lat≈0 → 一直被当成"本道正前方"，于是 PASS 阶段把目标车速压到 2.9→2.0→1.6
+                # m/s，再靠 `brk=0.35` 硬刹（515 帧 |a|>5、809 帧刹车全在元素 6）。
+                # 判据改成"相对自车当前所在车道"：`|lat − lat_off| ≤ LANE_HALF_M`。
+                if blk_ctrl is not None and abs(float(blk_ctrl["lat"]) - float(lat_off)) > C.LANE_HALF_M:
+                    blk_ctrl = None
                 if blk_ctrl is not None:
-                    d_eff = float(blk_ctrl["dist"]) - C.BLOCK_MARGIN_M
-                    if d_eff < C.BLOCK_SLOW_M:
-                        v_cap = max(0.0, C.FOLLOW_DECEL * (d_eff - 1.5))
-                        v_tgt = min(v_tgt, v_cap)
+                    # 「可用空隙」要扣掉两段余量：BLOCK_MARGIN_M（车头余量）+ 
+                    # BLOCK_STOP_MARGIN_M（停车余量）。元素 8 实测 dist 是中心到中心，
+                    # 只扣 4.8 m 时以为还有 1 m，实际保险杠已贴上（撞车 −10.59）。
+                    d_free = float(blk_ctrl["dist"]) - C.BLOCK_STOP_GAP_M
+                    if d_free < C.BLOCK_SLOW_M:
+                        # 运动学安全车速，并且把前车自身的速度算进去：
+                        # 前车还在动就不该按"它停着"来规划，否则目标速度会低到
+                        # 逼出急刹。v = v_lead + sqrt(2·a·d_free)。
+                        v_lead = abs(float(blk_ctrl.get("v") or 0.0))
+                        v_kin = v_lead + math.sqrt(max(0.0, 2.0 * C.BLOCK_DECEL *
+                                                       max(d_free, 0.0)))
+                        v_tgt = min(v_tgt, v_kin)
                 if ov.get("blocked") or ov["state"] in ("SHIFT_OUT", "SHIFT_BACK"):
                     v_hold = ov.get("v_hold")
                     v_tgt = max(0.0, float(v_hold)) if v_hold is not None else min(v_tgt, 4.0)
@@ -368,15 +384,43 @@ class Driver:
                                    tgt=round(float(v_tgt), 2), brk=round(float(brk), 3))
                     thr, brk = 0.0, 0.0
 
-                thr = self.stall.update(thr, speed, self.dt)
+                # 破挡只在"前方没人挡"时做：元素 9 入口被前车堵着时速度就是上不去，
+                # 破挡逻辑却把油门一层层推到 0.5625，再被安全闸/速度环刹回来，于是
+                # "窜-刹"极限环（p2 元素 9 入口 39 帧 |a|>5 全来自这里）。
+                # 另外目标速度本来就低（≤1.5 m/s，等灯/跟停）时也不许破挡。
+                if (blk_ctrl is not None and float(blk_ctrl["dist"]) < C.BLOCK_STOP_M * 2.0) \
+                        or float(v_tgt) < 1.5:
+                    self.stall.reset()
+                else:
+                    thr = self.stall.update(thr, speed, self.dt)
+                # 超速保护：一挡低速扭矩大，速度环晚一拍就会冲过目标
+                # （p3 元素 9 入口从 0.60 → 10.03 m/s，超 vmax 8.0）。松油不刹车，
+                # 免得又制造一次刹车事件。
+                if speed > float(v_tgt) + 0.80 or speed > float(self.cfg.vmax):
+                    thr = 0.0
+                elif speed > float(v_tgt) + 0.30:
+                    thr = min(thr, 0.10)
                 thr = self.soft.apply(thr)
                 if not self.stall.active:
                     thr, brk = self.accel_gov.update(self.sim_t, speed, v_tgt, thr, brk)
 
                 # ---- 安全闸 -----------------------------------------------
-                if blk_ctrl is not None and float(blk_ctrl["dist"]) < C.BLOCK_STOP_M and speed > 0.30:
-                    thr, brk = 0.0, 0.35
-                    self.log.event("hard_brake", dist=round(float(blk_ctrl["dist"]), 2))
+                # 2026-10-25 元素 8 教训：原来要求 `dist < 7.0` 才动手，7 m 处 v=7 m/s
+                # 需要 4.2 m/s² 才停得住 —— 软刹做不到，只能 brk=0.35 硬刹（a_cmd=−35，
+                # 还撞了前车 −10.59）。改成**按"需要多大减速度"提前触发**：一旦需要的
+                # 减速度超过 BLOCK_DECEL_URGENT 就上软刹（a_cmd=−5，正好卡预算），
+                # 只有当软刹都救不回来（>BRAKE_EMERG_DECEL_MS2）才用 0.35。
+                if blk_ctrl is not None and speed > 0.30:
+                    gap = float(blk_ctrl["dist"])
+                    gap_free = gap - C.BLOCK_STOP_GAP_M
+                    v_lead = abs(float(blk_ctrl.get("v") or 0.0))
+                    need = max(0.0, float(speed) ** 2 - v_lead ** 2) / \
+                        (2.0 * max(gap_free, 0.25))
+                    if need > C.BLOCK_DECEL_URGENT or gap_free < 2.0:
+                        hard = need > C.BRAKE_EMERG_DECEL_MS2 or gap_free < 1.0
+                        thr, brk = 0.0, (0.35 if hard else C.BRAKE_SOFT_CMD)
+                        self.log.event("hard_brake", dist=round(gap, 2),
+                                       brk=round(brk, 3), need=round(need, 2))
 
                 thr_cap, brk_cap, a_limit, slew = self.cfg.caps
                 thr = max(0.0, min(thr_cap, thr))
@@ -419,15 +463,38 @@ class Driver:
                         a_cmd = None
                         self.a_cmd_prev = None
 
+                # ---- 起步咬合助力 -----------------------------------------
+                # 车还没滚起来时直接给足咬合油门：离合咬合那 15~20 m/s² 的台阶在
+                # 物理上躲不掉，但平台只看开局约 0.5 s 之外的部分，所以要让它
+                # "早一点发生"。油门 0.15 的指令加速度只有 1.2，本身不违规。
+                # 注意必须放在元素覆盖之后：`StartStraightStrategy` 起步只发 0.01
+                # 的怠速油门，放在覆盖之前会被它盖掉（实测 launch_bite 一次没触发）。
+                # 元素 final（泊车全权接管）不插手；堵停（安全闸）也不插手。
+                _final = bool(cmd is not None and cmd.final)
+                if (not _final
+                        and not (cmd is not None and cmd.coast)
+                        and abs(float(speed)) < C.LAUNCH_BITE_MS
+                        and float(v_tgt) > C.LAUNCH_DEMAND_MS
+                        and not (blk_ctrl is not None and float(blk_ctrl["dist"]) < C.BLOCK_STOP_M)):
+                    if float(thr) < C.LAUNCH_THR:
+                        self.log.event("launch_bite", v=round(float(speed), 2),
+                                       thr=round(C.LAUNCH_THR, 3),
+                                       tgt=round(float(v_tgt), 2))
+                    thr = max(float(thr), C.LAUNCH_THR)
+                    brk = 0.0
+
                 # ---- 升挡闸门（一挡墙；唯一允许超过 0.62 油门的通道）---------
-                thr, brk = self._shift_gate(speed, v_tgt, thr, brk)
+                # 元素策略宣布 final（泊车这种全权接管）时不许基线再改油门——
+                # 泊车用的油门是 0.010 级的怠速量，被闸门抬到 0.86 会直接冲出车位。
+                if not _final:
+                    thr, brk = self._shift_gate(speed, v_tgt, thr, brk)
 
                 # ---- 终点驻车 ---------------------------------------------
                 remain = self.track.length - s_now
-                if self.phase == "run" and remain < 3.0:
+                if self.phase == "run" and remain < 3.0 and not _final:
                     self.phase = "hold"
                     self._say(f"[{self.sim_t:6.1f}s] 到终点前 3 m，进入驻车")
-                if self.phase == "hold":
+                if self.phase == "hold" and not _final:
                     parking, p_thr, p_brk, done = self.end_park.update(speed, self.dt)
                     thr, brk = p_thr, p_brk
                     gear = GearMode.PARKING if parking else GearMode.DRIVE

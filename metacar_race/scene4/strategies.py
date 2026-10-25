@@ -51,6 +51,7 @@ class Command:
     brake: float | None = None
     gear: GearMode | None = None
     coast: bool | None = None            #: True = 松油滑行（油门刹车都置 0）
+    final: bool = False                  #: True = 策略全权接管（基线不许再插手升挡闸门/终点驻车）
     note: str = ""
 
 
@@ -273,6 +274,14 @@ try:
 except Exception as _exc:  # noqa: BLE001
     _LANE_ERR = repr(_exc)
 
+# 平行泊车（`parkslot.py`）：认到 PARKING_SLOT 才接管，走"车位坐标系 + 两段圆弧
+# 倒车"，绝不沿 route 直接开进车位（用户 2026-10-25 明确要求）。
+try:
+    from .parkslot import SlotParkStrategy
+    STRATEGY_BY_KIND["parking"] = SlotParkStrategy
+except Exception as _exc:  # noqa: BLE001
+    _PARK_ERR = repr(_exc)
+
 
 def kind_of(name: str) -> str:
     """元素名 → 策略种类。只认**已经验证过**的映射，其余返回 ""（走基线）。"""
@@ -288,6 +297,8 @@ def kind_of(name: str) -> str:
         return "straight"
     if "连续转弯" in name:          # 元素 2：切内弯
         return "curve"
+    if "泊车" in name:              # 平行车道泊车：认车位 → 车位坐标系倒车入库
+        return "parking"
     return ""
 
 
