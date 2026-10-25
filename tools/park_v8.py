@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """垂直泊车 v6：全部由「车位坐标系」推导，不含场景魔法数。
 
 核心思想
@@ -34,6 +34,7 @@ from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
 PARKING_SLOT_TYPE = 30
 ARC_RADIUS = 5.26          # 车辆满舵倒车半径（实测，车辆属性）
+LAT_TRIM = 0.26             # 对位点横向修正：补"假设半径"与"实际满舵半径"之差（实测 0.26 m）
 STAGING_OFFSET = 0.10      # 对位点相对圆弧半径再多让 0.1 m
 STAGE_SPEED = 0.14
 STOP_LONG_TOL = 0.06
@@ -142,7 +143,7 @@ def main() -> int:
         # 对位点：保持当前沿轴线位置，横向退到 -side*(R+偏移)
         # 精确解：对位点 = 车位中心 + u*R + v*(-side*R)
         # 倒车 90 度圆弧后必然落在车位中心，不需要任何经验补偿
-        stage_lat = -side * ARC_RADIUS
+        stage_lat = -side * ARC_RADIUS + LAT_TRIM
         stage_x = slot.pos_x + ux * ARC_RADIUS + vx * stage_lat
         stage_y = slot.pos_y + uy * ARC_RADIUS + vy * stage_lat
         d_stage = math.hypot(stage_x - pose.pos_x, stage_y - pose.pos_y)
