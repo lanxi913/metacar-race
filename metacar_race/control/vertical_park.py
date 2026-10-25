@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """垂直泊车控制器（把 tools/park_v4.py 的已验证动作封装成类）
 
 来源：`tools/park_v4.py`（元素场景「垂直车道泊车」实测 210 分）。

@@ -82,9 +82,11 @@ class AdaptiveCruise:
 
     def steering(self, x, y, yaw_deg):
         tx, ty = self._target(x, y)
-        # yaw = -atan2(dy, dx)：不能写 atan2(-dy, -dx)，那只在 dx≈0 时相等，
-        # 有横向分量时会反向（变道题实测会往反方向打方向）
-        desired_yaw = -math.degrees(math.atan2(ty - y, tx - x))
+        # 场景 yaw 顺时针为正：yaw = -atan2(dy, dx)（角度制）。
+        # 注意不能写成 atan2(-dy, -dx)：那只在 dx≈0 的正前方才成立，
+        # 一旦有横向分量符号就反了（变道题实测会往反方向打方向）。
+        dy, dx = ty - y, tx - x
+        desired_yaw = -math.degrees(math.atan2(dy, dx))
         err = math.radians((desired_yaw - yaw_deg + 180.0) % 360.0 - 180.0)
         return max(-1.0, min(1.0, self.kp * err))
 
