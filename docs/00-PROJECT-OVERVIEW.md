@@ -99,7 +99,7 @@ steer = -delta / 0.6                   # ← 这个负号实测验证过
 | 左侧车道超车 | 110 | 车道级循迹 + 换道避让 |
 | 辅路驶入驶出 | 110 | 同上 |
 | 车辆紧急停止 | 110 | `tools/emergency_stop_run.py` |
-| 垂直车道泊车 | **210** | `tools/park_v8.py`（几何推导，无场景常数） |
+| 垂直车道泊车 | **210** | `tools/park_v4.py` ★**效果最好**（2026-10-25 复核 210.00，中心误差 0.14 m / 航向 1.5°）；同分备选 `tools/park_v8.py`（几何推导，无场景常数） |
 | 平行车道泊车 | **210** | `control/parallel_parking.py` |
 | 十字路口 | **210** | 读 SDK 停止线与信号灯 |
 | 丁字路口 | **210** | 矢量加速度预算 |
@@ -133,7 +133,9 @@ crossroad/ lanechange/ leftturn/ parking/ roundabout/ speed/ straight_full/ tjun
 templates/                  可复用模板（stop / rightturn / parking / scenes）
 tools/                      脚本工具
   ├ track_bonus.py          ★ 通用循迹（奖励分优化版，支持 --offset/--cscale/--nobrake）
-  ├ park_v8.py              ★ 垂直泊车（几何推导，210 分）
+  ├ park_v4.py              ★★ 垂直泊车【效果最好】（210 分，中心误差 0.14 m / 航向 1.5°，优先复用）
+  ├ park_v8.py              ★ 垂直泊车（几何推导，210 分；同分备选）
+  ├ park_cs_single_arc.py   垂直泊车（连续场景单圆弧移植，同属 park_v4 一系）
   ├ stop_run.py             ★ 车辆停止（3 cm 判据，110 分）
   ├ follow_run.py / emergency_stop_run.py   跟车与急停入口
   ├ park_angled*.py         异形泊车（未完成，v4 是当前版本）
