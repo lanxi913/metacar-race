@@ -249,6 +249,136 @@ COAST_LOOKAHEAD_MIN_M = 8.0     #: 前方弯道入口距离小于这个值就按
 #: 只有目标速度低于本值（真要停车：红灯 / 前车 / 终点）才保留刹车。
 BRAKE_ONLY_BELOW_MS = 1.20
 
+#: 方向盘物理上限（本车 |steering| ≤ 1.0）；策略输出前统一夹一下
+MAX_STEER = 1.00
+
+# ---- 元素 7「匝道行驶」（683 m 长弯，2026-10-25 新增）-------------------------
+# 依据：元素 7 从来没被单独验证过（elem6-r4 只跑到 s=2553.5），基线 9 m/s 纯跟踪
+# 在长弯里没有任何曲率保护。这里只接管方向盘 + 曲率限速，纵向仍归基线速度环。
+RAMP_LAT_BUDGET_MS2 = 3.00      #: 匝道允许侧向加速度（比环岛 3.5 保守，车速更高）
+RAMP_V_FLOOR_MS = 6.00          #: 最低目标车速（683 m / 6.0 ≈ 114 s，限时 200 s）
+RAMP_COAST_MS2 = 0.30           #: 反推减速点的滑行减速度
+RAMP_LOOKAHEAD_M = 5.00         #: 纯跟踪前视距离（比基线短，弯里贴线）
+RAMP_END_SLOW_M = 25.0          #: 终点前这么多里程按停车剖面收速（end_point 检查点）
+
+# ---- 元素 8「车辆紧急停止」（46.4 m，2026-10-25 新增）------------------------
+# 平台按「距 end_point 的近距检查点」推进（elem6-r1 实测 0.48~1.95 m），
+# 所以必须停进 end_point 并保持，不能停在任意位置。
+ESTOP_GAP_M = 0.40              #: 停车点距 end_point 的余量（旧口径，仅参数文档保留）
+ESTOP_DECEL_MS2 = 1.50          #: 旧口径停车剖面减速度（已由下面的滑行模型取代）
+ESTOP_OVER_MS = 0.30            #: 旧口径超速阈值（已由 COAST 段 + arrest 段取代）
+ESTOP_BRAKE = 0.35              #: 收尾段刹车（加速度纪律允许的上限，只在最后 2 m 用）
+ESTOP_STOP_M = 0.60             #: 旧口径停车窗口（保留兼容）
+ESTOP_STOP_MS = 0.20            #: 旧口径「算停住」的速度
+ESTOP_HOLD_BRAKE = 1.00         #: 停住后满刹车保持
+ESTOP_HOLD_S = 3.00             #: 保持时间（与 EMERGENCY_STOP_HOLD_SECONDS 一致）
+ESTOP_LOOKAHEAD_M = 4.00        #: 纯跟踪前视距离
+# 元素 8 改「松油滑行」（2026-10-25 用户要求：减速回顾已有经验，用滑行不用刹车）
+ESTOP_CLEARANCE_RATIO = 0.05    #: 停车点 = end_point − 0.05×车长（≈0.235 m），对齐 main 的 emergency_stop_run
+ESTOP_COAST_MS2 = 0.25          #: 滑行模型的规划减速度（取实测 0.30 的保守值），allow=sqrt(2·a·d)
+ESTOP_FINAL_M = 0.45            #: 距停车点 ≤ 此值 → 满刹保持
+ESTOP_ARREST_M = 2.00           #: 距停车点 ≤ 此值且仍快于 ESTOP_ARREST_MS → 补一脚 0.35 刹车
+ESTOP_ARREST_MS = 1.20          #: 收尾刹车触发的速度阈值
+
+# ---- 元素 8 v2：端点坐标系停车律（2026-10-25 重写）---------------------------
+# 实测依据（elem8-r3，得分 99.28 = 100 − 0.72）：
+# * 扣分公式用 main 的两个失败点反解：`penalty = 10 × (|along| − 0.20)`，
+#   `along` = 定位点沿终点法向到 end_point 的距离（正=在线前，负=越过），
+#   理想 0、容差 ±0.20 m。本次 −0.72 ⇒ 实际越过 0.272 m。
+# * 旧实现的根因：`d` 由整米网格的 `route_s` 算，`d > 0.45` 时返回的是**正的限速**
+#   `sqrt(2·0.25·d)`（d=1.7 时 0.92 m/s）而不是 0，StallGuard 又补 0.09~0.27 的油门，
+#   于是车以 ±0.4 m/s 抖着往前蹭了 2 m / 9 s，最后过线才满刹。
+# * 新律离线试算：`accel_window_probe/scratch_estop_sim.py`，进场 5.04 m/s →
+#   17 s 停住、最大刹车 0.03、落点 along ≈ 0.14 m（2/3/4 m/s 进场也落在 0.14~0.15）。
+ESTOP_ALONG_TARGET_M = 0.12     #: 停车目标：end_point 前 0.12 m（容差 ±0.20 的中间偏安全侧）
+ESTOP_APPROACH_MS2 = 0.25       #: 远段允许的规划减速度（= 滑行能力），allow = sqrt(2·a·gap)
+ESTOP_FINE_ALONG_M = 8.0        #: 进入精细段的 along（此段用 a_need 反算刹车）
+ESTOP_FINE_BRAKE_MAX = 0.28     #: 精细段刹车上限（低于 0.30，且全程不许阶跃）
+ESTOP_BRAKE_GAIN_MS2 = 3.0      #: 刹车指令 → 减速度的换算斜率（1.0 brake ≈ 3.0 m/s²）
+ESTOP_BRAKE_RAMP_PER_S = 0.60   #: 刹车指令爬升斜率（0.02/帧，避免把指令写成阶跃）
+ESTOP_SELFCHECK_M = 8.0         #: 首帧自检：|along − (s_end − s_now)| > 此值 ⇒ end_point 不属于本元素
+ESTOP_SETTLED_MS = 0.12         #: 算「停住」的速度
+ESTOP_SETTLED_GAP_M = 0.12      #: 算「停住」的 along − target 窗口
+ESTOP_SETTLED_ALONG_M = 0.06    #: 已经压到 end_point 前 0.06 m 也直接算停住
+ESTOP_CREEP_THROTTLE = 0.03     #: 停早了时的最小蠕动油门（显式下发，压掉 stall 的 0.5）
+ESTOP_CREEP_MAX_THROTTLE = 0.08  #: 蠕行 6 s 内线性加到的上限（怕 0.03 落在死区里推不动）
+ESTOP_CREEP_TARGET_MS = 0.25    #: 蠕行的目标速度
+ESTOP_CREEP_LIMIT_S = 6.0       #: 蠕行最长时间（超时就不再往前挪）
+ESTOP_STUCK_ALONG_M = 0.30      #: 停在这里还没到点、也推不动：算停住（避免一直蠕行）
+ESTOP_NEAR_ALONG_M = 3.0        #: 进入这个距离才记「近线平台元素名」（交棒判据的基线）
+ESTOP_HOLD_RAMP_S = 1.0         #: 满刹从 0.10 爬到 1.00 的时间（避免阶跃）
+ESTOP_RELEASE_MAX_S = 12.0      #: 兜底：最多保持这么久就交棒（平台元素名一直没变时）
+
+# ---- 元素 8 第二轮：加速度 +10 与零刹车起跑（2026-10-25，elem89-r1 实测）-------
+# 结算表（m00443）：元素 8 得 100，没有 +10。逐帧差分定位到唯一超限点——
+# f13032 t=23.05 `v −0.00→−0.18 @ brk=1.00`（a=−5.16）、f13038 t=23.25
+# `v 0.17→0.01 @ brk=1.00`（a=−5.04）：满刹 1.00 顶在一辆**静止**的车上，
+# 速度逐帧抖 ±0.18 m/s。判据是「元素内 |a| ≤ 5 m/s²」（docs/08-continuous-scene.md），
+# 元素 3 的 5.13 也拿了 +10，说明 5 附近有容差噪声——把驻车段压到 4 以下才稳。
+# 同时元素 9 丢 +10 的元凶也是交棒瞬间：基线给了 2 帧 brk=0.35（安全闸，blk=6.82<7）
+# + 0→0.56 油门阶跃（a=8.49）。⇒ 修法：驻车挂 P、刹车只到 0.55；平台切元素后
+# 自己零刹车起跑 24 m，再交棒。
+ESTOP_HOLD_BRAKE_MAX = 0.55     #: 驻车刹车上限（不用 1.00：满刹在静止车上会抖出 −5 m/s²）
+ESTOP_LAUNCH_M = 24.0           #: 零刹车起跑跑出这么远再交棒（元素 9 从 s_end+24.9 m 才开始）
+ESTOP_LAUNCH_MS = 7.0           #: 起跑目标速度
+ESTOP_LAUNCH_RAMP_PER_S = 0.10  #: 起跑油门爬升斜率（每帧 +0.003）
+ESTOP_LAUNCH_THR_MAX = 0.30     #: 起跑油门上限（二挡 0.30 ≈ 7~8 m/s，够接上元素 9）
+ESTOP_LAUNCH_MAX_S = 12.0       #: 起跑最长持续时间（兜底交棒）
+
+# ---- 元素 9「辅路驶入、驶出」（1336.7 m，2026-10-25 新增）--------------------
+# 依据 main 的 `templates/scenes/zyyxnjydhcg/fudao_run.py`（RouteFollower，单场景
+# 443 m / 99 s / 110 分）：跟 `static.route` 走、不叠曲率限速、收尾轻刹到 0.05 m/s
+# 以下再挂 P 保持 5 s（硬停一帧 4.8→0 就是 5 m/s² 的加速度事件，会丢 +10）。
+# 连续场景的差别：元素 9 有 1336.7 m / 限时 200 s ⇒ 必须 ≥6.68 m/s；而元素 8
+# 把车停住后变速箱退回一挡，driver 的 `_shifted_ok` 是全局一次、已经用掉（m03278）
+# ⇒ 元素 9 必须自己补一次升挡 kick（元素 1 实测 0.86 油门 0.43 s 就能升挡）。
+FUDAO_LOOKAHEAD_M = 5.00        #: 纯跟踪前视距离（与匝道一致，弯里贴线）
+FUDAO_HANDOVER_M = 6.0          #: 距 s_end 这么多米就 return None，把元素 10 交给基线
+FUDAO_KICK_ON = True            #: 是否允许自己补一次升挡 kick
+FUDAO_KICK_THROTTLE = 0.88      #: kick 的油门（元素 1 实测 0.86 能触发升挡，留 0.02 余量）
+FUDAO_KICK_RAMP_PER_S = 0.70    #: kick 油门爬升斜率（0.62 → 0.88 约 0.37 s）
+FUDAO_KICK_MAX_S = 2.2          #: 单次 kick 最长持续时间
+FUDAO_KICK_MIN_TAIL_M = 200.0   #: 剩余里程不足这么多就不 kick（别在收尾处顶油门）
+FUDAO_KICK_MIN_GAP_S = 6.0      #: 两次 kick 的最小间隔
+
+# ---- 元素 9 起跑缓升（2026-10-25 补，元素 8 交棒之后）-------------------------
+# elem89-r1 的实测：元素 8 停车后由基线直接接过纵向，第一帧就 `thr=0.56` 把车从
+# 0 顶到 1.5 s 9.14、2.5 s 11.27 m/s，|a| 峰值 8.49（元素 9 的 +10 就是这么丢的，
+# 另有两帧安全闸 brk=0.35）。estop 的零刹车起跑只到 `s_end + ESTOP_LAUNCH_M(24 m)`，
+# 而 span 在 3066.8 m（=s_end+24.9）就切给辅路，所以起跑速度只有 3 m/s 左右；
+# 直接交回基线仍然是阶跃。这里由辅路策略自己把油门按 0.10/s 爬到 0.30、跑到
+# 7 m/s 再交回基线（那时基线需要的油门也是 0.3 左右，交接没有阶跃）。
+FUDAO_LAUNCH_MS = 7.00          #: 起跑缓升的目标速度，到这速度就交回基线纵向
+FUDAO_LAUNCH_THR_MAX = 0.30     #: 缓升期间的油门上限（二挡 ~3.5 m/s²，进不了加速度事件）
+FUDAO_LAUNCH_RAMP_PER_S = 0.10  #: 缓升斜率（0→0.30 要 3 s）
+
+# ---- 元素 12「平行车道泊车」（2026-10-25 新增）--------------------------------
+# 依据 main 的 `metacar_race/control/parallel_parking.py`（PR#19，平行泊车连续 5 次
+# 210 分、停位离散 < 3 cm）与 `docs/parallel-parking-calibration.md` 的四个坑：
+#   ① staging 必须与「远端那辆车」并排（远端车中心 +0.15 m），不能按车位中心加偏移；
+#   ② 舵角必须斜坡打（1.2 s 到 0.75），低速先给连续小油门破静摩擦，否则车轮顶死；
+#   ③ 收尾不能纯滑行（会多滚 1 m 把 dy 带偏），要 0.06 轻刹收速；
+#   ④ 换向前先停稳，避免正负加速度叠加。
+# 本站连续场景 4 是它的 180° 旋转（车位在行驶方向右侧、ego 沿 +y 开），所以
+# `scene4/park.py` 把位姿与障碍物映射进「绕车位中心旋 180°」的规范坐标系，
+# 原样调用该控制器，再把控制量映射回来（旋转不改手性，steering 符号不变）。
+# 上一轮 elem89-r1 的教训：基线把车开到被挡的车屁股后停下（s=4716.4，距路线
+# 终点 2.06 m），从未倒车入库 ⇒ 元素 12 整行消失 = 0 分（用户 m00443）。
+PARK_LATERAL_M = 3.00           #: staging 侧距（= 两段等半径圆弧的总横移 L）
+PARK_APPROACH_MS = 5.00         #: 接近段目标速度（从元素 11 的 6~9 m/s 收到这里）
+PARK_APPROACH_DECEL_MS2 = 1.20  #: 接近段规划减速度（松油滑行即可，别踩大刹车）
+PARK_APPROACH_GAIN_DEG_PER_M = 8.0   #: 侧向误差 1 m 换多少度航向偏置
+PARK_APPROACH_YAW_MAX_DEG = 12.0     #: 航向偏置上限（再大就是甩尾了）
+PARK_APPROACH_STEER_GAIN = 0.020     #: 航向误差 1° 换多少舵（0.02 → 12° 给 0.24）
+PARK_APPROACH_STEER_MAX = 0.30       #: 接近段舵角上限
+PARK_APPROACH_THR_MAX = 0.35         #: 接近段油门上限
+PARK_APPROACH_THR_RAMP_PER_S = 0.10  #: 油门爬升斜率（避免 0→0.35 阶跃）
+PARK_APPROACH_BRAKE = 0.06           #: 超速时的轻刹（|a|≈1.6 m/s²，不触发加速度事件）
+PARK_HANDOVER_REM_M = 0.30      #: 距 staging 这么多米、且速度够低就交给控制器
+PARK_HANDOVER_MS = 0.30         #: 交给控制器时的速度上限
+PARK_HANDOVER_LAT_M = 0.45      #: 交给控制器时的侧向误差上限（超过就继续修）
+PARK_HOLD_BRAKE = 0.55          #: 入库完成后的驻车刹车（同元素 8，不用 1.00）
+
 
 @dataclass
 class DriverConfig:
@@ -282,7 +412,8 @@ class DriverConfig:
 
     # 元素路由
     elements: bool = True            #: 元素级策略路由
-    elements_only: tuple[str, ...] = ("起步直行", "车辆直行", "连续转弯", "环岛", "复杂路况超车")  #: 空元组 = 全部接管
+    elements_only: tuple[str, ...] = ("起步直行", "车辆直行", "连续转弯", "环岛", "复杂路况超车",
+                                      "匝道行驶", "车辆紧急停止")  #: 空元组 = 全部接管
     lane_element: str = ""           #: 非空时，名字含该字样的元素改走「真变道」（lanechange.py）
 
     # 由 __post_init__ 推导出来的实际预算

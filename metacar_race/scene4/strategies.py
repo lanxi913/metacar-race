@@ -51,6 +51,7 @@ class Command:
     brake: float | None = None
     gear: GearMode | None = None
     coast: bool | None = None            #: True = 松油滑行（油门刹车都置 0）
+    park: bool = False                   #: True = 本元素自己管泊车，driver 别抢 EndPark
     note: str = ""
 
 
@@ -81,6 +82,7 @@ class ElementContext:
     stop_gap: float | None = None
     s_start: float = 0.0
     s_end: float = 0.0
+    platform_element: str = ""          #: 平台当前元素名（交棒判据，见 estop.py）
 
 
 def cumulative(route) -> list[float]:
@@ -317,6 +319,35 @@ try:
 except Exception as _exc:  # noqa: BLE001
     _OVERTAKE_ERR = repr(_exc)
 
+# 元素 7「匝道行驶」（`ramp.py`）：贴线 + 曲率限速，纵向仍归基线。
+try:
+    from .ramp import RampStrategy
+    STRATEGY_BY_KIND["ramp"] = RampStrategy
+except Exception as _exc:  # noqa: BLE001
+    _RAMP_ERR = repr(_exc)
+
+# 元素 8「车辆紧急停止」（`estop.py`）：端点坐标系停车并保持。
+try:
+    from .estop import StopAtEndStrategy
+    STRATEGY_BY_KIND["estop"] = StopAtEndStrategy
+except Exception as _exc:  # noqa: BLE001
+    _ESTOP_ERR = repr(_exc)
+
+# 元素 9「辅路驶入、驶出」（`fudao.py`）：跟 static.route 纯跟踪 + 一次升挡 kick。
+try:
+    from .fudao import FudaoStrategy
+    STRATEGY_BY_KIND["fudao"] = FudaoStrategy
+except Exception as _exc:  # noqa: BLE001
+    _FUDAO_ERR = repr(_exc)
+
+# 元素 12「平行车道泊车」（`park.py`）：接近段自己走 S，入库交给旋转后的
+# `control/parallel_parking.ParallelParkingController`（PR#19，连续 5 次 210 分）。
+try:
+    from .park import ParkStrategy
+    STRATEGY_BY_KIND["park"] = ParkStrategy
+except Exception as _exc:  # noqa: BLE001
+    _PARK_ERR = repr(_exc)
+
 
 def kind_of(name: str) -> str:
     """元素名 → 策略种类。只认**已经验证过**的映射，其余返回 ""（走基线）。"""
@@ -338,6 +369,23 @@ def kind_of(name: str) -> str:
         # 之前一直 0 分不是超车失败，而是穿过终点时横向还差 2.75 m、没进平台的
         # 近距离检查点，元素一直张着不结算（cont-r2 的证据见 elem6-r1 诊断）。
         return "overtake"
+    if "匝道" in name:
+        # 元素 7（2026-10-25，elem6-r4 只跑到 s=2553.5）：683 m 长弯没有任何曲率保护，
+        # 单独接管方向盘 + 曲率限速，纵向仍归基线（第二套速度闭环必坏，环岛教训）。
+        return "ramp"
+    if "紧急停止" in name:
+        # 元素 8（2026-10-25）：46 m 内停进 end_point 并保持；cont-r2 卡在
+        # s=3042.9（正是元素 8 终点）但当时元素 6 还张着，判定条件从未验证过。
+        return "estop"
+    if "辅路" in name:
+        # 元素 9（2026-10-25）：1336.7 m / 限时 200 s，必须 ≥6.68 m/s；
+        # 复用 main 的 fudao 路线级循迹经验（不叠曲率限速），另补一次升挡 kick。
+        return "fudao"
+    if "泊车" in name:
+        # 元素 12（2026-10-25，elem89-r1 整行消失＝0 分）：基线把车开到被挡的车屁股后
+        # 停下（s=4716.4，距路线终点 2.06 m），从未倒车入库。改走 main 验证过的
+        # 两段圆弧侧方停车（旋转 180° 复用），并由 Command.park 压住 driver 的 EndPark。
+        return "park"
     return ""
 
 
