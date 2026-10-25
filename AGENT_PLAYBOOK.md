@@ -39,6 +39,9 @@
     每帧读 `traffic_light_groups[].traffic_lights[]`、按几何认本进口的灯（见 §3.10），
     绿灯放行 / 红灯配速 / 赶不上就停在车头距停止线 0~3 m。**看灯 ≠ 磨蹭**：
     优先用"整段恒速配速"卡进绿灯窗口，别爬行、别原地等（见 §3.10）。
+18. **换场先量，别照搬上一场的结论**：同一套"参考线中线化"代码，在车辆汇入（26）是必需项
+    （route 偏左 0.80 m、照抄压线），在车辆切出（27）却可有可无（route 本身就是中线，`--no-center` 也满分）。
+    横向控制上车前先量三件事：route 与最近左右车道线的距离、最小曲率半径、前视距离是否切内线（见 §4.6）。
 
 ---
 
@@ -78,6 +81,11 @@ powershell -ExecutionPolicy Bypass -File tools\auto_scene.ps1 `
 - 点完「启动场景」会**轮询 `SmartCar` 进程 3 次**（每次等 5 s），进程没起来就重按一次——
   客户端偶尔吞掉第一次点击，不重试就是白等一轮
 - 读分用 `tools\read_score.ps1 -Scene <场景拼音名>`，看分项用 `tools\read_detail.ps1 -Scene <拼音名> -Row <第几行>`
+- 更稳的读法是 `tools\nav_dump.ps1 -Url 'https://www.i-mylab.com/icv/history.html?id=<拼音名>'`：
+  用它把历史页导航过去再 dump，`ControlType.DataItem|` 依次是 场景名/开始/结束/得分/查看；
+  明细用 `tools\read_detail2.ps1 -Url <同上> -Rows 2`（`-Rows` 是「第几个查看」，最新一行的按钮通常是 2）
+- `-SceneCp` 必须用引号包起来传（`-SceneCp '7EFF,706F,7981,884C'`），否则被当数组 → `ToInt32` FormatException
+- 场景卡片偶发找不到（`page 0..3 : not found` / `ElementNotEnabledException`）→ 再跑一次即可
 - ⚠️ **不要给 `-PythonArgs ""`**：PowerShell 会报 `MissingArgument`，脚本根本没执行，白跑一轮
 
 ### 1.4 Windows / PowerShell 的坑
@@ -90,7 +98,10 @@ powershell -ExecutionPolicy Bypass -File tools\auto_scene.ps1 `
 | `git commit -m "多行+引号"` 会被拆成多个参数 | 用 `git commit -F <文件>` |
 | `pwsh` 在 workspace-write 沙箱下报 `0xC0000142` | 需要 `danger-full-access` |
 | **用 PowerShell 改带中文的 `.py`/`.md`** | `Get-Content -Raw` 按 ANSI 读 → 中文变「鏈€鍚?」；`Set-Content -Encoding UTF8` 又加 BOM → Python 报 `SyntaxError: invalid non-printable character U+FEFF`。**改用编辑器工具**，或 `[System.IO.File]::WriteAllText($p,$c,(New-Object System.Text.UTF8Encoding($false)))` |
-| 直接 `& .\tools\auto_scene.ps1` 报「禁止运行脚本」 | 必须 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...` |
+| 直接 `& .\tools\auto_scene.ps1` 报「禁止运行脚本」 | 二选一：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...`；若连 `-File` 也报 **`程序"powershell.exe"无法运行: Access is denied`**，就改成在**当前进程内**执行：`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & .\tools\auto_scene.ps1 ...`（`pwsh` 工具本身就是 PS 5.1） |
+| `Get-Content` 看 python 日志是乱码 | python 日志是 UTF-8，`Get-Content -Encoding UTF8`；`auto_scene.ps1` 用 `*>` 重定向出的日志是 UTF-16LE，易乱码，直接看 `logs\auto_*.log` |
+| 用 `-Help` 试 auto_scene 的参数 | **它没有 Help 参数，会真的跑一局默认场景**，别试 |
+| 中文路径在 PowerShell 输出里乱码（`D:\�����㷨`） | 只是显示问题，不影响功能；判断存在性用 `Test-Path` |
 
 ### 1.5 网络
 
@@ -414,6 +425,23 @@ right = -(ddx*lx + ddy*ly)        # 右偏（lx,ly 是车身左法线）
 **(6) 停车剖面要留余量**：`STOP_A_PROFILE = 1.5`（实际能执行 1.8~1.9）。
 用 2.0 会冲过停点到 1.56 m，用 1.5 精确停在 2.44 m。
 
+**(7) 绿灯禁行（元素 25）的教训：配速目标必须定在停止线，不是检测区边界**
+
+这一场停车是必然的（起点到停止线 17.27 m，绿灯要等 14.9 s，平均速度只能 ~1.15 m/s），
+所以核心是"怎么在判分窗口内把 1.15 m/s 走平"。试过 7 种都失败（阻尼带 / 抛物线刹车 /
+事后冲击吸收 / 预载刹车 / 软抬离合……），最后两条现场结论把问题解决了：
+
+- **低速保持是平滑的，别怕**：`thr=0` 纯滑行实测 0.17~0.3 m/s²（4.91→0.94 用 20 s，`peak|a|=0.54`），
+  不会自己加速；用软 P 律 `err = v_t − v`、`thr = clamp(0, 0.02, 0.02·err)`、
+  `brk = clamp(0, 0.02, 0.02·(−err))` 保持 1.1 m/s，实测 `|a| ≤ 2.10`。
+  ⇒ 「低速蠕行必然 6~8 m/s²」是错的，咬合尖峰只发生在**从静止起步**那一瞬。
+- **配速目标定在检测区边界 = 自找极限环**：定在"车头距线 10 m"时目标速度只有 0.43 m/s，
+  低于能平稳保持的下限，控制器一路点刹 → 「窜-憋-窜」13~15 m/s²；改成
+  `v_pace = d_head / (now + sec + RED_LEN + CROSS_MARGIN − now)`（直接算"绿灯亮起时正好压线"的速度，
+  本场 1.14 m/s）+ 上面的软 P 律 ⇒ `|a| ≤ 4.7`，**210 分连续 6 次**。
+- 顺序是：**一次起步（咬合落在 0~0.5 s 豁免窗口）→ 低速配速滑到线 → 绿灯放开后按加速度空间 PI 加速**。
+  全程只起步一次，就不会有"中途再起步"的 15 m/s² 咬合尖峰。
+
 ---
 
 ## 4. 几何与坐标（写横向控制的必看）
@@ -473,6 +501,37 @@ steer = -delta / max_steer          # 左偏为正 -> 需要负舵
 - 但平滑会把 90° 弯走成大圆弧，**直接压线 −20**（实测 180 分）
 - 正确做法：**路径保持原样**，用**更宽的曲率算子**（按弧长 2.5 m 取三点）抑制航点噪声
 - 弯道靠**减速**通过，不靠改路径
+
+### 4.6 参考线中线化与"压线"排查（场景 26/27 实战）
+
+**route 不等于车道中线。** 车辆汇入（26）实测：匝道左实线 `x=-1.45`、右虚线 `x=2.22`，
+车道宽 3.67 m、中线 `+0.385`，而 SDK 给的 route 走在 `x=-0.41`（偏左 0.80 m），
+车身半宽 0.905 m ⇒ 照抄 route 直接压左实线，**−20**（90 分那次就是）。
+
+**做法：从场景包读车道边界，把参考线推到中线。**
+
+1. **按路线指纹认场景包**（不写死场景名）：遍历 `D:\无人算法\场景包\scenes\*`，
+   把每个 `<场景>/SmartCar_Data/StreamingAssets/mapfile/route` 和 SDK 的 `st.route`
+   逐点比对（点数相同、最大误差最小且 ≤0.6 m），命中就取同目录的 `mapd`。
+   实测车辆切出命中误差 **0.000 m**。
+2. **读 mapd**：JSON，每条 road 的 `laneData[].LeftBorder/RightBorder` 里有
+   `borderType` 和 `pathPoint[]`。`borderType` 实测分布 `1/2 = 实线（道路边线）`、
+   `6 = 虚线（车道分界，可跨）`。
+3. **逐点求横向修正**：对每个参考点，用其法向取左右最近的边界线段（`|along| ≤ 2.0` 过滤），
+   修正量 `(dr - dl)/2`，限幅 ±1.2 m，5 点滑动平均，**首 3 m / 末 2 m 收拢回 route**
+   （起点朝向与判分终点不能动）。车辆汇入场实测最大修正 0.70 m。
+4. **拿不到 mapd 时**（目录空）退回直接跟 route，并打印提示；车辆切出场证明这样也能满分。
+5. **前视要按曲率封顶**：纯跟踪 `1.2v+2 ≈ 7.7 m` 的前视在 R=7.65 m 的 S 弯里会切内线
+   0.97 m；改成 `Ld ≤ 0.55R + 1.5` 后降到 0.78 m 并拿到 110。弯道限速用
+   `A_LAT_BUDGET=2.2`（推到中线后最小 R=4.82 m → 3.26 m/s）。
+6. **离线复核，别反复跑仿真**：`metacar-race/tools/line_check.py` 读 mapd 全部边界线段，
+   逐个车身四角算到线的最小距离，配逐帧 CSV 用。
+7. **一个反直觉现象**：车辆汇入场 Stanley 版横向偏差只有 0.53 m（比纯跟踪的 0.78 m 更小），
+   离线复核离实线还有 0.538 m，却被平台判压线 ⇒ 平台「压道路边线」不只看静态采样点，
+   横摆大、扫过宽度大的控制律吃亏。**默认用纯跟踪，Stanley 只留作对照（`--steer stanley`）。**
+8. **换场必须重新量**：26 场不做中线化必压线，27 场 `--no-center` 也满分（route 本身就在中线）；
+   27 场的 mapd 是整张大地图（926 条边界线段），全局最近边界会被邻近道路干扰
+   （原始修正量 −1.74~+1.81 m，46 点里 23 个超 1.0 m，靠 cap 兜住）。
 
 ---
 
@@ -667,6 +726,10 @@ feat(<scope>): 说明
 | **过路口后车变成 1 m/s 爬行** | 把横向道路的出口停止线当成自己的了 | 停止线只认一次，`crossed=True` 后停用（§3.10） |
 | **在路口外几十米就停了等红灯** | 认错了灯（按最近距离挑到对向/横向的） | 用"前方 + 右偏 0.8~12 m"认本进口的灯（§3.10） |
 | **红灯配速时车猛地一顿** | 配速分支没给前馈、积分顶住减速 | `a_cmd = a_ff + 1.2·err` 且积分清零（§3.10） |
+| **配速目标定在"检测区边界"就一直窜-憋-窜** | 目标速度 0.43 m/s 低于可平稳保持的下限 | 目标定在停止线：`v_pace = d_head / 剩余到线时间` + 软 P 律（§3.10(7)） |
+| **行车轨迹偏差只有 0.5 m 却判压线** | 平台「压道路边线」不只看静态采样点，横摆大吃亏 | 换纯跟踪 + 车道中线化（§4.6(7)） |
+| **照抄 route 就压线** | route 不是车道中线（车辆汇入偏左 0.80 m） | 从 mapd 读左右边界推到中线（§4.6） |
+| **另换一场，同一套中线化却没必要** | route 本身就基本在中线上（车辆切出） | 先量再改：`--no-center` 对照跑一次（§4.6(8)） |
 | 明细里只有总数没有分项 | 没点「查看」 | `tools/read_detail.ps1` 点开明细 |
 
 ---
@@ -684,6 +747,9 @@ feat(<scope>): 说明
 | 无保护左转 | 19 | **210.00** | `leftturn/main.py` | `feat/leftturn` |
 | 上下坡驻车 | 16 | **210.00**（连续 3 次） | `hillstop/main.py` | `feat/hill-stop` |
 | 有行人右转 | 20 | **210.00**（连续 8 次） | `pedright/main.py` | `feat/pedrightturn` |
+| 绿灯禁行 | 25 | **210.00**（连续 6 次） | `greenhold/main.py` | `feat/greenhold` |
+| 车辆汇入 | 26 | **110.00**（连续 3 次） | `merge/main.py` | `feat/merge` |
+| 车辆切出 | 27 | **110.00**（连续 3 次） | `cutout/main.py` | `feat/cutout` |
 | 平行车道泊车 | 22 | 未达标 | `parking/main.py` | `feat/parking-parallel` |
 
 > 场景编号与平台文件夹名的对应，写在场景包目录 `car/scenes/<拼音名>` 里；
@@ -700,3 +766,7 @@ feat(<scope>): 说明
 - **泊车搜索**：A* 网格分辨率曾设粗（0.4 m > 步长 0.35 m），分支被折叠；已改 0.12/0.2，但还没跑通。
 - **有行人右转**：本场行人永远不进 ego 车道，让行判据没在真实通行冲突下验证过；
   真红灯被逼停时再起步只到 200（丢 +10，见 §3.9(4)），要捞回来得做「刹车预载 + 极慢抬」。
+- **车辆汇入 / 车辆切出**：两场都没有车流，汇入的让行与切出的目标车道盲区判定都没机会验证；
+  切出场的中线化会被大地图上邻近道路干扰（见 §4.6(8)），要稳得按「当前车道索引」取边界。
+- **平台「压道路边线」口径未完全摸清**：静态几何解释不了 Stanley 那次被判压线（见 §4.6(7)），
+  目前靠「纯跟踪 + 车道中线 + 曲率封顶前视」这套保守组合。
