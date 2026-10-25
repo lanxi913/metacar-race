@@ -96,3 +96,70 @@ RING_TURN_START_RAMP_SECONDS = 3.00      # 从零建立起步油门的时长
 RING_TURN_START_EXIT_SPEED_MS = 3.00     # 低挡位速度建立后交回巡航控制器
 RING_TURN_CROSS_TRACK_BAND_RATIO = 0.25  # 不降速的横向误差占车道宽度比例
 RING_TURN_CROSS_TRACK_MIN_SPEED_RATIO = 0.70
+# ---- 平行车道泊车（feat/parking-parallel，2026-10-23 连续 5 次 210.00）----
+PARALLEL_SLOT_TYPE = 30          # 障碍物里车位对象的 type 值
+PARALLEL_CAR_LEN = 4.00          # 车长（车辆属性）
+PARALLEL_WHEELBASE = 2.60        # 轴距（车辆属性）
+PARALLEL_MAX_STEER_RAD = 0.60    # 最大前轮转角（车辆属性）
+PARALLEL_THROTTLE_MAX = 0.010    # 油门最小有效值
+PARALLEL_STEER = 0.75            # 倒车舵角；满舵 1.0 会顶住静摩擦导致车不动
+PARALLEL_A_MAX = 0.5             # 规划加速度上限（m/s²）
+PARALLEL_V_APPROACH = 3.2        # 接近段目标速度
+PARALLEL_V_REVERSE = 0.9         # 倒车目标速度
+PARALLEL_BRAKE_CMD = 0.10        # 常规刹车指令
+PARALLEL_SETTLE_BRAKE = 0.06     # 收尾轻刹（纯滑行会多滚 1 m，把 dy 带偏）
+PARALLEL_STAGING_MARGIN_M = 0.15 # staging 相对远端车中心的余量
+PARALLEL_TOL_DX_M = 0.35         # 入位判据：横向
+PARALLEL_TOL_DY_M = 0.35         # 入位判据：纵向
+PARALLEL_HOLD_SECONDS = 5.0      # 停稳保持
+# ---- 车道级循迹 + 换道避让（feat/scenes-page2-zyy，左侧车道超车实测 110）----
+LANE_CRUISE_MS = 4.2       # 巡航目标速度
+LANE_ACCEL_MAX = 1.2       # 规划加速度上限（m/s²）
+LANE_HOLD_SECONDS = 5.0    # 终点停稳保持
+LANE_LAUNCH_HOLD_S = 1.5   # 起步前先驻车的时间，压掉挂挡首帧跳变
+LANE_STEER_LIMIT = 0.8     # 转向限幅，满舵低速会卡死
+LANE_WHEELBASE = 2.6       # 轴距（车辆属性）
+
+# ---- 路线级循迹（辅路驶入驶出实测 110，2026-10-23）----
+ROUTE_CRUISE_MS = 6.0      # 巡航目标速度（车实际最高 4.8 m/s，长路线按此跑）
+ROUTE_ACCEL_MAX = 2.0      # 规划加速度上限
+ROUTE_HOLD_SECONDS = 5.0   # 终点停稳保持
+ROUTE_STEER_LIMIT = 0.8    # 转向限幅
+ROUTE_WHEELBASE = 2.6      # 轴距
+# ---- 车辆跟随（首版直线跟车）----
+FOLLOW_CANDIDATE_MAX_HEADING_DEG = 75.0
+FOLLOW_STANDSTILL_CAR_LENGTHS = 2.0    # 静止净距按主车长度换算
+FOLLOW_MIN_GAP_RATIO = 0.45            # 硬安全净距占静止净距比例
+FOLLOW_LATERAL_LANE_RATIO = 0.50       # 前车横向门限占最近车道宽度比例
+FOLLOW_SPEED_LIMIT_RATIO = 0.35        # 跟随速度占平台限速比例
+FOLLOW_REACTION_TIME_S = 0.80          # 基础反应时间
+FOLLOW_SPEED_RESPONSE_S2_PER_M = 0.05  # 速度变化带来的额外车头距
+FOLLOW_GAP_GAIN = 0.40                 # 车距误差换算为速度修正
+FOLLOW_SAFE_DECEL_MS2 = 2.5
+FOLLOW_END_DECEL_MS2 = 2.0
+FOLLOW_THROTTLE_MAX = 0.50
+FOLLOW_THROTTLE_SLEW_PER_FRAME = 0.010
+FOLLOW_BRAKE_SLEW_PER_FRAME = 0.005
+FOLLOW_HOLD_SECONDS = 3.0
+FOLLOW_LOOKAHEAD_M = 6.0
+
+# ---- 车辆紧急停止 ----
+EMERGENCY_STOP_DECEL_RATIO = 0.40       # 保守规划制动距离，提前开始刹车
+EMERGENCY_STOP_CLEARANCE_RATIO = 0.05   # 终点处最小净余量按主车长度比例
+EMERGENCY_STOP_RESPONSE_SECONDS = 0.50
+EMERGENCY_STOP_HOLD_SECONDS = 3.0
+# ---- 车辆停止（正式模板）----
+STOP_THROTTLE_COMMAND = 0.01     # 稳态约 4.78 m/s
+STOP_BRAKE_COMMAND = 0.10        # 从 4.78 m/s 停车约 4.22 m
+STOP_BRAKE_DECEL_MS2 = 2.70      # 刹车指令的等效平均减速度
+STOP_BRAKE_LEAD_M = 0.10         # 补偿控制周期
+STOP_CAPTURE_RADIUS_M = 0.20     # 停车捕获半径
+STOP_STILL_SPEED_MS = 0.30       # 静止时速度信号抖动范围
+STOP_SETTLE_SECONDS = 0.80       # 锁存驻车前低速持续时间
+STOP_HOLD_SECONDS = 5.0          # 题目要求停稳 5 s
+STOP_EXIT_GRACE_SECONDS = 1.0    # 标定结束后额外制动时间
+STOP_STEER_LOCK_DISTANCE_M = 2.5 # 终点附近回正距离
+
+# ---- 直角转弯（正式模板）----
+TURN_THROTTLE_COMMAND = 0.01     # 稳态约 4.78 m/s
+TURN_LOOKAHEAD_M = 3.0           # 匹配 3 m 曲率，避免大前视切弯

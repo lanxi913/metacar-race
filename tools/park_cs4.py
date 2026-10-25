@@ -49,6 +49,17 @@ from metacar_race.config import LOOKAHEAD_M  # noqa: E402
 from metacar_race.control.profile import SpeedProfile  # noqa: E402
 from metacar_race.control.tracking import PurePursuit, SpeedController  # noqa: E402
 
+# 元素级控制器路由：连续场景 4 的十二个元素各自交给 main 上验证过的控制器。
+# 同目录的兄弟模块，导入失败就整层不启用（不能因为一个文件缺失让整局跑不了）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from scene4_elements import ElementContext, ElementRouter, lane_width_at  # noqa: E402
+    ELEMENT_ROUTER_AVAILABLE = True
+except Exception as _elem_exc:  # noqa: BLE001
+    ElementContext = ElementRouter = lane_width_at = None  # type: ignore[assignment]
+    ELEMENT_ROUTER_AVAILABLE = False
+    _ELEMENT_ROUTER_ERROR = repr(_elem_exc)
+
 PARKING_SLOT_TYPE = 30
 SPEED_SIGN_TYPE = 26
 IGNORE_TYPES = {PARKING_SLOT_TYPE, SPEED_SIGN_TYPE}
@@ -874,6 +885,15 @@ def main() -> int:
     parser.add_argument("--fixed-throttle", type=float, default=0.0,
                         help="定油门直驱（>0 时绕过速度环、直发这个油门 + 零刹车）："
                              "16 局实测「控制量恒定」是拿加速度分的充要条件")
+    parser.add_argument("--no-elements", action="store_true",
+                        help="关掉元素级控制器路由（默认开：按元素名把控制权交给 "
+                             "scene4_elements 里对应 main 已验证控制器）")
+    parser.add_argument("--elements-only", type=str,
+                        default="起步直行,环岛,十字路口,复杂路况超车",
+                        help="只启用这些元素关键字的路由（逗号分隔，空=全部）。"
+                             "默认只接管 4 处：起步段、环岛（元素3）、十字路口、"
+                             "复杂路况超车；其余元素走 park_cs4 原来的通用栈"
+                             "（cont-r2 能一路跑到元素 8 的那套）")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     # 默认是"连续场景正常跑"：不限油门、不砍刹车；只有 --bonus 才启用 +10 那套封顶。
@@ -909,6 +929,15 @@ def main() -> int:
         b = (None if sc.end_point is None
              else round(s_of_point(float(sc.end_point.x), float(sc.end_point.y)), 1))
         elem_spans.append({"index": k, "name": sc.name, "s_start": a, "s_end": b})
+
+    # 元素级控制器路由（连续场景 4）：车长/车宽每帧从 msg.main_vehicle 取，
+    # 所以实体在第一帧才构造；这里只占位。
+    elem_router = None
+    elem_router_tried = False
+    ego_len = 0.0
+    ego_wid = 0.0
+    last_elem_log = -99.0
+    elem_ctl_frames = 0
 
     target = ""
     elem_start = None
@@ -1021,6 +1050,38 @@ def main() -> int:
                     pass
             x, y, yaw = float(pose.pos_x), float(pose.pos_y), float(pose.ori_z)
             speed = float(car.speed)
+
+            # ---- 元素级控制器路由：第一帧用真实车长/车宽构造 ----
+            if not elem_router_tried:
+                elem_router_tried = True
+                ego_len = float(getattr(car, "length", 0.0) or 0.0)
+                ego_wid = float(getattr(car, "width", 0.0) or 0.0)
+                if args.no_elements:
+                    print("[elem-router] 已按 --no-elements 关闭", flush=True)
+                elif not ELEMENT_ROUTER_AVAILABLE:
+                    print(f"[elem-router] 不可用（{globals().get('_ELEMENT_ROUTER_ERROR', '?')}），"
+                          "全部走通用路径", flush=True)
+                else:
+                    try:
+                        elem_router = ElementRouter(
+                            static, static.route, elem_spans,
+                            vmax=args.vmax,
+                            ego_length=ego_len or 4.70,
+                            ego_width=ego_wid or 1.90,
+                            lane_width=lane_width_at(static, x, y),
+                            only=[t.strip() for t in (args.elements_only or "").split(",") if t.strip()],
+                            log=lambda m: print(m, flush=True),
+                        )
+                        only = [t.strip() for t in (args.elements_only or "").split(",") if t.strip()]
+                        if only:
+                            elem_router.only = only
+                        emit("elem_router", on=True, ego_len=ego_len, ego_wid=ego_wid,
+                             spans=len(elem_spans))
+                    except Exception as exc:  # noqa: BLE001
+                        elem_router = None
+                        print(f"[elem-router] 构造失败，走通用路径: {exc!r}", flush=True)
+                        emit("elem_router", on=False, error=repr(exc))
+
             if args.shots > 0 and _frames and sim_t - last_shot >= args.shots:
                 last_shot = sim_t
                 save_shot(_frames, out_dir, "t%06.1f" % sim_t)
@@ -1102,6 +1163,10 @@ def main() -> int:
                 overtaker.reset(sim_t)
                 soft_start.reset()
                 accel_gov.reset()
+                if elem_router is not None:
+                    # 元素处理器各自持有跟踪器：瞬移后必须一起复位，
+                    # 否则转向恒 0、车会直着开出路面（full-r1 回归）。
+                    elem_router.reset()
                 a_cmd_prev = None
                 stall.extra = 0.0
                 stall.stall_t = 0.0
@@ -1306,6 +1371,56 @@ def main() -> int:
                     enabled=not args.no_accel_gov)
                 a_cmd_prev = a_cmd
 
+            # ---- 元素级控制器接管（连续场景 4 十二元素）----
+            # 位置放在最后：安全闸（blk_ctrl 硬刹、limit_command）都已经算完，
+            # 元素处理器这里是「按 main 上验证过的配方重算一遍控制量」，
+            # 它返回 None 就一切照旧。
+            elem_gear = None
+            if elem_router is not None and phase != "hold":
+                try:
+                    ctx_now = ElementContext(
+                        pose=pose,
+                        speed=speed,
+                        dt=dt,
+                        obstacles=list(getattr(msg, "obstacles", None) or []),
+                        static=static,
+                        sim_t=sim_t,
+                        s_now=float(track.s[i_now]),
+                        x=x, y=y, yaw=yaw,
+                        lane_width=lane_width_at(static, x, y),
+                        ego_length=ego_len, ego_width=ego_wid,
+                        vmax=args.vmax,
+                        time_limit=float(getattr(status, "time_limit", 0.0) or 0.0),
+                        end_point=getattr(status, "end_point", None),
+                        trajectory=getattr(msg, "trajectory", None),
+                        a_now=float(a_cmd_prev or 0.0),
+                        light=None if passed_stop else light,
+                        stop_gap=stop_gap,
+                        v_target=float(v_tgt),
+                    )
+                    ctl = elem_router.step(ctx_now)
+                except Exception as exc:  # noqa: BLE001
+                    ctl = None
+                    if sim_t - last_elem_log > 2.0:
+                        last_elem_log = sim_t
+                        print(f"[{sim_t:6.1f}s] 元素路由异常: {exc!r}", flush=True)
+                        emit("elem_error", error=repr(exc))
+                if ctl is not None:
+                    # None = 该通道沿用通用栈（环岛只用它的方向盘）
+                    if ctl.throttle is not None:
+                        thr = min(1.0, max(0.0, float(ctl.throttle)))
+                    if ctl.brake is not None:
+                        brk = min(1.0, max(0.0, float(ctl.brake)))
+                    if ctl.steering is not None:
+                        steer = min(1.0, max(-1.0, float(ctl.steering)))
+                    elem_gear = ctl.gear
+                    elem_ctl_frames += 1
+                    if sim_t - last_elem_log > 5.0:
+                        last_elem_log = sim_t
+                        print(f"[{sim_t:6.1f}s] 元素接管 {ctl.note} "
+                              f"thr={thr:.2f} brk={brk:.2f} steer={steer:+.3f} "
+                              f"v={speed:.2f} s={track.s[i_now]:.1f}", flush=True)
+
             # ---- 到终点就驻车 ----
             if track.length - track.s[i_now] < 3.0:
                 phase = "hold"
@@ -1346,7 +1461,7 @@ def main() -> int:
                     break
                 continue
 
-            vc = VehicleControl(gear=GearMode.DRIVE, throttle=thr, brake=brk, steering=steer)
+            vc = VehicleControl(gear=elem_gear or GearMode.DRIVE, throttle=thr, brake=brk, steering=steer)
             api.set_vehicle_control(vc)
 
             tx, ty = track.tangent(i_now)
