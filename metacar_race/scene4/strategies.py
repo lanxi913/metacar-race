@@ -52,6 +52,7 @@ class Command:
     gear: GearMode | None = None
     coast: bool | None = None            #: True = 松油滑行（油门刹车都置 0）
     park: bool = False                   #: True = 本元素自己管泊车，driver 别抢 EndPark
+    final: bool = False                  #: True = 策略全权接管（driver 不许再插手升挡闸门/终点驻车）
     note: str = ""
 
 
@@ -348,6 +349,15 @@ try:
 except Exception as _exc:  # noqa: BLE001
     _PARK_ERR = repr(_exc)
 
+# 元素 12 第二版（`parkslot.py`，2026-10-26 从 PR#43 移植）：车位坐标系 + ALIGN 段
+# Stanley 对齐 + 交班**强制 `ctl.phase="STOP"`**（r2 就是卡在它的 APPROACH：0.010
+# 的前进油门推不动静止车，33 s 原地不动）。`Command.final=True` 全权接管。
+try:
+    from .parkslot import SlotParkStrategy
+    STRATEGY_BY_KIND["parking"] = SlotParkStrategy
+except Exception as _exc:  # noqa: BLE001
+    _PARKS_ERR = repr(_exc)
+
 
 def kind_of(name: str) -> str:
     """元素名 → 策略种类。只认**已经验证过**的映射，其余返回 ""（走基线）。"""
@@ -382,10 +392,11 @@ def kind_of(name: str) -> str:
         # 复用 main 的 fudao 路线级循迹经验（不叠曲率限速），另补一次升挡 kick。
         return "fudao"
     if "泊车" in name:
-        # 元素 12（2026-10-25，elem89-r1 整行消失＝0 分）：基线把车开到被挡的车屁股后
-        # 停下（s=4716.4，距路线终点 2.06 m），从未倒车入库。改走 main 验证过的
-        # 两段圆弧侧方停车（旋转 180° 复用），并由 Command.park 压住 driver 的 EndPark。
-        return "park"
+        # 元素 12（2026-10-26 第二版）：`parkslot.py` —— 车位坐标系里 ALIGN 到 staging、
+        # 停稳后强制 `ParallelParkingController` 从 STOP 起手倒车入库，`final=True`
+        # 压住 driver 的 EndPark 与升挡闸门。第一版（`park.py`）的两条弯路：staging
+        # 用 2R·sinθ 算过头压在远端车身上、交班时它还在 APPROACH（0.010 油门推不动）。
+        return "parking"
     return ""
 
 

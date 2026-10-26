@@ -491,15 +491,21 @@ class Driver:
                 # 3.20 m/s（elem6-r3 实测 2369/2489 帧，整段 168 m 用了 81 s）。
                 self.steer_prev = float(steer)
 
+                # 策略全权接管（`Command.final`，见 parkslot.py）：升挡闸门与终点驻车
+                # 都不许再插手——元素 12 要开过路线末点 6 m 去 staging、再倒车入库，
+                # 基线在这两处抢一次控制就会把车钉死在车位前（elem89-r1 的 0 分）。
+                _final = bool(cmd is not None and cmd.final)
+
                 # ---- 升挡闸门（一挡墙；唯一允许超过 0.62 油门的通道）---------
-                thr, brk = self._shift_gate(speed, v_tgt, thr, brk)
+                if not _final:
+                    thr, brk = self._shift_gate(speed, v_tgt, thr, brk)
 
                 # ---- 终点驻车 ---------------------------------------------
                 # 元素 12 自己管泊车（`Command.park`）：本站车位中心就是路线末点，
                 # 倒车入库必须先把车开过它 6 m 到 staging，所以不能让 EndPark 在
                 # `remain<3 m` 时抢走控制（elem89-r1 就是这样停在 s=4716.4 的）。
                 remain = self.track.length - s_now
-                self_park = bool(cmd is not None and cmd.park)
+                self_park = bool(_final or (cmd is not None and cmd.park))
                 if self.phase == "run" and remain < 3.0 and not self_park:
                     self.phase = "hold"
                     self._say(f"[{self.sim_t:6.1f}s] 到终点前 3 m，进入驻车")

@@ -172,7 +172,9 @@ class FudaoStrategy(Strategy):
                 return Command(steer=steer, throttle=round(self.kick_thr, 3), brake=0.0,
                                note="fudao kick v=%.2f thr=%.2f" % (speed, self.kick_thr))
 
-        # 4) 常规：只给横向 + 限速，纵向交基线（不叠曲率限速）
+        # 4) 常规：只给横向与限速，**纵向交回基线**。
+        #    这是 elem12-r1（2026-10-26 11:24）拿 110 的版本；当天下午试过自己接管纵向
+        #    （巡航律 8.8 m/s + 0.02/帧油门），元素 9 掉回 100（elem12-r2），已回退。
         cap = min(float(self.vmax or 9.0), 9.0)
         return Command(steer=steer, v_cap=cap,
                        note="fudao v=%.2f 剩 %.0f m" % (speed, remain))

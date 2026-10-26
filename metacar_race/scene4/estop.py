@@ -298,17 +298,19 @@ class StopAtEndStrategy(Strategy):
                           % (self.platform_now, self.held_s, C.ESTOP_LAUNCH_M))
             if self.launching:
                 return self._launch(ctx, speed, along)
-            self.hold_brake = min(C.ESTOP_HOLD_BRAKE_MAX,
-                                  max(0.10, 0.10 + (C.ESTOP_HOLD_BRAKE_MAX - 0.10)
-                                      * min(1.0, self.held_s / max(0.1, C.ESTOP_HOLD_RAMP_S))))
-            # 保持段**不挂 P**（elem8912-r1 实测）：挂 P 之后平台在切元素那一下做 P→D
-            # 重新咬合，速度从 0 在 0.7 s 内被跳到 5.96 m/s（f13092–f13113，当时我们
-            # 的油门只有 0.04~0.10），与「换挡帧平台跳速度」同类，够丢一个元素的 +10。
-            # elem89-r1（保持段 gear=DRIVE + 刹车 1.0）切元素时没有这个跳变。
-            # 车本来就靠 0.55 的刹车停住，挂 D 不影响元素 8 的停车位置分（已 110）。
+            # 保持段：thr=0、gear 保持 D，刹车从 0.10 用 1 s 爬到 ESTOP_HOLD_BRAKE_MAX。
+            # **这是 elem12-r1（2026-10-26 11:24）拿 110 的版本**：当天下午试过
+            # 「零指令保持」（thr=0/brk=0），平台反而不给 +10（elem12-r2 元素 8 = 100），
+            # 当天已回退——元素 8 的加速度加分不是「刹车越少越好」。
+            # 不挂 P：挂 P 后平台在切元素那一下做 P→D 重新咬合，速度 0.7 s 内被跳到
+            # 5.96 m/s（elem8912-r1），够丢一个元素的 +10。
             gear = GearMode.DRIVE if GearMode is not None else None
-            return Command(steer=steer, throttle=0.0, brake=round(self.hold_brake, 3),
-                           gear=gear,
+            self.hold_brake = min(
+                C.ESTOP_HOLD_BRAKE_MAX,
+                max(0.10, 0.10 + (C.ESTOP_HOLD_BRAKE_MAX - 0.10)
+                    * min(1.0, self.held_s / C.ESTOP_HOLD_RAMP_S)),
+            )
+            return Command(steer=steer, throttle=0.0, brake=self.hold_brake, gear=gear,
                            note="estop hold %.2fs along=%.2f（%s）"
                                 % (self.held_s, along, mode))
 

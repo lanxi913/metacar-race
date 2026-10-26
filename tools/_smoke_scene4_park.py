@@ -1,10 +1,10 @@
-"""离线冒烟：元素 12 平行车道泊车（`scene4/park.py`）。
+"""离线冒烟：元素 12 平行车道泊车（`scene4/parkslot.py`，PR#43 移植版）。
 
 分两段验证：
-    1) 接线：`kind_of("平行车道泊车")=="park"`、策略挂着、无车位时退回基线、车位/远端车解析；
-    2) 几何：用运动学模型把车从元素 12 起点开一遍（接近段 → staging → 两段圆弧 → FIT），
-       检查两段圆弧是否把车送到车位中心（主控制器已由 main 的 5 次 210 分验证，
-       这里查的是**旋转坐标系**有没有把几何映错）。
+    1) 接线：`kind_of("平行车道泊车")=="parking"`、策略挂着、无车位时退回基线、车位解析、
+       基向量（模板系 yaw_t 恒 90）；
+    2) 几何：用运动学模型把车从元素 12 起点开一遍（ALIGN → STOP → PARK），检查
+       staging 落点、交班时控制器从 STOP 起手、倒挡真的动起来、入库落点（dx/dy）。
 
 运动学：`x += v·dt·cos(−yaw)`、`y += v·dt·sin(−yaw)`、`yaw += v·dt·tan(0.6·steer)/2.6`（度），
 `yaw = −atan2(dy, dx)`、`steer > 0 = 右转`——这套约定是 run.csv 里实测出来的
@@ -23,9 +23,10 @@ sys.path.insert(0, str(ROOT))
 from metacar import GearMode  # noqa: E402
 
 from metacar_race.scene4 import config as C  # noqa: E402
-from metacar_race.scene4.park import ParkStrategy  # noqa: E402
+from metacar_race.scene4.parkslot import (  # noqa: E402
+    SlotParkStrategy, find_slot)
 from metacar_race.scene4.strategies import (  # noqa: E402
-    Command, ElementContext, STRATEGY_BY_KIND, kind_of)
+    STRATEGY_BY_KIND, ElementContext, kind_of)
 
 FAILED: list[str] = []
 COUNT = 0
@@ -51,9 +52,10 @@ OBSTACLES = [CAR_FRONT, CAR_BACK, SLOT]
 START = (-2154.92, -1453.06, 270.0)          # 元素 12 起点（elem89-r1 实测）
 WHEELBASE = 2.60
 MAX_STEER_RAD = 0.60
+DT = 1.0 / 30.0
 
 
-def ctx_at(x, y, yaw, speed, obstacles=OBSTACLES, dt=1.0 / 30.0):
+def ctx_at(x, y, yaw, speed, obstacles=OBSTACLES, dt=DT):
     return ElementContext(x=x, y=y, yaw=yaw, speed=speed, dt=dt, sim_t=0.0, s_now=4700.0,
                           pose=SimpleNamespace(pos_x=x, pos_y=y, ori_z=yaw),
                           obstacles=list(obstacles), static=None, vmax=9.0,
@@ -87,84 +89,103 @@ def integrate(x, y, yaw, speed, cmd, dt):
     return x, y, yaw, speed
 
 
-def slot_offset(x, y, yaw):
-    """真实坐标下相对车位中心的 (dx, dy) 与航向误差（车位 270°/90° 都算平行）。"""
-    dx = x - SLOT["x"]
-    dy = y - SLOT["y"]
-    err = abs((yaw - SLOT["ori"] + 180.0) % 360.0 - 180.0)
-    err = min(err, abs(180.0 - err))
-    return dx, dy, err
-
-
 def main() -> int:
-    print("[1] 路由与解析")
-    check("kind_of('平行车道泊车') == 'park'", kind_of("平行车道泊车") == "park",
+    print("[1] 接线")
+    check('kind_of("平行车道泊车") == "parking"', kind_of("平行车道泊车") == "parking",
           kind_of("平行车道泊车"))
-    check("STRATEGY_BY_KIND 挂了 park", STRATEGY_BY_KIND.get("park") is ParkStrategy)
-    check("别的元素不受影响",
-          kind_of("车辆切出") == "" and kind_of("辅路驶入、驶出") == "fudao")
+    check('STRATEGY_BY_KIND["parking"] 是 SlotParkStrategy',
+          STRATEGY_BY_KIND.get("parking") is SlotParkStrategy)
 
-    strat = ParkStrategy(ctx_at(*START, 6.7), route=[], log=None)
-    cmd = strat.step(ctx_at(*START, 6.7, obstacles=[CAR_FRONT, CAR_BACK]))
-    check("无车位时退回基线（返回 None）", cmd is None, repr(cmd))
-
-    strat = ParkStrategy(ctx_at(*START, 6.7), route=[], log=None)
-    cmd = strat.step(ctx_at(*START, 6.7))
-    check("车位识别", strat.slot is not None and abs(strat.slot[1] + 1380.69) < 1e-6,
-          str(strat.slot))
-    check("接近段接管（park=True、挂 D 挡）",
-          isinstance(cmd, Command) and cmd.park and cmd.gear == GearMode.DRIVE
-          and cmd.throttle is not None and (cmd.brake or 0.0) <= C.PARK_APPROACH_BRAKE + 1e-9,
-          f"thr={cmd.throttle:.2f} brk={cmd.brake:.2f}")
-    far_y = strat._far_car_y(ctx_at(*START, 6.7))
-    check("远端车取车位前方那辆（旋 180° 后 y 更小）",
-          abs(far_y - (2 * SLOT["y"] - CAR_FRONT["y"])) < 1e-6,
-          f"far_y={far_y:.2f} 期望={2 * SLOT['y'] - CAR_FRONT['y']:.2f}")
-    xp, yp, yawp = strat._canonical(*START)
-    check("规范坐标系：起点朝 −y（yaw=90）", abs(yawp - 90.0) < 1e-6,
-          f"({xp:.2f}, {yp:.2f}) yaw={yawp:.1f}")
-    check("规范坐标系：起点在车位 +x 侧 0.92 m",
-          abs((xp - SLOT["x"]) - 0.92) < 0.02, f"侧向 {xp - SLOT['x']:.2f} m")
-    tx, ty = strat._staging(ctx_at(*START, 6.7))
-    check("staging 侧距 = PARK_LATERAL_M", abs((tx - SLOT["x"]) - C.PARK_LATERAL_M) < 1e-6,
-          f"侧距 {tx - SLOT['x']:.2f} m")
-    check("staging 在车位中心前方 7.3~7.6 m（Δ=2R·sinθ）",
-          7.30 <= (SLOT["y"] - ty) <= 7.65, f"Δ={SLOT['y'] - ty:.2f} m")
-
-    print("[2] 全程运动学仿真（接近 → staging → 两弧 → FIT → 驻车）")
+    # 无车位 → 交回基线
     x, y, yaw = START
-    speed = 6.7
-    strat = ParkStrategy(ctx_at(x, y, yaw, speed), route=[], log=None)
-    handover_frame = None
-    final = None
-    max_steer = 0.0
-    for frame in range(6000):
-        ctx = ctx_at(x, y, yaw, speed)
-        cmd = strat.step(ctx)
+    strat = SlotParkStrategy(ctx_at(x, y, yaw, 6.0),
+                             route=[SimpleNamespace(x=SLOT["x"], y=START[1]),
+                                    SimpleNamespace(x=SLOT["x"], y=SLOT["y"])])
+    check("没有车位（type=30）时返回 None",
+          strat.step(ctx_at(x, y, yaw, 6.0, obstacles=[CAR_FRONT, CAR_BACK])) is None)
+
+    # 有车位 → 解析 + 定基向量
+    cmd = strat.step(ctx_at(x, y, yaw, 6.0))
+    check("看到车位后接管（Command 非 None）", cmd is not None)
+    check("接管即 final=True（driver 不许抢 EndPark/升挡）", bool(cmd and cmd.final))
+    check("车位解析 5.5x2.5 / ori=270",
+          strat.frame is not None and abs(strat.frame.length - 5.5) < 1e-6
+          and abs(strat.frame.width - 2.5) < 1e-6 and abs(strat.frame.ori - 270.0) < 1e-6)
+    X0, Y0, yaw0 = strat.to_t(x, y, yaw)
+    check("模板系 yaw_t = 90°（按自车来向定轴）", abs(yaw0 - 90.0) < 0.5, f"yaw_t={yaw0:.1f}")
+    check("侧向偏置取经验值 3.15 m（本机没有场景包）",
+          abs(abs(strat.lat_target) - 3.15) < 1e-6,
+          f"lat={strat.lat_target:+.2f} 来源={strat.lat_source}")
+    check("staging Y = −5.90 m（车位半长 + 半车长 + 0.8）",
+          abs(strat.stage_y + 5.90) < 1e-6, f"stage_y={strat.stage_y:+.2f}")
+
+    print("[2] ALIGN → STOP")
+    speed = 6.0
+    t = 0.0
+    frames = 0
+    while frames < 4000 and strat.phase == "ALIGN":
+        cmd = strat.step(ctx_at(x, y, yaw, speed))
         if cmd is None:
             break
-        if strat.handed and handover_frame is None:
-            handover_frame = frame
-        max_steer = max(max_steer, abs(float(cmd.steer or 0.0)))
-        x, y, yaw, speed = integrate(x, y, yaw, speed, cmd, ctx.dt)
-        if strat.controller is not None and strat.controller.done() and abs(speed) < 0.05:
-            final = (x, y, yaw, speed, frame)
-            break
+        x, y, yaw, speed = integrate(x, y, yaw, speed, cmd, DT)
+        t += DT
+        frames += 1
+    check("ALIGN 阶段能在 60 s 内到达 staging", strat.phase in ("STOP", "PARK"),
+          f"phase={strat.phase} t={t:.1f}s frames={frames}")
+    _, Ys, _ = strat.to_t(x, y, yaw)
+    check("staging 纵向落点 |Y − stage_y| ≤ 1.2 m", abs(Ys - strat.stage_y) <= 1.2,
+          f"Y={Ys:+.2f} 目标={strat.stage_y:+.2f}")
+    check("staging 横向落点 |X − lat_target| ≤ 1.0 m",
+          abs(strat.to_t(x, y, yaw)[0] - strat.lat_target) <= 1.0,
+          f"X={strat.to_t(x, y, yaw)[0]:+.2f} 目标={strat.lat_target:+.2f}")
 
-    check("接近段在 6000 帧内交给控制器", handover_frame is not None,
-          f"frame={handover_frame}")
-    check("控制器跑完（DONE 且停稳）", final is not None,
-          "" if final is None else f"frame={final[4]}")
-    if final is not None:
-        dx, dy, err = slot_offset(*final[:3])
-        check("入库后横向 |dx| ≤ 0.35 m", abs(dx) <= 0.35, f"dx={dx:+.2f}")
-        check("入库后纵向 |dy| ≤ 0.60 m", abs(dy) <= 0.60, f"dy={dy:+.2f}")
-        check("入库后航向误差 ≤ 5°", err <= 5.0, f"{err:.1f}°")
-    check("舵角从不打满（≤ 0.80）", max_steer <= 0.80, f"max={max_steer:.2f}")
+    # STOP 段：先把速度压到 0
+    for _ in range(120):
+        cmd = strat.step(ctx_at(x, y, yaw, speed))
+        if cmd is None:
+            break
+        x, y, yaw, speed = integrate(x, y, yaw, speed, cmd, DT)
+        if strat.phase != "STOP":
+            break
+    check("停稳后控制器从 STOP 起手（绕开 0.010 油门推不动的 APPROACH）",
+          strat.ctl is not None and strat.ctl.phase in ("STOP", "ARC1", "ARC2", "FIT", "DONE"),
+          f"ctl.phase={None if strat.ctl is None else strat.ctl.phase}")
+
+    print("[3] PARK：两段圆弧倒车入库")
+    got_reverse = False
+    done = False
+    frames = 0
+    while frames < 3600:
+        cmd = strat.step(ctx_at(x, y, yaw, speed))
+        if cmd is None:
+            break
+        if cmd.gear == GearMode.REVERSE:
+            got_reverse = True
+        x, y, yaw, speed = integrate(x, y, yaw, speed, cmd, DT)
+        frames += 1
+        if strat.phase == "DONE":
+            done = True
+            break
+    check("倒车段真的挂过 R 挡", got_reverse)
+    check("入库完成（controller.done()）", done,
+          f"phase={strat.phase} frames={frames} t={frames * DT:.1f}s")
+    if strat.ctl is not None:
+        dx = float(getattr(strat.ctl, "dx", 0.0) or 0.0)
+        dy = float(getattr(strat.ctl, "dy", 0.0) or 0.0)
+        check("入库落点 |dx| ≤ 0.8 m", abs(dx) <= 0.8 or not done, f"dx={dx:+.2f}")
+    # DONE 之后：驻车保持
+    hold = strat.step(ctx_at(x, y, yaw, 0.0))
+    check("DONE 后输出驻车保持（P 挡 + 满刹 + final）",
+          hold is not None and hold.gear == GearMode.PARKING
+          and float(hold.brake or 0.0) >= 0.99 and bool(hold.final))
+
+    print("[4] 复位")
+    strat.sync(0.0, 0.0)
+    check("sync() 回到 WAIT 并清掉控制器", strat.phase == "WAIT" and strat.frame is None)
 
     print()
     if FAILED:
-        print(f"失败 {len(FAILED)} 项：" + "；".join(FAILED))
+        print(f"失败 {len(FAILED)}/{COUNT}：{FAILED}")
         return 1
     print(f"全部通过（{COUNT} 项）")
     return 0

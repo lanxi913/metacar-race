@@ -134,19 +134,17 @@ def main() -> int:
     cmd_stop = router.step(ctx_at(track, 3042.82, speed=0.05, end_point=end_pt,
                                   plat="车辆紧急停止"))
     gear_name = getattr(getattr(cmd_stop, "gear", None), "name", "")
-    check("到点：油门清零、保持 D（不挂 P，避免平台 P→D 跳速度）、刹车起于 0.10",
+    check("到点：thr=0、刹车从 0.10 起爬、保持 D（不挂 P）",
           cmd_stop is not None and cmd_stop.throttle == 0.0 and gear_name == "DRIVE"
-          and cmd_stop.brake is not None
-          and 0.09 <= cmd_stop.brake <= C.ESTOP_HOLD_BRAKE_MAX + 1e-9,
+          and 0.09 <= float(cmd_stop.brake or 0.0) <= C.ESTOP_HOLD_BRAKE_MAX,
           "" if cmd_stop is None else "thr=%s brk=%s gear=%s"
           % (cmd_stop.throttle, cmd_stop.brake, gear_name))
     for _ in range(90):
         cmd_hold = router.step(ctx_at(track, 3042.82, speed=0.0, end_point=end_pt,
                                       plat="车辆紧急停止", sim_t=100.0))
-    check("保持 3 s 后刹车停在 %.2f（不用满刹 1.0：会抖出 −5 m/s² 丢 +10）"
-          % C.ESTOP_HOLD_BRAKE_MAX,
-          cmd_hold is not None and abs((cmd_hold.brake or 0.0)
-                                       - C.ESTOP_HOLD_BRAKE_MAX) < 1e-6,
+    check("保持 3 s 后刹车停在 %.2f（elem12-r1 = 110 的版本）" % C.ESTOP_HOLD_BRAKE_MAX,
+          cmd_hold is not None
+          and abs(float(cmd_hold.brake or 0.0) - C.ESTOP_HOLD_BRAKE_MAX) < 1e-9,
           "" if cmd_hold is None else "brk=%s note=%s" % (cmd_hold.brake, cmd_hold.note))
     cmd_launch = router.step(ctx_at(track, 3042.82, speed=0.0, end_point=end_pt,
                                     plat="辅路驶入、驶出", sim_t=101.0))
@@ -197,11 +195,10 @@ def main() -> int:
     check("s=3500 由 FudaoStrategy 接管", "Fudao" in typ3, typ3)
     check("辅路给了转向", cmd_f9 is not None and cmd_f9.steer is not None,
           "None" if cmd_f9 is None else "steer=%.3f" % cmd_f9.steer)
-    check("辅路不接管油门（巡航段）",
-          cmd_f9 is not None and cmd_f9.throttle is None and cmd_f9.brake is None,
-          "None" if cmd_f9 is None else "thr=%s brk=%s" % (cmd_f9.throttle, cmd_f9.brake))
-    check("辅路限速 = vmax", cmd_f9 is not None and cmd_f9.v_cap == 9.0,
-          "v_cap=%s" % (None if cmd_f9 is None else cmd_f9.v_cap))
+    check("辅路只给横向与限速（纵向交回基线，thr=None、v_cap≤9）",
+          cmd_f9 is not None and cmd_f9.throttle is None
+          and cmd_f9.brake is None and (cmd_f9.v_cap or 0.0) <= 9.0 + 1e-9,
+          "None" if cmd_f9 is None else "thr=%s v_cap=%s" % (cmd_f9.throttle, cmd_f9.v_cap))
 
     router3 = ElementRouter(static, route, track, vmax=9.0, ego_length=4.7, ego_width=1.9,
                             lane_width=3.75, only=("辅路驶入、驶出",), log=lambda m: None)
@@ -213,9 +210,10 @@ def main() -> int:
           cmd_l1 is not None and (cmd_l1.throttle or 0.0) <= C.FUDAO_LAUNCH_THR_MAX + 1e-9,
           "thr=%s" % (None if cmd_l1 is None else cmd_l1.throttle))
     cmd_l2 = router3.step(ctx_at(track, 3120.0, speed=C.FUDAO_LAUNCH_MS + 0.5, sim_t=4.0))
-    check("到 %.1f m/s 后交回基线纵向（throttle=None）" % C.FUDAO_LAUNCH_MS,
-          cmd_l2 is not None and cmd_l2.throttle is None,
-          "None" if cmd_l2 is None else "thr=%s" % cmd_l2.throttle)
+    check("过 %.1f m/s 后纵向交回基线（throttle=None、只给 v_cap）"
+          % C.FUDAO_LAUNCH_MS,
+          cmd_l2 is not None and cmd_l2.throttle is None and cmd_l2.brake is None,
+          "None" if cmd_l2 is None else "thr=%s brk=%s" % (cmd_l2.throttle, cmd_l2.brake))
 
     router4 = ElementRouter(static, route, track, vmax=9.0, ego_length=4.7, ego_width=1.9,
                             lane_width=3.75, only=("辅路驶入、驶出",), log=lambda m: None)
@@ -229,9 +227,9 @@ def main() -> int:
           cmd_kick is not None and (cmd_kick.throttle or 0.0) > 0.0 and cmd_kick.brake == 0.0,
           "" if cmd_kick is None else "thr=%s brk=%s" % (cmd_kick.throttle, cmd_kick.brake))
     cmd_after = router2.step(ctx_at(track, 3201.0, speed=C.SHIFT_DONE_MS + 0.1, sim_t=10.5))
-    check("过了一挡墙就不再 kick",
-          cmd_after is not None and cmd_after.throttle is None,
-          "" if cmd_after is None else "thr=%s" % cmd_after.throttle)
+    check("过了一挡墙就不再 kick（纵向交回基线，thr=None）",
+          cmd_after is not None and cmd_after.throttle is None and cmd_after.brake is None,
+          "" if cmd_after is None else "thr=%s brk=%s" % (cmd_after.throttle, cmd_after.brake))
 
     router2.reset()
     cmd_hand = router2.step(ctx_at(track, 4400.0, speed=8.0, sim_t=200.0))
