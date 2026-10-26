@@ -30,7 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--skip-to-index", type=int, default=0,
                    help="已停用（本地 AGENTS.md 铁律 9）：只接受 0，非 0 直接报错退出")
-    p.add_argument("--vmax", type=float, default=8.0, help="速度上限 m/s")
+    p.add_argument("--vmax", type=float, default=7.8,
+                   help="速度上限 m/s（7.8 = 28.1 km/h，稳态巡航目标）")
     p.add_argument("--max-seconds", type=float, default=700.0, help="墙钟超时秒数")
     p.add_argument("--end-hold", type=float, default=HOLD_END_S, help="终点驻车保持秒数")
     p.add_argument("--shots", type=float, default=0.0, help="每隔多少秒存一张前视图（0=不存）")
@@ -51,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help=">0 时绕过速度环，整段直发这个油门（直行/恒速元素拿 +10 用）")
 
     p.add_argument("--no-elements", action="store_true", help="关掉元素级策略，全走基线")
+    p.add_argument("--no-border", action="store_true",
+                   help="关掉实线余量保护（默认开：车身四角离实线 ≥0.55 m）")
+    p.add_argument("--scene-root", default=r"D:\无人算法\场景包\scenes",
+                   help="场景包根目录（按路线指纹找 mapd 用）")
     p.add_argument("--elements-only", default="起步直行,车辆直行,连续转弯,环岛",
                    help="只让这些关键字对应的元素接管控制量（逗号分隔，空=全部）")
     p.add_argument("--lane-element", default="",
@@ -80,6 +85,8 @@ def make_config(args: argparse.Namespace) -> DriverConfig:
         elements=not args.no_elements,
         elements_only=only,
         lane_element=str(args.lane_element or "").strip(),
+        border_guard=not args.no_border,
+        scene_root=str(args.scene_root),
     )
 
 

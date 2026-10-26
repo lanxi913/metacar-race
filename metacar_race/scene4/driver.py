@@ -33,6 +33,7 @@ from metacar_race.control.profile import SpeedProfile
 from metacar_race.control.tracking import PurePursuit, SpeedController
 
 from . import config as C
+from .holdctl import HoldController
 from .lateral import Overtaker, ShiftRoute, Stanley
 from .longitudinal import AccelGovernor, SoftStart, limit_command
 from .obstacles import ObstacleScan, StallGuard, StuckWatch, TeleportWatch
@@ -86,10 +87,17 @@ class Driver:
         self.stall = StallGuard()
         self.stuck = StuckWatch()
         self.teleport = TeleportWatch()
+        # 强制停车状态机（2026-10-25 「必须停就一次停住」指令，见 holdctl.py）
+        self.hold = HoldController()
         self.light_gate = LightGate(enabled=cfg.light, log=self._say)
         self.end_park = EndPark(hold_seconds=cfg.end_hold,
                                 coast_only=cfg.caps[1] <= 0.001)
         self.router: ElementRouter | None = None
+        # 实线边界保护（懒加载：第一帧拿到 static.route 之后才按指纹找 mapd）
+        self.border = None
+        self.border_tried = False
+        self.ego_len = 4.70
+        self.ego_wid = 1.90
 
         # 逐帧状态
         self.sim_t = 0.0
@@ -107,7 +115,12 @@ class Driver:
         self._span_len = 0.0
         self._span_end = 0.0
         self._span_name = ""
-        self._shifted_ok = False        # 整局是否已成功升上二挡（m03278：只换一次）
+        self._shifted_ok = False        # （旧）整局是否已升上二挡——现在按次数计
+        self._shifts_done = 0           # 一局已成功升挡次数（上限 C.SHIFT_MAX_COUNT）
+        self._v_need = 0.0              # 剩余里程 ÷ 剩余时间（时钟需求，驱动升挡）
+        self._time_limit = 0.0          # 本元素限时（秒），每帧从 status 刷新
+        self.scene_t = 0.0              # 场景累计时间（status.used_time 是逐元素的，不能用来算总账）
+        self._v_need_elem = 0.0         # 本元素的时钟需求（剩余里程 ÷ 剩余时间）
         self.kick_until = -1.0
         self.last_kick = -1e9
         self.steer_prev = 0.0
@@ -117,6 +130,50 @@ class Driver:
         self._ended = False
 
     # ------------------------------------------------------------------ 小工具
+    def _stop_gap(self) -> float:
+        """跟停时"与前车中心的目标距离"。元素 8（车辆紧急停止）按规则是 5 m。"""
+        if "紧急停止" in str(self.cur_sub or "") or "紧急停止" in str(self._span_name or ""):
+            return float(C.EMERGENCY_STOP_GAP_M)
+        return float(C.BLOCK_STOP_GAP_M)
+
+    def _stop_extra(self) -> float:
+        if "紧急停止" in str(self.cur_sub or "") or "紧急停止" in str(self._span_name or ""):
+            return float(C.EMERGENCY_STOP_EXTRA)
+        return float(C.BLOCK_STOP_EXTRA)
+
+    def _must_stop(self) -> bool:
+        """本段是不是"规则要求必须停住"（车辆紧急停止）。"""
+        if "紧急停止" in str(self.cur_sub or "") or "紧急停止" in str(self._span_name or ""):
+            return True
+        return False
+
+    def _load_borders(self, static) -> None:
+        """按路线指纹找 mapd、索引实线线段。失败就是没有保护，不抛异常。"""
+        if self.border_tried:
+            return
+        self.border_tried = True
+        if not getattr(self.cfg, "border_guard", True):
+            self._say("[border] 实线保护已关闭（--no-border）")
+            return
+        try:
+            from . import borders as B
+
+            mapd = B.find_mapd(list(getattr(static, "route", []) or []),
+                               scene_root=getattr(self.cfg, "scene_root", B.DEFAULT_SCENE_ROOT))
+            if mapd is None:
+                self._say("[border] 没认出场景包，实线保护关闭")
+                return
+            segs = B.load_solid_segments(mapd)
+            grid = B.BorderGrid(segs, cell=float(C.BORDER_CELL_M))
+            if not grid:
+                self._say("[border] mapd 里没有实线，保护关闭")
+                return
+            self.border = grid
+            self._say(f"[border] 实线 {len(segs)} 段（{mapd}），余量目标 "
+                      f"{C.BORDER_SAFE_M:.2f} m")
+        except Exception as exc:                            # noqa: BLE001
+            self._say(f"[border] 载入失败，实线保护关闭: {exc!r}")
+
     def _say(self, msg: str) -> None:
         print(msg, flush=True)
 
@@ -197,7 +254,10 @@ class Driver:
                     self.sim_t += self.dt
                 self.log.sim_t = self.sim_t
                 self.log.frame = frame
+                self.scene_t += self.dt
                 sub = (status.sub_scene_name or "") if status is not None else ""
+                # 本场限时（平台给的几何量，用来算"剩余里程 ÷ 剩余时间"的时钟需求）
+                self._time_limit = float(getattr(status, "time_limit", 0.0) or 0.0)
 
                 # ---- 元素切换：复位与开关都在这里 ------------------------
                 if sub != self.cur_sub:
@@ -291,22 +351,45 @@ class Driver:
                 # 判据改成"相对自车当前所在车道"：`|lat − lat_off| ≤ LANE_HALF_M`。
                 if blk_ctrl is not None and abs(float(blk_ctrl["lat"]) - float(lat_off)) > C.LANE_HALF_M:
                     blk_ctrl = None
+                # ---- 强制停车（一次停住，不再"油门刹车打架"）--------------
+                # 2026-10-25 p4/p5 元素 8 实测：旧逻辑在这里算 `v_kin`、在安全闸里
+                # 又按 `gap_free < 1.0` 补一脚 `brk=0.35`（a_cmd=−35，车端 −13~−18
+                # m/s²），两处各说各话 → 停到 5.9 m 后又被低速限幅 `thr=0.28` 推着
+                # 蹭到 4.9 m，17 秒里 67 帧刹车。现在只有一个地方能决定"停"：
+                # `HoldController`（run→decel→hold→release），这里只取它的结论。
+                d_true = None
                 if blk_ctrl is not None:
-                    # 「可用空隙」要扣掉两段余量：BLOCK_MARGIN_M（车头余量）+ 
-                    # BLOCK_STOP_MARGIN_M（停车余量）。元素 8 实测 dist 是中心到中心，
-                    # 只扣 4.8 m 时以为还有 1 m，实际保险杠已贴上（撞车 −10.59）。
-                    d_free = float(blk_ctrl["dist"]) - C.BLOCK_STOP_GAP_M
-                    if d_free < C.BLOCK_SLOW_M:
-                        # 运动学安全车速，并且把前车自身的速度算进去：
-                        # 前车还在动就不该按"它停着"来规划，否则目标速度会低到
-                        # 逼出急刹。v = v_lead + sqrt(2·a·d_free)。
-                        v_lead = abs(float(blk_ctrl.get("v") or 0.0))
-                        v_kin = v_lead + math.sqrt(max(0.0, 2.0 * C.BLOCK_DECEL *
-                                                       max(d_free, 0.0)))
-                        v_tgt = min(v_tgt, v_kin)
+                    try:
+                        d_true = math.hypot(float(blk_ctrl["x"]) - float(x),
+                                            float(blk_ctrl["y"]) - float(y))
+                    except (KeyError, TypeError, ValueError):
+                        d_true = None
+                hcmd = self.hold.update(blk=blk_ctrl,
+                                        stop_gap=self._stop_gap(),
+                                        extra=self._stop_extra(),
+                                        speed=float(speed), dt=self.dt,
+                                        must_stop=self._must_stop(),
+                                        d_true=d_true)
+                if hcmd.mode != "run":
+                    self.log.event("hold", mode=hcmd.mode,
+                                   d_free=None if hcmd.d_free is None
+                                   else round(float(hcmd.d_free), 2),
+                                   v=round(float(speed), 2))
+                if hcmd.v_cap is not None:
+                    v_tgt = min(v_tgt, float(hcmd.v_cap))
                 if ov.get("blocked") or ov["state"] in ("SHIFT_OUT", "SHIFT_BACK"):
                     v_hold = ov.get("v_hold")
-                    v_tgt = max(0.0, float(v_hold)) if v_hold is not None else min(v_tgt, 4.0)
+                    if v_hold is None:
+                        v_tgt = min(v_tgt, 4.0)
+                    elif C.OVERTAKE_HOLD_NO_ACCEL:
+                        # 2026-10-25 p4 元素 6 实测：`v_hold` 是**进并线那一刻**的速度
+                        # （8.00），车一边打舵一边掉到 5.78，速度误差 2.2 m/s 把油门顶到
+                        # 0.56（a_cmd = 4.5，正好卡在限幅上），换挡/扭矩台阶让平台连看
+                        # 11 帧 8.48 m/s² → 丢 +10。并线期间只"保持"，不追目标电压：
+                        # 目标夹到当前车速，提速全部留给 PASS 直线段。
+                        v_tgt = min(float(v_hold), float(speed))
+                    else:
+                        v_tgt = max(0.0, float(v_hold))
 
                 # ---- 信号灯闸门 -------------------------------------------
                 light = self.light_gate.update(groups=list(msg.traffic_light_groups or []),
@@ -341,26 +424,83 @@ class Driver:
                     cmd = self.router.step(ctx)
                     if cmd is not None and cmd.v_cap is not None:
                         v_tgt = min(v_tgt, float(cmd.v_cap))
+                    if self.border is None:
+                        self._load_borders(static)
+                    self.ego_len = float(car.length or 4.70)
+                    self.ego_wid = float(car.width or 1.90)
 
-                # ---- 长元素速度下限（m03278） ------------------------------
-                # 元素 2（连续转弯 1023 m / 限时 200 s）必须 ≥5.12 m/s 才不超时；
-                # 取 6.0 是因为它落在二挡稳态区，低于 6.0 车就会在 4.3~4.8 的一挡墙
-                # 上反复穿越，每穿一次都要重新升挡，而每次升挡都是 6~9 m/s² 的尖峰
-                # （curve-r11 元素 2 因此被误开 4 次闸门、丢了 +10）。
-                _tail_left = float(getattr(self, "_span_end", 0.0)) - float(s_now)
-                _floor_ok = (
-                    float(getattr(self, "_span_len", 0.0)) >= C.SHIFT_MIN_SPAN_M
-                    and _tail_left > C.LONG_SPAN_FLOOR_TAIL_M
-                    and (blk_ctrl is None or float(blk_ctrl["dist"]) > C.BLOCK_SLOW_M)
-                    and not bool(ov.get("blocked"))
-                    and (light.v_cap is None or float(light.v_cap) >= C.LONG_SPAN_MIN_MS)
-                )
-                if _floor_ok and float(v_tgt) < C.LONG_SPAN_MIN_MS:
-                    if float(v_tgt) < C.LONG_SPAN_MIN_MS - 0.05:
-                        self.log.event("span_floor", tgt=round(float(v_tgt), 2),
-                                       floor=C.LONG_SPAN_MIN_MS,
-                                       span=getattr(self, "_span_name", ""))
-                    v_tgt = C.LONG_SPAN_MIN_MS
+                # ---- 长元素速度下限（已删除） ------------------------------
+                # 2026-10-25：原来这里有一张"元素长度 ≥200 m 就强行把目标车速抬到
+                # 6.0 m/s"的表，本质是把 p2/p4 的经验写成答案（记忆题）。它还会和
+                # 一挡墙打架：抬到 6.0 但车只能跑 4.78，于是反复穿越墙、反复开升挡闸门。
+                # 现在速度目标只由现场量算的包络决定（曲率/跟车/边线/信号/元素），
+                # 升挡改由"剩余里程 ÷ 剩余时间"的时钟需求驱动（见 _shift_gate）。
+                _v_need = 0.0
+                try:
+                    _total = float(self.track.length) if self.track is not None else 0.0
+                    _remain_m = _total - float(s_now)
+                    _remain_t = float(C.SCENE_TIME_LIMIT_S) - float(self.scene_t)
+                    if _remain_m > 0.0 and _remain_t > 1.0:
+                        _v_need = _remain_m / _remain_t
+                except (TypeError, ValueError, AttributeError):
+                    _v_need = 0.0
+                self._v_need = _v_need
+
+                # ---- 元素时钟（每个元素自己的 200 s）-----------------------
+                # 2026-10-26 p7 实测：`SceneStatus` 是**逐元素**的
+                # （`sub_scene_name` + `used_time` + `time_limit`），元素 9（辅路
+                # 1337 m / 限时 200 s）平均要 6.69 m/s；按曲率律只跑 5.5~6.0 m/s，
+                # 结果 used_time 到 200 s 时还没走完 → 平台把车瞬移回元素起点重跑，
+                # 连跳 3 次（p7 帧数 33600、元素 9 反复重来）。
+                # 这条"元素时钟律"不猜场景：剩余里程 ÷ 剩余时间就是必须达到的车速，
+                # 低于它就按需抬到（上限 vmax）。这也是当初那张"长元素抬到 6.0"的表
+                # 真正在干的事——现在改成算出来的。
+                _v_need_elem = 0.0
+                try:
+                    _lim = float(getattr(self, "_time_limit", 0.0) or 0.0)
+                    _left_t = _lim - float(self.sim_t)
+                    _left_m = float(getattr(self, "_span_end", 0.0)) - float(s_now)
+                    if _lim > 1.0 and _left_t > 0.5 and _left_m > 0.0:
+                        _v_need_elem = _left_m / _left_t
+                except (TypeError, ValueError, AttributeError):
+                    _v_need_elem = 0.0
+                self._v_need_elem = _v_need_elem
+
+
+                # ---- 包络：实线余量 → 车速上限 ---------------------------
+                # 余量越窄越慢（`v_free × clamp(c/SAFE, 0.6, 1.0)`）。这是"边线律"，
+                # 用的是车到实线的实测余量，不是任何场景/元素的经验值。
+                self._border_clear = None
+                if (not (cmd is not None and cmd.final)) and (not hcmd.lock) \
+                        and self.border is not None and abs(float(speed)) > 0.5:
+                    try:
+                        _bc, _bside, _bp = self.border.clearance(
+                            x, y, yaw, self.ego_len, self.ego_wid)
+                        self._border_clear = float(_bc)
+                        if _bc < C.BORDER_SLOW_M:
+                            _v_border = float(self.cfg.vmax) * max(
+                                0.70, float(_bc) / C.BORDER_SLOW_M)
+                            if _v_border < float(v_tgt) - 0.05:
+                                self.log.event("border_cap", d=round(float(_bc), 2),
+                                               cap=round(float(_v_border), 2),
+                                               tgt=round(float(v_tgt), 2))
+                                v_tgt = _v_border
+                    except Exception:  # noqa: BLE001
+                        self._border_clear = None
+
+                # ---- 元素时钟兜底：赶不上就加速（不许被瞬移）----------------
+                if (_v_need_elem > 0.0 and not hcmd.lock
+                        and blk_ctrl is None
+                        and float(v_tgt) < _v_need_elem * C.ELEM_CLOCK_MARGIN):
+                    _v_clock = min(float(self.cfg.vmax),
+                                   _v_need_elem * C.ELEM_CLOCK_MARGIN)
+                    if _v_clock > float(v_tgt) + 0.05:
+                        self.log.event("elem_clock", need=round(_v_need_elem, 2),
+                                       tgt=round(float(v_tgt), 2),
+                                       raise_to=round(float(_v_clock), 2),
+                                       left_m=round(float(getattr(self, "_span_end", 0.0)) - float(s_now), 1),
+                                       left_t=round(float(getattr(self, "_time_limit", 0.0)) - float(self.sim_t), 1))
+                        v_tgt = _v_clock
 
                 # ---- 速度环 -----------------------------------------------
                 v_tgt = self.accel_gov.apply_trim(v_tgt)
@@ -408,22 +548,36 @@ class Driver:
                 # 2026-10-25 元素 8 教训：原来要求 `dist < 7.0` 才动手，7 m 处 v=7 m/s
                 # 需要 4.2 m/s² 才停得住 —— 软刹做不到，只能 brk=0.35 硬刹（a_cmd=−35，
                 # 还撞了前车 −10.59）。改成**按"需要多大减速度"提前触发**：一旦需要的
-                # 减速度超过 BLOCK_DECEL_URGENT 就上软刹（a_cmd=−5，正好卡预算），
-                # 只有当软刹都救不回来（>BRAKE_EMERG_DECEL_MS2）才用 0.35。
-                if blk_ctrl is not None and speed > 0.30:
+                # 减速度超过 BLOCK_DECEL_URGENT 就上软刹（a_cmd=−5，正好卡预算）。
+                # 2026-10-25 「强制停车」改造：硬刹 0.35 只在"真的贴脸了"(<0.35 m) 才准用，
+                # 正常跟停全部交给 HoldController（它会在目标点前就锁定），不再制造
+                # −13~−18 m/s² 的刹车事件。
+                if blk_ctrl is not None and speed > 0.30 and not hcmd.lock:
                     gap = float(blk_ctrl["dist"])
-                    gap_free = gap - C.BLOCK_STOP_GAP_M
+                    gap_free = gap - self._stop_gap()
                     v_lead = abs(float(blk_ctrl.get("v") or 0.0))
                     need = max(0.0, float(speed) ** 2 - v_lead ** 2) / \
                         (2.0 * max(gap_free, 0.25))
                     if need > C.BLOCK_DECEL_URGENT or gap_free < 2.0:
-                        hard = need > C.BRAKE_EMERG_DECEL_MS2 or gap_free < 1.0
+                        hard = gap_free < 0.35
                         thr, brk = 0.0, (0.35 if hard else C.BRAKE_SOFT_CMD)
                         self.log.event("hard_brake", dist=round(gap, 2),
                                        brk=round(brk, 3), need=round(need, 2))
 
                 thr_cap, brk_cap, a_limit, slew = self.cfg.caps
                 thr = max(0.0, min(thr_cap, thr))
+                # ---- 低速油门限幅 -----------------------------------------
+                # 2026-10-25 p4 元素 9（辅路入口）实测：进元素时车正好停着（v=0.14，
+                # 前车 4.89 m），一键油门 0.56 直接把车从 0.14 甩到 8.42 m/s（1.2 s，
+                # 实测 8.0~8.3 m/s²、41 帧超限）→ 丢 +10。平台只豁免**开局** 0.5 s，
+                # 中途停车再起步没有豁免，所以低速段一律压油门：一挡低速扭矩太大，
+                # 0.56 在 0~3 m/s 区间根本不止 4.5 m/s²（a_cmd 是折算值，不是实测值）。
+                if not (cmd is not None and cmd.final) and self.cfg.low_speed_cap:
+                    v_abs = abs(float(speed))
+                    if v_abs < C.LOW_SPEED_THR_MS:
+                        thr = min(thr, C.LOW_SPEED_THR_CAP)
+                    elif v_abs < C.MID_SPEED_THR_MS:
+                        thr = min(thr, C.MID_SPEED_THR_CAP)
                 brk = max(0.0, min(brk_cap, brk))
 
                 # ---- 横向 -------------------------------------------------
@@ -471,7 +625,49 @@ class Driver:
                 # 的怠速油门，放在覆盖之前会被它盖掉（实测 launch_bite 一次没触发）。
                 # 元素 final（泊车全权接管）不插手；堵停（安全闸）也不插手。
                 _final = bool(cmd is not None and cmd.final)
+
+                # ---- 强制停车：锁定 ---------------------------------------
+                # 用户要求「必须停的时候一次停住，不要顿顿卡卡」。锁定期间只允许
+                # 这一支说话：油门归零、刹车 `HOLD_BRAKE=0.05`（a_cmd=−5 卡线）把车
+                # 收到 `HOLD_LOCK_MS=0.12` 以下，再挂 P 挡 + 满刹——P 挡后速度恒定
+                # −0.00，保持期零抖动（上下坡驻车场景实测），也不会有"再给油再蹭"
+                # 的抽搐。放行由 `holdctl` 的 release 负责（一次咬合油门，早咬合）。
+                if hcmd.lock and not _final:
+                    thr, brk = 0.0, C.HOLD_BRAKE
+                    # 2026-10-25：锁是从"再晚就刹不住"那一点开始（可能离目标还有
+                    # 20+ m），这段滑行里仍然要跟线，不能把舵打死；只有真正停住
+                    # 之后才把舵回正，免得保持期车轮摆着、松刹时带着横向速度。
+                    if abs(float(speed)) <= C.HOLD_LOCK_MS:
+                        brk = 1.0
+                        steer = 0.0
+                        gear = GearMode.PARKING
+                elif hcmd.bite and not _final:
+                    # 放行那一帧：复刻场景起始起步（咬合油门一次到位）。
+                    thr = max(float(thr), C.LAUNCH_THR)
+                    brk = 0.0
+                    self.log.event("hold_bite", v=round(float(speed), 2),
+                                   thr=round(C.LAUNCH_THR, 3))
+
+                # ---- 实线余量保护 ----------------------------------------
+                # p2 / p4 的环岛出口，车身四角离实线的最近余量分别是 0.02 / 0.01 m
+                # （`tools/replay_score.py --lines` 实测，都在 (-3028,-889) 一带），
+                # 平台却只把 p4 判成「压道路边线 -20」——1 cm 的差别任何控制都保证
+                # 不了。所以这里不追求"贴着线走"，而是把余量整体抬到
+                # `BORDER_SAFE_M` 以上：近侧在左就往右带舵，在右就往左带舵。
+                # 泊车（final）不插手：车本来就要挪进车位、贴着车位线走。
+                if (not _final) and (not hcmd.lock) and self.border is not None \
+                        and abs(float(speed)) > 0.5:
+                    d_line, side, _near = self.border.clearance(
+                        x, y, yaw, self.ego_len, self.ego_wid)
+                    self._border_clear = float(d_line)
+                    if d_line < C.BORDER_SAFE_M:
+                        bias = min(C.BORDER_STEER_MAX,
+                                   C.BORDER_STEER_K * (C.BORDER_SAFE_M - d_line))
+                        steer = max(-1.0, min(1.0, float(steer) + side * bias))
+                        self.log.event("border_guard", d=round(float(d_line), 2),
+                                       side=int(side), bias=round(float(bias), 3))
                 if (not _final
+                        and not hcmd.lock
                         and not (cmd is not None and cmd.coast)
                         and abs(float(speed)) < C.LAUNCH_BITE_MS
                         and float(v_tgt) > C.LAUNCH_DEMAND_MS
@@ -486,12 +682,12 @@ class Driver:
                 # ---- 升挡闸门（一挡墙；唯一允许超过 0.62 油门的通道）---------
                 # 元素策略宣布 final（泊车这种全权接管）时不许基线再改油门——
                 # 泊车用的油门是 0.010 级的怠速量，被闸门抬到 0.86 会直接冲出车位。
-                if not _final:
+                if not _final and not hcmd.lock:
                     thr, brk = self._shift_gate(speed, v_tgt, thr, brk)
 
                 # ---- 终点驻车 ---------------------------------------------
                 remain = self.track.length - s_now
-                if self.phase == "run" and remain < 3.0 and not _final:
+                if self.phase == "run" and remain < 3.0 and not _final and not hcmd.lock:
                     self.phase = "hold"
                     self._say(f"[{self.sim_t:6.1f}s] 到终点前 3 m，进入驻车")
                 if self.phase == "hold" and not _final:
@@ -557,7 +753,7 @@ class Driver:
             if float(speed) >= C.SHIFT_DONE_MS or (now - self._shift_t0) >= C.SHIFT_MAX_S + 0.5:
                 self.shift_until = -1.0
                 if float(speed) >= C.SHIFT_DONE_MS:
-                    self._shifted_ok = True      # 全局只换这一次（m03278）
+                    self._shifts_done = int(getattr(self, "_shifts_done", 0)) + 1
                 self.log.event("shift_done", v=round(float(speed), 2),
                                ok=float(speed) >= C.SHIFT_DONE_MS)
                 self._say(f"[{now:6.1f}s] 升挡完成：v={speed:.2f}")
@@ -565,23 +761,34 @@ class Driver:
             return C.SHIFT_THROTTLE, 0.0
 
         stuck = abs(float(speed) - C.KICK_WALL_MS) <= C.KICK_WALL_TOL_MS
+        # 只认"贴墙贴住"：二挡路过 4.78 m/s 只是一瞬间，一挡才会长期停在墙上。
+        # 用驻留时间把这两种情况分开，避免二挡里误开闸门白丢一个 +10。
+        self._wall_t = (float(getattr(self, "_wall_t", 0.0)) + self.dt) if stuck else 0.0
+        stuck = self._wall_t >= C.SHIFT_WALL_HOLD_S
         want = float(v_tgt) >= C.SHIFT_TARGET_MS - 0.01
         long_span = (float(getattr(self, "_span_len", 0.0)) >= C.SHIFT_MIN_SPAN_M
                      or bool(getattr(self, "_pre_shift_ok", False)))
-        # m03278：换挡整局只做一次，而且放在不评分的「起步直行」段（0~8.2 m）里做完。
-        # 一个 8.2 m 的段里车 1 s 就到一挡墙，所以这一段的闸门随便开；成功升上去之后
-        # 全局不再开闸（curve-r11 是「每个元素一次」，元素 2 里仍被触发 4 次）。
+        # 2026-10-25 重构：原来是「整局只换一次挡，而且只准在起步段做」——那是把
+        # p2/p4 的经验写成答案（记忆题），结果元素 9~11 共 1575 m 死钉 4.78 m/s，
+        # 多花 117 s、整场 1540 s 超时。现在改成**时钟需求驱动**：
+        #   need = 剩余里程 ÷ 剩余时间；
+        # 只要 need 还低于一挡墙（4.78），就不值得为它付一个元素的 +10；
+        # need 一旦超过 SHIFT_NEED_MS，说明不升挡一定超时，才开闸。
+        # 一局最多 SHIFT_MAX_COUNT 次（每次代价 ≈ 一个元素的 +10，必须有限额）。
+        need = float(getattr(self, "_v_need", 0.0) or 0.0)
+        urgent = need >= C.SHIFT_NEED_MS
+        count_ok = int(getattr(self, "_shifts_done", 0)) < int(C.SHIFT_MAX_COUNT)
         in_start = str(getattr(self, "_span_name", "")) == C.START_SPAN_NAME
-        once = (not bool(getattr(self, "_shifted_ok", False))
-                and (in_start or self._gate_span != getattr(self, "_cur_span_index", None)))
-        if (stuck and want and (long_span or in_start) and once
+        once = (in_start or self._gate_span != getattr(self, "_cur_span_index", None))
+        if (stuck and want and count_ok and (long_span or in_start or urgent) and once
                 and (now - self.last_shift) >= C.SHIFT_MIN_GAP_S):
             self.last_shift = now
             self._shift_t0 = now
             self._gate_span = getattr(self, "_cur_span_index", None)
             self.shift_until = now + C.SHIFT_MAX_S
             self.log.event("shift_gate", v=round(float(speed), 2),
-                           tgt=round(float(v_tgt), 2), thr=C.SHIFT_THROTTLE)
+                           tgt=round(float(v_tgt), 2), thr=C.SHIFT_THROTTLE,
+                           need=round(need, 2), urgent=urgent)
             self._say(f"[{now:6.1f}s] 开升挡闸门：v={speed:.2f} 目标={v_tgt:.2f}，"
                       f"油门 {C.SHIFT_THROTTLE:.2f}（最长 {C.SHIFT_MAX_S:.1f}s）")
             return C.SHIFT_THROTTLE, 0.0
