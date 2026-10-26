@@ -512,12 +512,12 @@ class SlotParkStrategy(Strategy):
         if self.phase == "STOP":
             if abs(ctx.speed) <= 0.10:
                 self.ctl = ParallelParkingController()
-                # 把参考控制器的 FIT 容差收紧到 PARK_TOL_XY_M（它原值 0.35 m 太松，
-                # 收尾位置会差 30 cm 量级）；20 s 内收不拢由 PARK 段放宽回原值。
+                # FIT 容差分开给：横向必须容得下 PARK_SLOT_BIAS_M（落点回正时控制器看到的
+                # dx≈+0.29），纵向按参考实现的 15 cm 收紧；20 s 内收不拢由 PARK 段统一放宽。
                 try:
                     import metacar_race.control.parallel_parking as _pp
-                    _pp.PARALLEL_TOL_DX_M = C.PARK_TOL_XY_M
-                    _pp.PARALLEL_TOL_DY_M = C.PARK_TOL_XY_M
+                    _pp.PARALLEL_TOL_DX_M = C.PARK_TOL_DX_M
+                    _pp.PARALLEL_TOL_DY_M = C.PARK_TOL_DY_M
                 except Exception:
                     pass
                 self.fit_t = 0.0
@@ -535,9 +535,12 @@ class SlotParkStrategy(Strategy):
 
         if self.phase in ("PARK", "DONE") and self.ctl is not None:
             pose_t = SimpleNamespace(pos_x=X, pos_y=Y, ori_z=yaw_t)
+            # 车位中心沿 -X 偏 PARK_SLOT_BIAS_M：参考控制器按 lateral=|sx-x| 算圆弧角度，
+            # 而它的舵角斜坡会让实际横移恒少 ≈0.29 m（四局实测 dx=+0.266~+0.318），
+            # 偏置后设计横移变大、落点回到真实车位中心。偏置只影响它自己的坐标系。
             obs_t = [SimpleNamespace(
                 type=SimpleNamespace(value=PARALLEL_SLOT_TYPE, name="PARKING_SLOT"),
-                pos_x=0.0, pos_y=0.0, ori_z=90.0,
+                pos_x=-C.PARK_SLOT_BIAS_M, pos_y=0.0, ori_z=90.0,
                 length=slot.length, width=slot.width)]
             # 邻车也要一起扔进模板坐标系（参考实现靠"远端那辆车"定 staging 点）。
             # ctx.obstacles 是 ObstacleScan 的 dict，type 是 int（CAR = 6）。
@@ -597,6 +600,7 @@ class SlotParkStrategy(Strategy):
                 self.phase = "DONE"
                 lo_la, hi_la, lo_lo, hi_lo = self._envelope(X, Y, yaw_t)
                 self._say(f"[park] 入库完成 dx={info.dx:+.2f} dy={info.dy:+.2f} "
+                          f"（真实 X={X:+.2f} Y={Y:+.2f}，偏置 {-C.PARK_SLOT_BIAS_M:+.2f}）"
                           f"yaw_err={info.yaw_error:.1f}° theta={info.theta:.1f}° | "
                           f"横向 {lo_la:+.2f}..{hi_la:+.2f}（库边 ±{slot.width / 2.0:.2f}）"
                           f" 纵向 {lo_lo:+.2f}..{hi_lo:+.2f}（库边 ±{slot.length / 2.0:.2f}）"

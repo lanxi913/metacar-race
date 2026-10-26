@@ -173,6 +173,16 @@ def main() -> int:
         dx = float(getattr(strat.ctl, "dx", 0.0) or 0.0)
         dy = float(getattr(strat.ctl, "dy", 0.0) or 0.0)
         check("入库落点 |dx| ≤ 0.8 m", abs(dx) <= 0.8 or not done, f"dx={dx:+.2f}")
+        lat_seen = float(strat.ctl.geom.get("lateral", 0.0) or 0.0)
+        check("控制器看到的设计横移含 PARK_SLOT_BIAS_M（≈ staging 横向 + 0.29）",
+              lat_seen >= abs(strat.lat_target) + C.PARK_SLOT_BIAS_M - 0.15,
+              f"lateral={lat_seen:+.2f} staging={abs(strat.lat_target):.2f} "
+              f"bias={C.PARK_SLOT_BIAS_M:.2f}")
+        Xf, Yf, _ = strat.to_t(x, y, yaw)
+        # 注意：这里的简化执行器没有真实舵机滞后，横向"亏欠"复现不出来，
+        # 偏置在仿真里会表现为过冲，所以只做粗检（真值以跑次为准）。
+        check("入库真实落点 |X| ≤ 0.45 m（仿真无舵机滞后，仅粗检）",
+              abs(Xf) <= 0.45 or not done, f"X={Xf:+.2f} Y={Yf:+.2f}")
     # DONE 之后：驻车保持
     hold = strat.step(ctx_at(x, y, yaw, 0.0))
     check("DONE 后输出驻车保持（P 挡 + 满刹 + final）",
