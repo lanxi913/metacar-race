@@ -1,3 +1,5 @@
 vla2/models/*.pt
 vla2/models/*.bin
 vla2/models/*.onnx
+__pycache__/
+*.pyc
