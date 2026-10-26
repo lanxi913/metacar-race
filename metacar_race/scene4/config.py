@@ -306,7 +306,8 @@ ESTOP_CREEP_TARGET_MS = 0.25    #: 蠕行的目标速度
 ESTOP_CREEP_LIMIT_S = 6.0       #: 蠕行最长时间（超时就不再往前挪）
 ESTOP_STUCK_ALONG_M = 0.30      #: 停在这里还没到点、也推不动：算停住（避免一直蠕行）
 ESTOP_NEAR_ALONG_M = 3.0        #: 进入这个距离才记「近线平台元素名」（交棒判据的基线）
-ESTOP_HOLD_RAMP_S = 1.0         #: 保持段刹车从 0.10 爬到 ESTOP_HOLD_BRAKE_MAX 的时间（避免阶跃）
+ESTOP_HOLD_RAMP_S = 1.0         #: 保持段刹车斜坡时间（零指令保持版本不再用，留作回退）
+ESTOP_HOLD_IDLE_MS = 0.30       #: 保持段只在速度超过它时补一帧 0.10 轻刹（静止车不踩刹车）
 ESTOP_RELEASE_MAX_S = 12.0      #: 兜底：最多保持这么久就交棒（平台元素名一直没变时）
 
 # ---- 元素 8 第二轮：加速度 +10 与零刹车起跑（2026-10-25，elem89-r1 实测）-------
@@ -353,8 +354,14 @@ FUDAO_KICK_MIN_GAP_S = 6.0      #: 两次 kick 的最小间隔
 FUDAO_LAUNCH_MS = 7.00          #: 起跑缓升的目标速度，到这速度就交回基线纵向
 FUDAO_LAUNCH_THR_MAX = 0.30     #: 缓升期间的油门上限（二挡 ~3.5 m/s²，进不了加速度事件）
 FUDAO_LAUNCH_RAMP_PER_S = 0.10  #: 缓升斜率（0→0.30 要 3 s）
-# 纵向交回基线（不在辅路里自己踩油门）。elem12-r1 就是这样拿到元素 9 = 110 的；
-# 当天下午试过「辅路自己接管纵向」（巡航律 8.8 m/s + 0.02/帧油门），掉回 100，已撤回。
+# 纵向自己接管（不再交回基线）。elem12-r2（2026-10-26 12:11）的元素 9 就是这一版：
+# 起跑缓升到 7 m/s 后按巡航律继续给油，全程 0 帧刹车、|a| 峰值 4.11、vmax 9.63。
+FUDAO_CRUISE_MS = 8.80          #: 巡航目标速度（1336.7 m / 200 s 需 ≥6.68，留余量）
+FUDAO_CRUISE_UNDER_MS = 8.60    #: 低于这个速度就加油（0.02/帧）
+FUDAO_CRUISE_OVER_MS = 9.20     #: 高于这个速度就收油（0.02/帧）
+FUDAO_CRUISE_THR_STEP = 0.02    #: 每帧油门步长（0.02 ≈ 0.6 m/s²，进不了加速度事件）
+FUDAO_CRUISE_THR_MAX = 0.20     #: 巡航油门上限（二挡 0.20 约 9 m/s）
+FUDAO_HOLD_BACK_GAP_M = 25.0    #: 前方 25 m 内有车/灯时交回基线（不在辅路里自己跟停）
 
 # ---- 元素 12「平行车道泊车」（2026-10-25 新增）--------------------------------
 # 依据 main 的 `metacar_race/control/parallel_parking.py`（PR#19，平行泊车连续 5 次
@@ -382,8 +389,11 @@ PARK_HANDOVER_REM_M = 0.30      #: 距 staging 这么多米、且速度够低就
 PARK_HANDOVER_MS = 0.30         #: 交给控制器时的速度上限
 PARK_HANDOVER_LAT_M = 0.45      #: 交给控制器时的侧向误差上限（超过就继续修）
 PARK_HOLD_BRAKE = 0.55          #: 入库完成后的驻车刹车（同元素 8，不用 1.00）
-PARK_ALIGN_MS = 3.20            #: 对齐段巡航上限（= PARALLEL_V_APPROACH；elem12-r1 = 200 分的版本）
-PARK_ALIGN_DECEL_MS2 = 0.50     #: 对齐段规划减速度（= PARALLEL_A_MAX，elem12-r1 的原值；1.0 会晚 1.4 倍刹车、冲过 staging）
+PARK_ALIGN_MS = 6.00            #: 对齐段巡航上限（6.0：接近 70 m 从 22 s 缩到 ~13 s）
+PARK_ALIGN_DECEL_MS2 = 1.00     #: 对齐段规划减速度（√(2·1.0·dist)，6 m/s 在 18 m 处开始收）
+PARK_TOL_XY_M = 0.15            #: 交给控制器后的 FIT 容差（收紧到 15 cm 才允许收尾）
+PARK_FIT_TIMEOUT_S = 20.0       #: FIT 超时（超时把容差放宽，先停进去再说）
+PARK_TOL_RELAX_M = 0.35         #: 超时后放宽的容差（= 参考控制器原值）
 
 
 @dataclass

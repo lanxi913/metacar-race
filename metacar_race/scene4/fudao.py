@@ -20,9 +20,9 @@
   （m03278，元素 1 已经用掉）⇒ 元素 9 只能自己补一次升挡 kick：油门 0.86→0.88，
   贴着一挡墙触发（元素 1 实测 0.86 顶 0.43 s 就升挡）。
 
-纪律：本策略只接管 `steer` 与（kick 期间的）`throttle`，纵向巡航仍交基线；
-`v_cap` 给 `vmax` 只是不让基线自己踩到 9 以上。元素 10 在 6 m 之外，提前 `return None`
-把控制权还给基线，绝不抢占后面的元素。
+纪律：本策略接管 `steer` 与纵向（起跑缓升 → 巡航律 `FUDAO_CRUISE_*` 自己给油门，
+全程 `brake = 0`）；前方 `FUDAO_HOLD_BACK_GAP_M` 内有车/灯时交回基线跟停。
+元素 10 在 6 m 之外，提前 `return None` 把控制权还给基线，绝不抢占后面的元素。
 """
 from __future__ import annotations
 
@@ -59,6 +59,7 @@ class FudaoStrategy(Strategy):
         self.handed = False
         self.launch_thr = 0.0
         self.launch_done = False
+        self.cruise_thr = 0.0
         self._log("[fudao] 接管：%.1f → %.1f m（%.1f m），vmax=%.2f，kick=%s"
                   % (self.s_start, self.s_end, max(0.0, self.s_end - self.s_start),
                      self.vmax, "on" if C.FUDAO_KICK_ON else "off"))
@@ -125,6 +126,7 @@ class FudaoStrategy(Strategy):
         self.handed = False
         self.launch_thr = 0.0
         self.launch_done = False
+        self.cruise_thr = 0.0
         if self.pursuit is not None:
             try:
                 self.pursuit.reset()
@@ -172,12 +174,22 @@ class FudaoStrategy(Strategy):
                 return Command(steer=steer, throttle=round(self.kick_thr, 3), brake=0.0,
                                note="fudao kick v=%.2f thr=%.2f" % (speed, self.kick_thr))
 
-        # 4) 常规：只给横向与限速，**纵向交回基线**。
-        #    这是 elem12-r1（2026-10-26 11:24）拿 110 的版本；当天下午试过自己接管纵向
-        #    （巡航律 8.8 m/s + 0.02/帧油门），元素 9 掉回 100（elem12-r2），已回退。
-        cap = min(float(self.vmax or 9.0), 9.0)
-        return Command(steer=steer, v_cap=cap,
-                       note="fudao v=%.2f 剩 %.0f m" % (speed, remain))
+        # 4) 巡航：自己接管纵向（不再交回基线）。
+        #    elem12-r2（2026-10-26 12:11）的元素 9 就是这一版：起跑缓升到 7 m/s 后按
+        #    0.02/帧的步长把油门推到巡航段，全程 0 帧刹车、|a| 峰值 4.11、vmax 9.63。
+        #    前方 25 m 内有车/灯时交回基线（不在辅路里自己跟停，跟停是基线的活）。
+        gap = getattr(ctx, "stop_gap", None)
+        if gap is not None and float(gap) < C.FUDAO_HOLD_BACK_GAP_M:
+            return Command(steer=steer, v_cap=min(float(self.vmax or 9.0), 9.0),
+                           note="fudao gap=%.1f 交回基线纵向" % float(gap))
+        if speed < C.FUDAO_CRUISE_UNDER_MS:
+            self.cruise_thr = min(C.FUDAO_CRUISE_THR_MAX,
+                                  self.cruise_thr + C.FUDAO_CRUISE_THR_STEP)
+        elif speed > C.FUDAO_CRUISE_OVER_MS:
+            self.cruise_thr = max(0.0, self.cruise_thr - C.FUDAO_CRUISE_THR_STEP)
+        return Command(steer=steer, throttle=round(self.cruise_thr, 3), brake=0.0,
+                       note="fudao cruise v=%.2f thr=%.2f 剩 %.0f m"
+                            % (speed, self.cruise_thr, remain))
 
 
 __all__ = ["FudaoStrategy"]

@@ -327,6 +327,8 @@ class SlotParkStrategy(Strategy):
         self.last_note = ""
         self.stall_t = 0.0
         self._stall_said = False
+        self.fit_t = 0.0                     # FIT 收紧后累计时间（超时放宽容差）
+        self.fit_relaxed = False
         # 基向量在 `_set_basis` 里定；先给个安全默认（1.0, 0.0）
         self.eX = (1.0, 0.0)
         self.eY = (0.0, 1.0)
@@ -491,8 +493,8 @@ class SlotParkStrategy(Strategy):
         if self.phase == "ALIGN":
             steer = self._pursuit(X, Y, yaw_t)
             dist = max(0.0, Y - self.stage_y)
-            # elem12-r1（1600 那一局）就是这条剖面：巡航 3.2 m/s、按 0.5 m/s² 规划减速。
-            # 巡航放到 6.0 或减速按 1.0 规划都会晚刹车、冲过 staging，别改。
+            # 对齐段剖面：巡航上限 6 m/s、按 1.0 m/s² 规划减速（elem12-r2 的 1600 版本）。
+            # 3.2 m/s + 0.5 m/s² 的慢剖面要多花 ~9 s 才到 staging，平台按元素计时扣时间。
             v_des = min(C.PARK_ALIGN_MS, math.sqrt(2.0 * C.PARK_ALIGN_DECEL_MS2 * dist))
             err = v_des - ctx.speed
             thr = max(0.0, min(0.30, 0.30 * err))
@@ -510,6 +512,16 @@ class SlotParkStrategy(Strategy):
         if self.phase == "STOP":
             if abs(ctx.speed) <= 0.10:
                 self.ctl = ParallelParkingController()
+                # 把参考控制器的 FIT 容差收紧到 PARK_TOL_XY_M（它原值 0.35 m 太松，
+                # 收尾位置会差 30 cm 量级）；20 s 内收不拢由 PARK 段放宽回原值。
+                try:
+                    import metacar_race.control.parallel_parking as _pp
+                    _pp.PARALLEL_TOL_DX_M = C.PARK_TOL_XY_M
+                    _pp.PARALLEL_TOL_DY_M = C.PARK_TOL_XY_M
+                except Exception:
+                    pass
+                self.fit_t = 0.0
+                self.fit_relaxed = False
                 # 直接跳到 STOP：参考控制器自己还有一段 APPROACH（从远处开过来），
                 # 但它的前进油门上限 `PARALLEL_THROTTLE_MAX = 0.01` 是给"怠速倒车"
                 # 标定的，用来前进根本推不动车。我们已经在 ALIGN 里开到位并停稳，
@@ -543,6 +555,20 @@ class SlotParkStrategy(Strategy):
                     pos_x=cx, pos_y=cy, ori_z=90.0,
                     length=f["len"] or 4.0, width=f["wid"] or 1.8))
             vc, info = self.ctl.update(pose_t, ctx.speed, obs_t, ctx.dt)
+            # FIT 收紧到 15 cm 后可能一直微调不到位（0.010 的怠速油门一次只挪几厘米）：
+            # 20 s 还没收敛就把容差放宽回 PARK_TOL_RELAX_M，先停进去再说。
+            if info.phase == "FIT" and not self.fit_relaxed:
+                self.fit_t += ctx.dt
+                if self.fit_t >= C.PARK_FIT_TIMEOUT_S:
+                    self.fit_relaxed = True
+                    try:
+                        import metacar_race.control.parallel_parking as _pp
+                        _pp.PARALLEL_TOL_DX_M = C.PARK_TOL_RELAX_M
+                        _pp.PARALLEL_TOL_DY_M = C.PARK_TOL_RELAX_M
+                    except Exception:
+                        pass
+                    self._say("[park] FIT 收紧 %.0f s 仍未收敛，容差退回 %.2f m"
+                              % (self.fit_t, C.PARK_TOL_RELAX_M))
             # 兜底：万一控制器自己又退回 APPROACH（它的 stage_y 和我们算的差 0.2 m），
             # 0.01 的前进油门会把它憋死在原地。停着不动超过 1.5 s 就强行跳到倒车段。
             if info.phase == "APPROACH" and abs(ctx.speed) < 0.05:

@@ -19,9 +19,10 @@
    夹在 `[0, 0.28]`，按 `0.60/s` 爬升——**只用很小的刹车**，绝大多数跑次是 0.03 甚至 0；
 3. **收尾**：停早了（`v < 0.25` 还有 `> 0.12 m` 就到）给 0.03 的显式蠕动油门，
    压掉 StallGuard；压到 `along ≤ 0.06` 就停住；
-4. **保持**：`thr = 0`、**gear 保持 DRIVE**（不挂 P）、刹车从 0.10 用 1 s 爬到
-   `ESTOP_HOLD_BRAKE_MAX(0.55)` 并一直保持（**不用 1.00**：实测 brk=1.00 顶在静止的车上
-   会让速度逐帧抖 ±0.18 m/s，元素 8 的 |a| 因此冲到 −5.16，正好丢掉 +10）。
+4. **保持**：`thr = 0`、**gear 保持 DRIVE**（不挂 P）、**静止时不踩刹车**
+   （只有速度超过 `ESTOP_HOLD_IDLE_MS(0.30)` 才补一帧 `brake = 0.10`）。
+   理由：实测 brk=1.00 顶在静止的车上会让速度逐帧抖 ±0.18 m/s，元素 8 的 |a| 因此
+   冲到 −5.16；逐帧 0.10→0.55 的斜坡也会留下一长串刹车指令（elem12-r2 因此拿 100）。
    不挂 P 的理由见下一条的 elem8912-r1 证据：挂 P 之后平台在切元素那一下做 P→D 重新咬合，
    速度会从 0 被跳到 ~6 m/s；保持 D 时（elem89-r1）没有这个跳变。
 5. **零刹车起跑**（2026-10-25 第二轮）：平台把元素切到 9 之后**不立刻交棒**，
@@ -287,7 +288,7 @@ class StopAtEndStrategy(Strategy):
                       % (self.held_s, str(getattr(ctx, "platform_element", "") or "")))
             return None
 
-        # 1) 到点 → 保持（gear 保持 D、刹车只爬到 0.55）/ 平台切元素后零刹车起跑
+        # 1) 到点 → 保持（gear 保持 D、静止不踩刹车）/ 平台切元素后零刹车起跑
         if self.settled or self._settled_now(gap, along, speed):
             self.settled = True
             self.held_s += dt
@@ -298,21 +299,17 @@ class StopAtEndStrategy(Strategy):
                           % (self.platform_now, self.held_s, C.ESTOP_LAUNCH_M))
             if self.launching:
                 return self._launch(ctx, speed, along)
-            # 保持段：thr=0、gear 保持 D，刹车从 0.10 用 1 s 爬到 ESTOP_HOLD_BRAKE_MAX。
-            # **这是 elem12-r1（2026-10-26 11:24）拿 110 的版本**：当天下午试过
-            # 「零指令保持」（thr=0/brk=0），平台反而不给 +10（elem12-r2 元素 8 = 100），
-            # 当天已回退——元素 8 的加速度加分不是「刹车越少越好」。
+            # 保持段：thr=0、gear 保持 D，**静止时不踩刹车**（elem12-r2 = 1600 那一版的写法）。
+            # 平台判的是「加速度事件/指令量」：满刹 1.00 顶在静止车上会抖出 −5.16 m/s²
+            # （elem89-r1 元素 8 丢 +10 的唯一超限点），逐帧 0.10→0.55 的斜坡也会留下
+            # 一长串刹车指令；只在车真的还在动（> ESTOP_HOLD_IDLE_MS）时补一帧 0.10。
             # 不挂 P：挂 P 后平台在切元素那一下做 P→D 重新咬合，速度 0.7 s 内被跳到
             # 5.96 m/s（elem8912-r1），够丢一个元素的 +10。
             gear = GearMode.DRIVE if GearMode is not None else None
-            self.hold_brake = min(
-                C.ESTOP_HOLD_BRAKE_MAX,
-                max(0.10, 0.10 + (C.ESTOP_HOLD_BRAKE_MAX - 0.10)
-                    * min(1.0, self.held_s / C.ESTOP_HOLD_RAMP_S)),
-            )
+            self.hold_brake = 0.10 if speed > C.ESTOP_HOLD_IDLE_MS else 0.0
             return Command(steer=steer, throttle=0.0, brake=self.hold_brake, gear=gear,
-                           note="estop hold %.2fs along=%.2f（%s）"
-                                % (self.held_s, along, mode))
+                           note="estop hold %.2fs v=%.2f along=%.2f（%s）"
+                                % (self.held_s, speed, along, mode))
 
         # 2) 精细段：a_need 反算刹车（上限 0.28，按 0.60/s 爬升）
         if along <= C.ESTOP_FINE_ALONG_M:
