@@ -491,8 +491,8 @@ class SlotParkStrategy(Strategy):
         if self.phase == "ALIGN":
             steer = self._pursuit(X, Y, yaw_t)
             dist = max(0.0, Y - self.stage_y)
-            # elem12-r1：以 3.2 m/s 爬 70 m 花了 22 s（整元素 73 s）。巡航放宽到 6.0，
-            # 减速仍按 1.0 m/s² 规划，接近 staging 时自然收油。
+            # elem12-r1（1600 那一局）就是这条剖面：巡航 3.2 m/s、按 0.5 m/s² 规划减速。
+            # 巡航放到 6.0 或减速按 1.0 规划都会晚刹车、冲过 staging，别改。
             v_des = min(C.PARK_ALIGN_MS, math.sqrt(2.0 * C.PARK_ALIGN_DECEL_MS2 * dist))
             err = v_des - ctx.speed
             thr = max(0.0, min(0.30, 0.30 * err))
@@ -510,17 +510,6 @@ class SlotParkStrategy(Strategy):
         if self.phase == "STOP":
             if abs(ctx.speed) <= 0.10:
                 self.ctl = ParallelParkingController()
-                # 收敛更紧：参考实现的 FIT 容差是 0.35 m，elem12-r1 就停在 dx=+0.30、
-                # 车身包络越线 0.09 m。这里把模块级容差收到 0.15，超时（FIT 20 s 还没
-                # 收敛）再放宽回去，防止在两辆车中间来回蹭。
-                try:
-                    import metacar_race.control.parallel_parking as _pp
-                    _pp.PARALLEL_TOL_DX_M = C.PARK_TOL_XY_M
-                    _pp.PARALLEL_TOL_DY_M = C.PARK_TOL_XY_M
-                except Exception:                       # noqa: BLE001
-                    pass
-                self.fit_t = 0.0
-                self.fit_relaxed = False
                 # 直接跳到 STOP：参考控制器自己还有一段 APPROACH（从远处开过来），
                 # 但它的前进油门上限 `PARALLEL_THROTTLE_MAX = 0.01` 是给"怠速倒车"
                 # 标定的，用来前进根本推不动车。我们已经在 ALIGN 里开到位并停稳，
@@ -578,19 +567,6 @@ class SlotParkStrategy(Strategy):
                     self._say("[park] 倒车起步卡住，油门临时放大 3 倍")
             elif abs(ctx.speed) > 0.15:
                 self._stall_said = False
-            # FIT 收紧容差后要留后路：来回蹭超过 20 s 就退回 0.35，宁可差一点也不能卡死。
-            if info.phase == "FIT" and not bool(getattr(self, "fit_relaxed", False)):
-                self.fit_t = float(getattr(self, "fit_t", 0.0)) + ctx.dt
-                if self.fit_t > C.PARK_FIT_TIMEOUT_S:
-                    self.fit_relaxed = True
-                    try:
-                        import metacar_race.control.parallel_parking as _pp
-                        _pp.PARALLEL_TOL_DX_M = C.PARK_TOL_RELAX_M
-                        _pp.PARALLEL_TOL_DY_M = C.PARK_TOL_RELAX_M
-                    except Exception:               # noqa: BLE001
-                        pass
-                    self._say("[park] FIT 收紧 %.0f s 仍未收敛，容差退回 %.2f"
-                              % (C.PARK_FIT_TIMEOUT_S, C.PARK_TOL_RELAX_M))
             if self.ctl.done() and self.phase != "DONE":
                 self.phase = "DONE"
                 lo_la, hi_la, lo_lo, hi_lo = self._envelope(X, Y, yaw_t)

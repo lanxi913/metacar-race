@@ -382,11 +382,8 @@ PARK_HANDOVER_REM_M = 0.30      #: 距 staging 这么多米、且速度够低就
 PARK_HANDOVER_MS = 0.30         #: 交给控制器时的速度上限
 PARK_HANDOVER_LAT_M = 0.45      #: 交给控制器时的侧向误差上限（超过就继续修）
 PARK_HOLD_BRAKE = 0.55          #: 入库完成后的驻车刹车（同元素 8，不用 1.00）
-PARK_ALIGN_MS = 3.20            #: 对齐段巡航上限（elem12-r1 = 200 分的版本；6.0 试过会冲过 staging）
-PARK_ALIGN_DECEL_MS2 = 1.00     #: 对齐段规划减速度（到 staging 前自然收油）
-PARK_TOL_XY_M = 0.35            #: 交给参考控制器时的 FIT 容差（15 cm 试过：控制器 0.010 油门推不动，卡死在 FIT）
-PARK_FIT_TIMEOUT_S = 20.0       #: FIT 收紧后超时还没收敛就放宽，防止来回蹭
-PARK_TOL_RELAX_M = 0.35         #: 放宽后的容差（等于参考实现默认值）
+PARK_ALIGN_MS = 3.20            #: 对齐段巡航上限（= PARALLEL_V_APPROACH；elem12-r1 = 200 分的版本）
+PARK_ALIGN_DECEL_MS2 = 0.50     #: 对齐段规划减速度（= PARALLEL_A_MAX，elem12-r1 的原值；1.0 会晚 1.4 倍刹车、冲过 staging）
 
 
 @dataclass
