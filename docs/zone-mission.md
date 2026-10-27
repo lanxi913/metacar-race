@@ -48,7 +48,8 @@ VLAExtensionOutput(function_zone_result=FunctionZoneResult(
 关键坑（都吃过）：
 
 1. **车顶黄牌不可读**：贴脸 1.2 m 也只有 29~47 px，数字 12~16 px，Windows OCR / RapidOCR / 模板匹配全部失败。
-2. **入口那块规则牌也是大块黄色**：会骗过车头相机的黄块闸门，抢走暂存帧预算（r14）。现在要求黄块落在地平线以下（`car_yellow_blob`）。
+2. **入口那块规则牌也是大块黄色**：早期车头黄块闸门会把它当成车，抢走暂存帧（r14）。
+   现在车头相机只按 `CAM0_EVERY=5` 补采样，不再用黄块触发停靠（`car_yellow_blob` 已删）。
 3. **OCR 线程与主循环抢 GIL**：默认线程池 + 多 worker 会把主循环压到 1 Hz（r4 只读到 3 个号）。
    真病根是**线程超订**——`RapidOCR(intra_op_num_threads=1)` 整帧 282~308 ms，主循环 p95 33.7 ms、
    零卡顿；默认线程数下同一帧要 588~1461 ms，主循环出现 12 次 >100 ms 卡顿。
