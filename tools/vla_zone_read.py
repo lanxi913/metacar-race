@@ -244,10 +244,17 @@ def summarize(votes: dict, lock: threading.Lock) -> dict[str, tuple[int, str, fl
 
 
 def build_violations(summary: dict[str, tuple[int, str, float]],
-                     min_votes: int) -> tuple[list[str], list[str], str]:
+                     min_votes: int,
+                     violator_cls: str = "blue") -> tuple[list[str], list[str], str]:
+    """R01 = `violator_cls` 这一类车的编号集合，R02 = 三轮车（green）。
+
+    任务一牌子写「RU1 不允许蓝色小轿车」⇒ violator_cls="blue"；
+    任务二（`功能区合规检测任务（二）`）牌子写「R01 不允许红色小轿车」⇒ "red"。
+    类别语义只在这一处换，其余（取帧、读号、判类、兜底）两任务完全共用。
+    """
     cand = set(CANDIDATE_CODES)
-    blue = sorted(c for c, (n, k, _s) in summary.items()
-                  if k == "blue" and n >= min_votes and c in cand)
+    cars = sorted(c for c, (n, k, _s) in summary.items()
+                  if k == violator_cls and n >= min_votes and c in cand)
     # 三轮车的牌子常被读成半截：两票 0.80 以上，或单票 0.85 以上（实测三轮车号
     # 一圈往往只出现一次，单票就把它丢掉会让 R02 恒为 0）
     green = sorted(c for c, (n, k, s) in summary.items()
@@ -257,12 +264,12 @@ def build_violations(summary: dict[str, tuple[int, str, float]],
     if not green:
         seen = set(summary)
         missing = [c for c in CANDIDATE_CODES if c not in seen]
-        if len(missing) == 1 and len(blue) >= 3:
+        if len(missing) == 1 and len(cars) >= 3:
             green = missing
             note = f"三轮车没读到，按缺号补 {missing[0]}"
         else:
             note = f"三轮车没读到，缺号 {missing}"
-    return blue, green, note
+    return cars, green, note
 
 
 def main() -> int:
@@ -272,6 +279,13 @@ def main() -> int:
     ap.add_argument("--min-submit", type=float, default=26.0)
     ap.add_argument("--hard-submit", type=float, default=40.0)
     ap.add_argument("--min-votes", type=int, default=1)
+    # R01 禁停类别：任务一牌子「RU1 不允许蓝色小轿车」→ blue；任务二牌子
+    # 「R01 不允许红色小轿车」→ red。只换这一处语义，别的不动。
+    ap.add_argument("--violator", default="blue", choices=["blue", "red"],
+                    help="R01 的禁停车型（blue=蓝色小轿车, red=红色小轿车）")
+    ap.add_argument("--expect-violators", type=int, default=4,
+                    help="算「读完」需要凑到的违停车数量；任务一固定 4 辆，任务二未知时"
+                         "给大值（如 9）即只在圈末按已有票上报")
     ap.add_argument("--yolo", default=r"D:\download3\算法邀請賽\accel_window_probe\_vla_ref\models\yolov8n.pt")
     ap.add_argument("--lookahead", type=float, default=6.0)
     ap.add_argument("--accept", type=float, default=4.0)
@@ -283,6 +297,10 @@ def main() -> int:
     ap.add_argument("--laps", type=int, default=1)
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
+
+    print(f"实验配置: R01 禁停车型={args.violator} expect={args.expect_violators} "
+          f"min-submit={args.min_submit} hard-submit={args.hard_submit} laps={args.laps}",
+          flush=True)
 
     # 两圈兜底：引擎 30 fps，采样从 0.25 s/帧 提高到 0.09 s/帧（≈11 Hz），
     # 一圈 137.9 m@4.3 m/s≈32 s，两圈 64 s + 三轮车停车 6 s + OCR 40 帧≈24 s
@@ -323,6 +341,12 @@ def main() -> int:
                 ok += int(got == want)
                 print(f"   分类 {name}: 期望 {want} 实得 {got}")
             print(f"   分类回归 {ok}/{len(truth)}")
+        # 规则参数化回归：同一份 summary，blue 变体选蓝车、red 变体选红车，R02 都是三轮车
+        fake = {"C-01": (2, "blue", 0.90), "C-02": (1, "red", 0.95),
+                "C-03": (1, "red", 0.88), "C-04": (1, "green", 0.92)}
+        r1 = build_violations(fake, 1, "blue")
+        r2 = build_violations(fake, 1, "red")
+        print(f"   规则回归 blue→R01={r1[0]} R02={r1[1]} | red→R01={r2[0]} R02={r2[1]}")
         return 0
 
     out = Path(args.out)
@@ -489,34 +513,35 @@ def main() -> int:
         # ---- 上报判定（上报即结算，先算） ----
         if payload is None:
             summary = summarize(votes, lock)
-            blue, green, note = build_violations(summary, args.min_votes)
+            cars, green, note = build_violations(summary, args.min_votes, args.violator)
             # 「读完」= 队列空 + worker 不在推理 + 已安静 0.4 s。只看 q.empty() 会把
             # 「worker 刚取走最后一帧、正在推理」误判成「已读完」（评审 MAJOR）。
             idle = q.empty() and not reader.busy and (time.time() - reader.last_done >= 0.4)
             force = now >= args.hard_submit
-            full = len(blue) >= 4 and len(green) >= 1
+            full = len(cars) >= args.expect_violators and len(green) >= 1
             if (full and now >= args.min_submit) or force:
                 if force and not full:
                     # 到点还没读全：**按规则分别兜底**，绝不再往后推时间。
                     # 旧版这里 args.hard_submit = now + 8，而 q.empty() 分支在进读阶段后
                     # 恒真，两者叠加会把「没读到号」变成「永不提交」（评审 BLOCKER-1）。
                     note = "兜底："
-                    if len(blue) < 4:
-                        blue = list(CANDIDATE_CODES)
-                        note += "R01 六号全报 "
+                    if len(cars) < args.expect_violators:
+                        got = len(cars)
+                        cars = list(CANDIDATE_CODES)
+                        note += f"R01 六号全报（{args.violator} 只读到 {got} 个） "
                     if len(green) < 1:
                         green = list(CANDIDATE_CODES)
                         note += "R02 六号全报"
                 violations = []
-                if blue:
-                    violations.append(FunctionZoneViolation(rule_code="R01", sticker_ids=blue))
+                if cars:
+                    violations.append(FunctionZoneViolation(rule_code="R01", sticker_ids=cars))
                 if green:
                     violations.append(FunctionZoneViolation(rule_code="R02", sticker_ids=green))
                 # 即使 violations 为空也提交：空提交不比不提交差，且能让本局干净结算
                 payload = VLAExtensionOutput(
                     function_zone_result=FunctionZoneResult(violations=violations))
                 submitted_at = now
-                print(f"[{now:5.1f}s] === 上报 R01={blue} R02={green}"
+                print(f"[{now:5.1f}s] === 上报 R01={cars} R02={green}"
                       f"（{note}；OCR {stats['frames']} 帧/命中 {stats['hits']}，idle={idle}）",
                       flush=True)
 
