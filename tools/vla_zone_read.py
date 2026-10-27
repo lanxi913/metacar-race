@@ -1,22 +1,27 @@
-"""功能区合规检测（v1 实跑版）：绕场两圈实时读侧门编号，按车型分类上报。
+"""功能区合规检测（v1 实跑版）：绕场实时读侧门编号，按车型分类上报。
 
 依据
 ----
-- 规则牌（入口 `(30.0,-3.9)` 杆上）：`R01 不允许蓝色小轿车` / `R02 禁止三轮车`。
+- 规则牌（入口 `(30.0,-3.9)` 杆上）：`RU1 不允许蓝色小轿车` / `RU2 禁止三轮车`
+  （代码里按结算字段写 `R01`/`R02`；平台实际用哪个键名以提交回报为准）。
 - 场内固定 6 辆：4 辆蓝色小轿车 + 1 辆三轮车 + 1 辆红色小轿车；**编号每局重排**，
   但车辆位置、数量、车型不变（用户 2026-10-26 确认，多局帧对照一致）。
 - 侧门白字编号在 3~6 m 侧距上可读：RapidOCR（PP-OCRv4 ONNX）在 `vla-perimeter-r2`
   那局把 5 个编号全读出来了（0.71~0.99），一圈 27 s。
   车型判据（该局六帧真值实测）：车漆色相 蓝 109~115 / 红 169~172 / 三轮车 32~35。
 
-策略
+策略（2026-10-27 改：单线程 + 1 worker + 巡航中在线读）
 ----
-1. 沿 `LAP` 绕两圈（约 59 s）；左右侧相机 4 Hz 取帧，交替送一个给 OCR（两个工作线程，
-   整帧约 0.55 s/帧，合计 ~3.5 帧/s）；
-2. 命中 `C-0x` 记一票，并用字块四周的色带判车型；
-3. 上报：蓝车编号（≥`--min-votes` 票）进 R01；三轮车编号进 R02；
-   三轮车没读到时，若已读 ≥5 个编号且恰好缺 1 个，就用缺的那个补；
-4. 上报时机：蓝车编号 ≥4 个且 t ≥ `--min-submit`，或 t ≥ `--hard-submit`（上报即结算）。
+1. 沿 `LAP` 绕一圈（2.6 m/s ≈ 53 s；快于 4.3 m/s 时每辆车的可读帧数腰斩）；
+2. 取帧闸门：侧向 cam1/cam2 用 YOLO 车宽 120~520 px 筛"好帧"，前向 cam0 用黄绿色
+   车身闸门找三轮车（三轮车不是 COCO 类别，YOLO 判不出来），四路轮转、每 tick 只送帧；
+3. 一帧进 `queue`（上限 6，满了丢最旧），**1 个 worker 用 `intra_op_num_threads=1`
+   推理**（3.6 帧/s；默认线程数会起 8+ OMP 线程把 30 Hz 主循环拖到 1 Hz）；
+4. 命中 `C-0x` 记一票，并用字块四周的色带判车型；
+5. 上报：蓝车编号（≥`--min-votes` 票）进 R01；三轮车编号进 R02（两票 0.80+ 或一票 0.85+）；
+   三轮车没读到时，若恰好缺 1 个候选号且已读 ≥3 个蓝车号，就用缺号补；
+6. 上报时机：R01 满 4 个且 R02 有号、且 t ≥ `--min-submit`；否则 t ≥ `--hard-submit`
+   时**按规则分别兜底**（缺哪条就把六号全报），绝不把上报时间往后推（上报即结算）。
 
 用法
 ----
@@ -55,7 +60,8 @@ LAP = [
     (-6.0, 16.0),
     (8.0, 16.0),
     (16.0, 6.0),
-    (16.0, -10.0),
+    (13.0, 6.0),      # 东侧让开三轮车（实测它在 (约17.5,0.5)，原航段从 2 m 处擦过会撞）
+    (13.0, -10.0),
     (22.0, -14.0),
 ]
 
@@ -64,26 +70,30 @@ V_CRUISE = 2.60         # r10（950 分）配置：靠收油滑行降到 2.6 m/s
 V_BAND = 0.35           # 速度滞环，避免油门每帧翻转
 PIN_SPEED = 0.15
 PIN_SECONDS = 2.0
-BURST_S = 0.0
 BACK_S = 1.5
 BOUND = 36.0
 PER_CAR_MAX = 5         # 同一辆车最多存几帧（自车位置 8 m 内归为同一辆）
 CAR_DEDUPE_M = 8.0
-CAR_MIN_W = 120.0       # 车框太远（<120 px）不存
-CAR_MAX_W = 400.0       # 车框太近/被裁切（>400 px）不存
-CAM0_EVERY = 3          # 车头相机抽样率（专抓三轮车）
+CAR_MIN_W = 80.0        # 车框太远（<80 px）不存（A3：95 时每车只攒到 1~4 帧）
+CAR_MAX_W = 560.0       # 车框太近/被裁切（>560 px）不存
+CAM0_EVERY = 5          # 车头相机抽样：每 5 帧一次（其余 4 帧全给左右侧相机，车都在航线两侧）
 YELLOW_MIN = 200        # 黄车块面积阈值（原 350 太严，三轮车进不来）
 TRI_STOP_S = 3.0        # 车头看到三轮车后停车连拍的时长
-TRI_YELLOW_MIN = 150    # 触发停车连拍的黄块面积（比入库闸门更松，宁可多停一次）
+TRI_TRIGGER_W = 90      # 车头画面里黄绿车身的宽度到 90 px 就刹停（实测：10 m 外 28 px、5 m 处 135 px）
 TRI_MAX_READ = 3        # 三轮车读号期间允许就地 OCR 的 cam0 帧数（停太久平台会挪车）
-ROI_TOP = 180         # OCR 只送地平线以下（y>=180）：车都在下面，帧面积减 40%
+ROI_TOP = 180         # 历史阈值：OCR 现在送整帧（裁 ROI 实测反而更慢）
 
 CODE_RE = re.compile(r"C\s*[-—–·.．:：_]?\s*(0?\d{1,2})")
 CANDIDATE_CODES = [f"C-{i:02d}" for i in range(1, 7)]
 
 SIDE_CAMS = (1, 2)          # cam1 左、cam2 右
-QUEUE_MAX = 8
-WORKERS = 2
+# OCR 线程数固定 1：实测（2026-10-27 基准）
+#   RapidOCR(intra_op_num_threads=1) + 1 个 worker：单帧 282~308 ms，主循环
+#   抖动 p95 33.6 ms / max 34.4 ms / >100 ms 卡顿 0 次 ⇒ 巡航中 inline 读号不掉帧；
+#   而 RapidOCR() 默认线程（8+ 线程）两个 worker 会把主循环拖到 1 Hz（r4/r12 的
+#   "读不到号"就是这么来的，不是物理极限）。
+QUEUE_MAX = 6
+WORKERS = 1          # 只允许 1 个 worker：多线程推理会把主循环拖到 1 Hz
 
 
 def save_jpg(path: Path, img: np.ndarray, quality: int = 90) -> bool:
@@ -105,10 +115,15 @@ def has_white_text(img: np.ndarray) -> bool:
 
 
 def has_yellow_blob(img: np.ndarray, min_px: int = YELLOW_MIN) -> bool:
-    """三轮车闸门：车身是大块高饱和黄绿色（S≥130、H 25~45），沙地饱和度低不会被选中。"""
+    """三轮车闸门：车身是大块高饱和黄绿色（S≥130、H 25~45），沙地饱和度低不会被选中。
+
+    **只数地平线以下的像素**：入口那块规则牌也是黄底，在 320×240 里落在 v<125 区域，
+    r14 就是被它触发了三轮车停靠、把好帧全占了（评审 MAJOR）。
+    """
     small = cv2.resize(img, (320, 240), interpolation=cv2.INTER_NEAREST)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    band = slice(125, 240)
+    h, s, v = hsv[band, :, 0], hsv[band, :, 1], hsv[band, :, 2]
     mask = (h >= 25) & (h <= 45) & (s >= 130) & (v >= 80)
     return int(mask.sum()) >= min_px
 
@@ -116,6 +131,7 @@ def has_yellow_blob(img: np.ndarray, min_px: int = YELLOW_MIN) -> bool:
 def yellow_blob_w(img: np.ndarray, min_px: int = YELLOW_MIN) -> int:
     """返回车头画面里最大黄绿色块的宽度（px，按 640 宽口径），用来判断"贴太近"该停了。"""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hsv[: int(0.52 * hsv.shape[0]), :] = 0        # 地平线以上的黄块（规则牌）不算车身
     mask = cv2.inRange(hsv, np.array((25, 130, 80)), np.array((45, 255, 255)))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, _lab, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
@@ -156,34 +172,51 @@ def hue_class(hue: float) -> str:
 
 
 class Reader(threading.Thread):
-    """整帧 PP-OCR 工作线程；两个线程能把吞吐抬到 ~3.5 帧/s。"""
+    """整帧 PP-OCR 工作线程。
+
+    **单线程推理**（`intra_op_num_threads=1`）是关键：默认线程数会起 8+ 个 OMP
+    线程，和主循环抢核，把一个 30 Hz 的控制回路拖到 1 Hz；限成 1 线程后
+    主循环抖动实测 p95 33.6 ms、无 >100 ms 卡顿，而 OCR 仍有 3.5 帧/s。
+    """
 
     def __init__(self, q: "queue.Queue", votes: dict, lock: threading.Lock,
-                 shots: Path | None, name: str, stats: dict) -> None:
+                 name: str, stats: dict) -> None:
         super().__init__(daemon=True, name=name)
         self.q = q
         self.votes = votes
         self.lock = lock
-        self.shots = shots
         self.stats = stats
+        # busy 是「读完」判据的关键：worker 取走最后一帧正在推理时 q.empty() 已经为真，
+        # 只看队列会把「刚开始读最后一帧」当成「已经读完」。
+        self.busy = False
+        self.last_done = 0.0
+        self.alive_ok = True
 
     def run(self) -> None:            # pragma: no cover - 线程体
-        from rapidocr_onnxruntime import RapidOCR
-        engine = RapidOCR()
-        print(f"{self.name} OCR 引擎就绪（RapidOCR / PP-OCRv4 ONNX）", flush=True)
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            engine = RapidOCR(intra_op_num_threads=1)
+            engine(np.zeros((240, 320, 3), np.uint8))     # 预热，别把首帧拖到 2 s
+            print(f"{self.name} OCR 引擎就绪（RapidOCR / PP-OCRv4 ONNX，1 线程）", flush=True)
+        except Exception as exc:      # noqa: BLE001 - 线程里不炸主循环
+            self.alive_ok = False
+            print(f"!! OCR worker 启动失败: {exc}", flush=True)
+            return
         while True:
             item = self.q.get()
             if item is None:
                 return
             tag, t, cid, img = item
+            self.busy = True
             try:
                 res, _ = engine(img)
             except Exception as exc:      # noqa: BLE001 - 线程里不炸主循环
                 print(f"!! OCR 异常 {exc}", flush=True)
-                continue
-            self.stats["done"] += 1
-            if self.shots is not None:
-                save_jpg(self.shots / f"ocr_t{tag:04d}_cam{cid}.jpg", img)
+                res = []
+            finally:
+                self.busy = False
+            self.stats["frames"] += 1
+            self.last_done = time.time()
             for box, txt, score in (res or []):
                 if float(score) < 0.45:
                     continue
@@ -191,11 +224,14 @@ class Reader(threading.Thread):
                 if not m:
                     continue
                 code = f"C-{int(m.group(1)):02d}"
+                if code not in CANDIDATE_CODES:
+                    continue        # A1：只认 C-01..C-06，`C-64` 这类是误读（r17 实测出现）
                 hue = body_hue(img, box)
                 cls = hue_class(hue)
                 with self.lock:
                     self.votes.setdefault(code, []).append(
                         (round(float(score), 2), round(hue, 1), cls, round(t, 1)))
+                    self.stats["hits"] += 1
                 print(f"[{t:5.1f}s] 读到 {code} score={float(score):.2f} "
                       f"色相={hue:5.1f}→{cls} cam{cid}", flush=True)
 
@@ -219,9 +255,11 @@ def build_violations(summary: dict[str, tuple[int, str, float]],
     cand = set(CANDIDATE_CODES)
     blue = sorted(c for c, (n, k, _s) in summary.items()
                   if k == "blue" and n >= min_votes and c in cand)
-    # 三轮车的牌子常被读成半截，要求高分（≥0.80）且至少两票才认
+    # 三轮车的牌子常被读成半截：两票 0.80 以上，或单票 0.85 以上（实测三轮车号
+    # 一圈往往只出现一次，单票就把它丢掉会让 R02 恒为 0）
     green = sorted(c for c, (n, k, s) in summary.items()
-                   if k == "green" and n >= max(2, min_votes) and s >= 0.80 and c in cand)
+                   if k == "green" and c in cand
+                   and ((n >= 2 and s >= 0.80) or (n >= 1 and s >= 0.85)))
     note = "三轮车已读到"
     if not green:
         seen = set(summary)
@@ -244,9 +282,9 @@ def main() -> int:
     ap.add_argument("--yolo", default=r"D:\download3\算法邀請賽\accel_window_probe\_vla_ref\models\yolov8n.pt")
     ap.add_argument("--lookahead", type=float, default=6.0)
     ap.add_argument("--accept", type=float, default=4.0)
-    ap.add_argument("--shot-every", type=float, default=0.25)
+    ap.add_argument("--shot-every", type=float, default=0.20)
     ap.add_argument("--phase-a", type=float, default=70.0)
-    ap.add_argument("--frame-budget", type=int, default=24)
+    ap.add_argument("--frame-budget", type=int, default=120)   # 累计入队硬上限（不是队列长度）
     ap.add_argument("--laps", type=int, default=1)
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
@@ -316,25 +354,31 @@ def main() -> int:
     from metacar import (FunctionZoneResult, FunctionZoneViolation, GearMode,
                          SceneAPI, VLAExtensionOutput, VehicleControl)
 
-    # Phase A：只巡航 + 闸门存帧，循环里**不跑 OCR**（线程抢 GIL 会把主循环卡到 1 Hz，
-    # r4 那局 84 s 只读到 25 帧就是这个原因）。Phase B 停稳后串行 OCR 存下的帧。
+    # 读号架构（2026-10-27 改）：1 个 OCR worker + **单线程推理**，巡航中 inline 读，
+    # 不再"存帧等停车"。依据：单线程推理下主循环抖动 p95 33.6 ms / 无 >100 ms 卡顿，
+    # 而停车串行会把每辆车的读号窗口压到 1~2 帧（r12 漏掉 C-04 就是这么发生的）。
     votes: dict = {}
     lock = threading.Lock()
-    stats = {"done": 0, "dropped": 0}
+    stats = {"frames": 0, "hits": 0, "enq": 0,
+             "drop_budget": 0, "drop_queue": 0, "drop_cap": 0, "gated": 0}
     eng = None
+    q: "queue.Queue" = queue.Queue(maxsize=QUEUE_MAX)
+    reader: "Reader | None" = None
     try:
         from rapidocr_onnxruntime import RapidOCR
         t_ocr = time.time()
-        eng = RapidOCR()
-        eng(np.zeros((240, 320, 3), np.uint8))     # 预热，避免 Phase B 首帧多花 2 s
-        print(f"OCR 引擎就绪（RapidOCR/PP-OCRv4，预热 {time.time() - t_ocr:.1f}s）", flush=True)
+        eng = RapidOCR(intra_op_num_threads=1)     # 主线程这份只给三轮车停靠时用
+        eng(np.zeros((240, 320, 3), np.uint8))     # 预热，别让首帧多花 2 s
+        print(f"OCR 引擎就绪（RapidOCR/PP-OCRv4，1 线程，预热 {time.time() - t_ocr:.1f}s）",
+              flush=True)
     except Exception as exc:      # noqa: BLE001
-        print(f"!! OCR 初始化失败: {exc}", flush=True)
-    store: list = []
+        # 没有 OCR 就没有任何编号可报，硬跑等于白跑一局：直接失败退出（评审 B2）
+        raise SystemExit(f"OCR 初始化失败，无法读号: {exc}") from exc
+    reader = Reader(q, votes, lock, "ocr0", stats)
+    reader.start()
     car_slots: list = []      # 按自车位置去重：{"pos":(x,y), "n":已存帧数, "cam":cid}
     read_brake = 0.0          # 读阶段渐进刹车（每帧 +0.01，绝不单帧大跳变）
     tri_done = False          # 三轮车专用停靠只做一次
-    tri_until = 0.0
     tri_state = ""            # 三轮车读号状态机：brake / read / creep（空串=不启用）
     tri_end = 0.0
     tri_cycles = 0
@@ -357,7 +401,6 @@ def main() -> int:
     last_log = -1e9
     last_seg = -1
     pin_since: float | None = None
-    burst_until = 0.0
     back_until = 0.0
     payload = None
     submitted_at: float | None = None
@@ -373,27 +416,45 @@ def main() -> int:
     pose_fh.write("tag,t,ego_x,ego_y,yaw,v,cam,box_cx,box_w\n")
 
     def offer(tag_: int, now_: float, cid: int, img) -> bool:
-        if len(store) >= args.frame_budget:
-            stats["dropped"] += 1
+        """把一帧塞进 OCR 队列；队列满了丢**最旧**的一帧——保证读的是最新画面。"""
+        if stats["enq"] >= args.frame_budget:
+            stats["drop_budget"] += 1
             return False
-        store.append((tag_, now_, cid, img.copy()))
         save_jpg(shots / f"gate_t{tag_:04d}_cam{cid}.jpg", img)
         pose_fh.write(f"{tag_},{now_:.2f},{pose_now['x']:.2f},{pose_now['y']:.2f},"
                       f"{pose_now['yaw']:.1f},{pose_now['v']:.2f},{cid},"
                       f"{pose_now['cx']:.0f},{pose_now['w']:.0f}\n")
         pose_fh.flush()
+        item = (tag_, now_, cid, img.copy())
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            try:
+                q.get_nowait()
+                stats["drop_queue"] += 1
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                stats["drop_queue"] += 1
+                return False
+        stats["enq"] += 1
         return True
 
     def ocr_frame(tag_: int, t_: float, cid_: int, img_, now_: float) -> None:
-        """对一帧跑 OCR 并把编号投票记下来（主线程串行调用）。"""
-        roi = img_[ROI_TOP:, :]
+        """三轮车停靠时就地读一帧（主线程串行，车已停/很慢）。
+
+        读**整帧**：实测 ROI 裁剪反而更慢（裁 y<180 后短边 300 被 rapidocr 的
+        limit_side_len=736 放大 2.45 倍，281 ms → 444 ms）。
+        """
         t_step = time.time()
         try:
-            res, _ = eng(roi)
+            res, _ = eng(img_)
         except Exception as exc:      # noqa: BLE001
             res = []
             print(f"!! OCR 异常 {exc}", flush=True)
-        stats["done"] += 1
+        stats["frames"] += 1
         for box, txt, score in (res or []):
             if float(score) < 0.5:
                 continue
@@ -401,14 +462,18 @@ def main() -> int:
             if not m:
                 continue
             code = f"C-{int(m.group(1)):02d}"
-            hue = body_hue(roi, box)
+            if code not in CANDIDATE_CODES:
+                continue            # A1：只认 C-01..C-06
+            hue = body_hue(img_, box)
             cls = hue_class(hue)
-            votes.setdefault(code, []).append(
-                (round(float(score), 2), round(hue, 1), cls, round(t_, 1)))
+            with lock:
+                votes.setdefault(code, []).append(
+                    (round(float(score), 2), round(hue, 1), cls, round(t_, 1)))
+                stats["hits"] += 1
             print(f"[{now_:5.1f}s] 读到 {code} score={float(score):.2f} "
                   f"色相={hue:5.1f}→{cls} cam{cid_}@{t_:.1f}s", flush=True)
-        print(f"[{now_:5.1f}s] 读帧 t{tag_:04d} cam{cid_} 用时 {time.time() - t_step:.2f}s"
-              f"（剩 {len(store)} 帧）", flush=True)
+        print(f"[{now_:5.1f}s] 就地读帧 t{tag_:04d} cam{cid_} 用时 {time.time() - t_step:.2f}s"
+              f"（队内 {q.qsize()} 帧）", flush=True)
 
     for msg, frames in api.main_loop():
         now = time.time() - t0
@@ -454,13 +519,17 @@ def main() -> int:
 
         if phase == "drive" and (follower.done() or now >= args.phase_a):
             phase = "read"
-            print(f"[{now:5.1f}s] 巡航段结束，停车读帧（暂存 {len(store)} 帧）", flush=True)
+            if tri_state:
+                tri_state = ""
+                print(f"[{now:5.1f}s] 进读阶段，三轮车状态机强制收尾", flush=True)
+            print(f"[{now:5.1f}s] 巡航段结束 → 停车排空读号队列（队内 {q.qsize()} 帧，"
+                  f"已读 {stats['frames']} 帧）", flush=True)
 
         # 三轮车专用停靠：它只在车头方向出现（左右侧相机看不到），所以车头一旦
         # 看到黄绿色车身就地停 3 s 连拍，读号靠这几帧
         if phase == "drive" and not tri_done and now > 8.0 and frames:
             cam0_img = next((getattr(c, "frame", None) for c in frames if int(c.id) == 0), None)
-            if cam0_img is not None and has_yellow_blob(cam0_img, TRI_YELLOW_MIN):
+            if cam0_img is not None and yellow_blob_w(cam0_img) >= TRI_TRIGGER_W:
                 tri_done = True
                 tri_state = "brake"
                 tri_end = now
@@ -471,29 +540,35 @@ def main() -> int:
         if payload is None:
             summary = summarize(votes, lock)
             blue, green, note = build_violations(summary, args.min_votes)
-            if now >= args.hard_submit and len(blue) < 3:
-                # 读号兜底：读到的蓝车号不足 4 个时，两条规则各报全部候选号
-                # （实测六号全报 ≈563，比报 3 个号 + 空 R02 的 375 高）
-                blue = list(CANDIDATE_CODES)
-                green = list(CANDIDATE_CODES)
-                note = "兜底：六号全报两条规则"
-            ready = (len(blue) >= 4 and now >= args.min_submit) \
-                or (phase == "read" and not store and now >= args.min_submit)
-            if ready or now >= args.hard_submit:
+            # 「读完」= 队列空 + worker 不在推理 + 已安静 0.4 s。只看 q.empty() 会把
+            # 「worker 刚取走最后一帧、正在推理」误判成「已读完」（评审 MAJOR）。
+            idle = q.empty() and not reader.busy and (time.time() - reader.last_done >= 0.4)
+            force = now >= args.hard_submit
+            full = len(blue) >= 4 and len(green) >= 1
+            if (full and now >= args.min_submit) or force:
+                if force and not full:
+                    # 到点还没读全：**按规则分别兜底**，绝不再往后推时间。
+                    # 旧版这里 args.hard_submit = now + 8，而 q.empty() 分支在进读阶段后
+                    # 恒真，两者叠加会把「没读到号」变成「永不提交」（评审 BLOCKER-1）。
+                    note = "兜底："
+                    if len(blue) < 4:
+                        blue = list(CANDIDATE_CODES)
+                        note += "R01 六号全报 "
+                    if len(green) < 1:
+                        green = list(CANDIDATE_CODES)
+                        note += "R02 六号全报"
                 violations = []
                 if blue:
                     violations.append(FunctionZoneViolation(rule_code="R01", sticker_ids=blue))
                 if green:
                     violations.append(FunctionZoneViolation(rule_code="R02", sticker_ids=green))
-                if violations:
-                    payload = VLAExtensionOutput(
-                        function_zone_result=FunctionZoneResult(violations=violations))
-                    submitted_at = now
-                    print(f"[{now:5.1f}s] === 上报 R01={blue} R02={green}"
-                          f"（{note}；OCR {stats['done']} 帧）", flush=True)
-                else:
-                    print(f"[{now:5.1f}s] 还没有可报的编号（{note}），继续读", flush=True)
-                    args.hard_submit = now + 8.0
+                # 即使 violations 为空也提交：空提交不比不提交差，且能让本局干净结算
+                payload = VLAExtensionOutput(
+                    function_zone_result=FunctionZoneResult(violations=violations))
+                submitted_at = now
+                print(f"[{now:5.1f}s] === 上报 R01={blue} R02={green}"
+                      f"（{note}；OCR {stats['frames']} 帧/命中 {stats['hits']}，idle={idle}）",
+                      flush=True)
 
         # ---- 纵向：只靠收油滑行（-0.26 m/s²）降到 V_CRUISE，全程不发刹车指令 ----
         if phase == "read":
@@ -509,7 +584,8 @@ def main() -> int:
             steer = follower.steering(x, y, yaw)
             if tri_state == "brake":
                 if v > 0.25 and now < tri_end + 3.5:
-                    tri_brake += max(-0.01, min(0.01, 0.10 - tri_brake))
+                    # 刹车给到 0.25：0.10 从 2.6 m/s 要 11 m 才停得住（r16 就是没停住撞上）
+                    tri_brake += max(-0.02, min(0.02, 0.25 - tri_brake))
                     vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
                                         brake=round(tri_brake, 3), steering=steer)
                 else:
@@ -520,7 +596,6 @@ def main() -> int:
                                         brake=round(tri_brake, 3), steering=steer)
             elif tri_state == "read":
                 tri_brake += max(-0.01, min(0.01, 0.0 - tri_brake))
-                creep_thr = min(THROTTLE, creep_thr + 0.004) if tri_state == "creep" else creep_thr
                 vc = VehicleControl(gear=GearMode.DRIVE, throttle=round(creep_thr, 3),
                                     brake=round(tri_brake, 3), steering=steer)
                 if now > tri_end:
@@ -584,24 +659,31 @@ def main() -> int:
                     float(getattr(vc, "brake", 0.0) or 0.0),
                     float(getattr(vc, "steering", 0.0) or 0.0))
 
-        # ---- Phase B：停稳后串行 OCR 暂存帧（主线程不卡，因为此时已经在停车读） ----
-        if phase == "read" and store and payload is None and eng is not None:
-            ocr_frame(*store.pop(0), now)
+        # ---- 读号队列：巡航中后台线程一直在读；这里只报排空进度（不再串行 OCR） ----
+        if phase == "read" and payload is None and not getattr(args, "_drained", False) \
+                and q.empty() and not reader.busy and stats["frames"] > 0:
+            args._drained = True
+            print(f"[{now:5.1f}s] 读号队列排空（OCR {stats['frames']} 帧，"
+                  f"命中 {stats['hits']}，丢弃 {stats['drop_budget'] + stats['drop_queue']} 帧）",
+                  flush=True)
 
         # ---- 取帧：用 YOLO 当闸门（0.03 s/帧），只把"侧向近处有车"的帧送 OCR ----
         if frames and now - last_shot >= (0.2 if tri_state else args.shot_every):
             last_shot = now
             tag += 1
-            want = 0 if tag % CAM0_EVERY == 0 else SIDE_CAMS[tag % len(SIDE_CAMS)]
+            if tag % CAM0_EVERY == 0:
+                want = 0                                    # A2：车头 20%
+            else:                                           # 侧向 80%，左右严格交替
+                want = SIDE_CAMS[(tag - tag // CAM0_EVERY) % len(SIDE_CAMS)]
             for cam in frames:
                 cid = int(cam.id)
                 img = getattr(cam, "frame", None)
                 if img is None or now < 2.0:
                     continue
                 if tri_state:
-                    # 三轮车读号期间：三路相机全存，不过质量闸门
-                    if cid in (0, 1, 2):
-                        offer(tag, now, cid, img)
+                    # 三轮车读号期间只走**就地读**（cam0），不再入队：
+                    # 同一帧既入队又就地读会被记两票，直接击穿 green「≥0.80 且 ≥2 票」
+                    # 的防误报条件（评审 MAJOR）。
                     # 贴近保护：黄绿块在车头画面里已经很大 → 立刻刹停，别再蹭
                     if cid == 0 and tri_state == "creep" and yellow_blob_w(img) > 250:
                         tri_state = "brake"
@@ -614,11 +696,11 @@ def main() -> int:
                     continue
                 if cid != want:
                     continue
+                car_slot_here = None          # 评审 BLOCKER-3：无 YOLO 权重时这里必须已定义
                 if cid == 0:
                     # 三轮车在车头方向出现过（cam0 读到 C-06 那帧），单独用黄车闸门
                     if not has_yellow_blob(img):
                         continue
-                    car_slot_here = None
                 elif det is not None:
                     try:
                         boxes = det(img, imgsz=416, conf=0.35, classes=[2, 5, 7], verbose=False)[0].boxes
@@ -635,15 +717,15 @@ def main() -> int:
                         cx = (x1 + x2) / 2.0
                         if not (CAR_MIN_W <= w <= CAR_MAX_W):
                             continue
-                        if not (0.15 * w_img <= cx <= 0.85 * w_img):
+                        if not (0.06 * w_img <= cx <= 0.94 * w_img):
                             continue
-                        if x1 <= 2 or x2 >= w_img - 2:
-                            continue
+                        if w > 0.9 * w_img:
+                            continue        # 整个画面都是车 = 已经蹭上了，读不出字
                         if good is None or w > good[0]:
                             good = (w, cx)
                     if good is None:
                         continue
-                    stats["ocr_gate"] = stats.get("ocr_gate", 0) + 1
+                    stats["gated"] += 1
                     pose_now["cx"], pose_now["w"] = good[1], good[0]
                     # 去重：自车位置 8 m 内视为同一辆车，每车最多存 PER_CAR_MAX 帧
                     car_slot_here = None
@@ -655,7 +737,7 @@ def main() -> int:
                         car_slot_here = {"pos": (x, y), "n": 0, "cam": cid}
                         car_slots.append(car_slot_here)
                     if car_slot_here["n"] >= PER_CAR_MAX:
-                        stats["dropped"] += 1
+                        stats["drop_cap"] += 1
                         continue
                 elif not has_white_text(img):
                     continue
@@ -666,7 +748,8 @@ def main() -> int:
             last_log = now
             summary = summarize(votes, lock)
             print(f"[{now:5.1f}s] {mode:<5} ({x:6.2f},{y:6.2f}) yaw={yaw:6.1f} v={v:4.2f} "
-                  f"帧={tag} OCR={stats['done']} 丢弃={stats['dropped']} "
+                  f"帧={tag} OCR={stats['frames']} 命中={stats['hits']} "
+                  f"队内={q.qsize()} 丢弃={stats['drop_budget'] + stats['drop_queue'] + stats['drop_cap']} "
                   f"票={{{', '.join(f'{c}:{n}' for c, (n, _k, _s) in sorted(summary.items()))}}}",
                   flush=True)
 
@@ -680,9 +763,31 @@ def main() -> int:
     except OSError:
         pass
 
+    if reader is not None:
+        # 哨兵可能因为队列满而丢：先腾位置，最多试 QUEUE_MAX+2 次（评审 MAJOR）
+        for _ in range(QUEUE_MAX + 2):
+            try:
+                q.put_nowait(None)
+                break
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        reader.join(timeout=3.0)
+        if reader.is_alive():
+            print(f"!! OCR 线程 3 s 内没退出（队列仍 {q.qsize()} 帧），细节可能丢", flush=True)
+        elif not reader.alive_ok:
+            print("!! OCR 线程是异常退出的，本局读号结果不完整", flush=True)
+        else:
+            print(f"OCR 线程正常退出：已读 {stats['frames']} 帧，命中 {stats['hits']} 号",
+                  flush=True)
+
     summary = summarize(votes, lock)
     print(f"最终票型 {dict(sorted(summary.items()))}", flush=True)
-    print(f"OCR {stats['done']} 帧、丢弃 {stats['dropped']}、"
+    print(f"OCR {stats['frames']} 帧、命中 {stats['hits']}、入队 {stats['enq']}、"
+          f"丢弃(预算/队列/上限) {stats['drop_budget']}/{stats['drop_queue']}/"
+          f"{stats['drop_cap']}、过闸 {stats['gated']}、"
           f"上报 {'是' if payload is not None else '否'}", flush=True)
     try:
         pose_fh.close()
