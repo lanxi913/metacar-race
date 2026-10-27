@@ -33,6 +33,7 @@
 | 连续场景 4（元素 1–4） | 430 | **430** | `tools/park_cs4.py --vmax 9.0`，元素级路由 `metacar_race/scene4/`（curve-r13） | ⚠️ 元素 5 闯红灯被结束 |
 | 连续场景 4（元素 5 十字路口） | ? | 未得分 | `scene4/safety.py` 灯态只取一次就缓存，直接闯红灯 | ❌ 待修 |
 | 连续场景 1~3、5 | ? | 未跑 | 元素题拼装，见 `docs/08-continuous-scene.md` | ❌ 未开始 |
+| 停车区违规检测（二） | F1 | **1000** | `vla_park_rapid.py --offset -3.0 --pulse --min-score 0.6`（RapidOCR + 脉冲滑行，见 `docs/VLA-RAPID-1000.md`） | ✅ 2026/10/27 平台 71455 实测 1000 |
 
 ## 三、奖励分（+10）怎么拿
 
