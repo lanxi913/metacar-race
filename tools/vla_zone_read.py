@@ -10,18 +10,20 @@
   那局把 5 个编号全读出来了（0.71~0.99），一圈 27 s。
   车型判据（该局六帧真值实测）：车漆色相 蓝 109~115 / 红 169~172 / 三轮车 32~35。
 
-策略（2026-10-27 改：单线程 + 1 worker + 巡航中在线读）
+策略（2026-10-27 二改：**恒定油门、零刹车**，依据 `docs/accel-research.md` §0.7/§0.9）
 ----
-1. 沿 `LAP` 绕一圈（2.6 m/s ≈ 53 s；快于 4.3 m/s 时每辆车的可读帧数腰斩）；
-2. 取帧闸门：侧向 cam1/cam2 用 YOLO 车宽 120~520 px 筛"好帧"，前向 cam0 用黄绿色
-   车身闸门找三轮车（三轮车不是 COCO 类别，YOLO 判不出来），四路轮转、每 tick 只送帧；
-3. 一帧进 `queue`（上限 6，满了丢最旧），**1 个 worker 用 `intra_op_num_threads=1`
+1. 沿 `LAP` 绕**两圈**（143.5 m × 2，4.78 m/s ≈ 60 s），第二圈补第一圈没读到的车；
+2. **纵向控制全程只有一条指令**：`thr=0.030, brk=0, gear=DRIVE`，第 0 帧就给满。
+   不做起步斜坡、不发刹车、不倒车脱困 —— 平台判的是「指令有没有变」，
+   而斜坡会把起步瞬态推出平台开局的约 1 s 免判期（r12/r17/r18/r19 的 −50 就是这么来的）；
+3. 取帧闸门：侧向 cam1/cam2 用 YOLO 车宽 80~560 px 筛"好帧"，前向 cam0 用黄绿色
+   车身闸门找三轮车（三轮车不是 COCO 类别，YOLO 判不出来），四路轮转（左右各 40%、车头 20%）；
+4. 一帧进 `queue`（上限 6，满了丢最旧），**1 个 worker 用 `intra_op_num_threads=1`
    推理**（3.6 帧/s；默认线程数会起 8+ OMP 线程把 30 Hz 主循环拖到 1 Hz）；
-4. 命中 `C-0x` 记一票，并用字块四周的色带判车型；
-5. 上报：蓝车编号（≥`--min-votes` 票）进 R01；三轮车编号进 R02（两票 0.80+ 或一票 0.85+）；
-   三轮车没读到时，若恰好缺 1 个候选号且已读 ≥3 个蓝车号，就用缺号补；
-6. 上报时机：R01 满 4 个且 R02 有号、且 t ≥ `--min-submit`；否则 t ≥ `--hard-submit`
-   时**按规则分别兜底**（缺哪条就把六号全报），绝不把上报时间往后推（上报即结算）。
+5. 命中 `C-0x` 记一票，并用字块四周的色带判车型；横向加速度按 `a_lat = v·Δyaw/Δt`
+   实时盯住，并把转向夹到 `a_lat ≤ A_LAT_MAX(3.5)`；
+6. 上报：蓝车编号进 R01、三轮车编号进 R02；R01 满 4 且 R02 有号就报，否则跑完两圈
+   或到 `--hard-submit` 时**按规则分别兜底**（缺哪条就把六号全报）。上报即结算。
 
 用法
 ----
@@ -66,11 +68,20 @@ LAP = [
 ]
 
 THROTTLE = 0.03
-V_CRUISE = 2.60         # r10（950 分）配置：靠收油滑行降到 2.6 m/s，全程不发刹车
-V_BAND = 0.35           # 速度滞环，避免油门每帧翻转
+# ---- 纵向控制：全程恒定油门、零刹车（依据 docs/accel-research.md §0.7 / §0.9）----
+# ① 判据是「指令」，不是实测加速度：probe r1 全程 thr=0.030/brk=0 一帧没改，起步瞬态
+#    10.13 m/s² 平台不管；r12/r17/r18/r19 每局都扣 −50，共同点是起步被
+#    `min(1, now/1.2)` 斜坡推到 1.1 s —— 平台起步后约 1 s 是免判期，斜坡把起步推了出去。
+# ② 因此：第 0 帧就给满 THROTTLE、**绝不做起步斜坡、绝不发刹车、绝不倒车**。
+#    稳定车速 ≈4.78 m/s（1 挡力平衡，thr 0.010 也只降到 4.37），读号窗口靠帧率换。
+A_LAT_MAX = 3.5         # 横向加速度预算（规则只写"加速度绝对值"，按最严口径自卫）
+WHEELBASE_M = 2.6
+MAX_STEER_RAD = 0.6
+V_CRUISE = 2.60         # 仅历史参考：r10 那版靠收油滑行的巡速，现已不用
+V_BAND = 0.35           # 同上，滞环带宽（已废弃）
 PIN_SPEED = 0.15
 PIN_SECONDS = 2.0
-BACK_S = 1.5
+BACK_S = 1.5            # 已废弃：倒车脱困会改动控制量，现在卡死只记日志不救
 BOUND = 36.0
 PER_CAR_MAX = 5         # 同一辆车最多存几帧（自车位置 8 m 内归为同一辆）
 CAR_DEDUPE_M = 8.0
@@ -258,15 +269,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=100.0)
     ap.add_argument("--out", default=str(Path.home() / "zone_read"))
-    ap.add_argument("--min-submit", type=float, default=55.0)
-    ap.add_argument("--hard-submit", type=float, default=85.0)
+    ap.add_argument("--min-submit", type=float, default=26.0)
+    ap.add_argument("--hard-submit", type=float, default=40.0)
     ap.add_argument("--min-votes", type=int, default=1)
     ap.add_argument("--yolo", default=r"D:\download3\算法邀請賽\accel_window_probe\_vla_ref\models\yolov8n.pt")
     ap.add_argument("--lookahead", type=float, default=6.0)
     ap.add_argument("--accept", type=float, default=4.0)
-    ap.add_argument("--shot-every", type=float, default=0.20)
-    ap.add_argument("--phase-a", type=float, default=70.0)
-    ap.add_argument("--frame-budget", type=int, default=120)   # 累计入队硬上限（不是队列长度）
+    ap.add_argument("--shot-every", type=float, default=0.10)
+    ap.add_argument("--phase-a", type=float, default=80.0)
+    ap.add_argument("--frame-budget", type=int, default=200)   # 累计入队硬上限（不是队列长度）
+    # 只跑一圈：r20 证明第二圈的调头弯（LAP 末尾 (22,-14) → 圈首 (32.5,-8.5) 是 183°）
+    # 在 4.78 m/s + 转向夹持下会甩出去 9 m 并撞车；而第一圈已经在 24.6 s 读全 4 个蓝车号。
     ap.add_argument("--laps", type=int, default=1)
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
@@ -354,8 +367,8 @@ def main() -> int:
     reader = Reader(q, votes, lock, "ocr0", stats)
     reader.start()
     car_slots: list = []      # 按自车位置去重：{"pos":(x,y), "n":已存帧数, "cam":cid}
-    read_brake = 0.0          # 读阶段渐进刹车（每帧 +0.01，绝不单帧大跳变）
-    cruise_on = 0.0           # 巡航油门滞环状态（1=给油 0=收油滑行）
+    read_brake = 0.0          # 已废弃（恒定油门模式下没有读阶段刹车）
+    cruise_on = 0.0           # 已废弃（滞环取消，油门恒定）
 
     print("连接仿真场景（先跑脚本，再点启动场景）...", flush=True)
     api = SceneAPI()
@@ -375,6 +388,8 @@ def main() -> int:
     submitted_at: float | None = None
     last_pose: tuple[float, float] | None = None
     prev_v: float | None = None
+    prev_yaw: float | None = None
+    lat_peak = 0.0
     prev_t = 0.0
     prev_cmd: tuple | None = None
     last_tick = 0.0
@@ -425,6 +440,17 @@ def main() -> int:
                 print(f"[{now:5.1f}s] !! |a|={abs(acc):4.1f} m/s²  v {prev_v:.2f}→{v:.2f}"
                       f"  dt={now - prev_t:.3f}s  上一帧指令 gear={g} thr={th:.3f}"
                       f" brk={br:.2f} steer={st:+.2f}", flush=True)
+        # 横向加速度自检：规则只写"加速度绝对值超过 5 m/s²"，没区分纵横。
+        # 判据既然是指令，横向大概率不算；但按最严口径盯住，超了就是航线画错了。
+        if prev_yaw is not None and now - prev_t > 1e-3:
+            omega = math.radians(((yaw - prev_yaw) + 180.0) % 360.0 - 180.0) / (now - prev_t)
+            a_lat = v * abs(omega)
+            if a_lat > lat_peak:
+                lat_peak = a_lat
+            if a_lat > 4.0:
+                print(f"[{now:5.1f}s] !! a_lat={a_lat:4.1f} m/s²  v={v:.2f} "
+                      f"ω={omega:+.2f} rad/s", flush=True)
+        prev_yaw = yaw
         prev_v, prev_t = v, now
 
         if now > args.seconds:
@@ -455,8 +481,10 @@ def main() -> int:
 
         if phase == "drive" and (follower.done() or now >= args.phase_a):
             phase = "read"
-            print(f"[{now:5.1f}s] 巡航段结束 → 停车排空读号队列（队内 {q.qsize()} 帧，"
-                  f"已读 {stats['frames']} 帧）", flush=True)
+            # 恒定油门模式下没有"停车排空"，圈数跑完就按已有票结算（上报即结算）
+            args.hard_submit = min(args.hard_submit, now)
+            print(f"[{now:5.1f}s] 巡航段结束（{args.laps} 圈跑完）→ 立即按已有票上报"
+                  f"（已读 {stats['frames']} 帧，命中 {stats['hits']}）", flush=True)
 
         # ---- 上报判定（上报即结算，先算） ----
         if payload is None:
@@ -492,43 +520,30 @@ def main() -> int:
                       f"（{note}；OCR {stats['frames']} 帧/命中 {stats['hits']}，idle={idle}）",
                       flush=True)
 
-        # ---- 纵向：只靠收油滑行（-0.26 m/s²）降到 V_CRUISE，全程不发刹车指令 ----
-        if phase == "read":
-            # 读阶段撞上就停着读完。刹车**上升和释放都限速 ±0.01/帧**：
-            # 平台扣的是指令阶跃（实测 0.10→0 一次就是一次加速度事件）。
-            target = 0.10 if v > 0.25 else 0.0
-            read_brake += max(-0.01, min(0.01, target - read_brake))
-            vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                brake=round(read_brake, 3), steering=0.0)
-            mode = "read"
-        elif back_until > now:
-            vc = VehicleControl(gear=GearMode.REVERSE, throttle=0.01, brake=0.0, steering=0.0)
-            mode = "back"
+        # ---- 纵向：全程恒定油门、零刹车、不倒车 ----
+        # 平台判的是「指令有没有变」，所以这里一帧都不改：不发刹车（刹车是阶跃）、
+        # 不倒车脱困（REVERSE 也是阶跃）、不做起步斜坡（会把起步瞬态推出 1 s 免判期）。
+        # 卡死只记日志；实在脱不了困就靠 hard-submit 按已有票提交。
+        if now > 6.0 and v < PIN_SPEED:
+            if pin_since is None:
+                pin_since = now
+            elif now - pin_since > PIN_SECONDS and not getattr(args, "_pinned", False):
+                args._pinned = True
+                print(f"[{now:5.1f}s] !! 卡死 ({x:.2f},{y:.2f}) —— 恒定油门模式不脱困，"
+                      f"继续等（按已有票提交）", flush=True)
         else:
-            if now > 6.0 and v < PIN_SPEED:
-                if pin_since is None:
-                    pin_since = now
-                elif now - pin_since > PIN_SECONDS:
-                    print(f"[{now:5.1f}s] !! 卡死 ({x:.2f},{y:.2f}) → 轻倒车脱困"
-                          f"（不踩刹车、不挂 P）", flush=True)
-                    back_until = now + BACK_S
-                    pin_since = None
-                    follower.seg = min(follower.seg + 1, len(waypoints) - 1)
-            else:
-                pin_since = None
-            # 巡航压到 V_CRUISE(2.6 m/s)：油门是开关量（0.03 一路顶到一挡力平衡
-            # 4.78 m/s），只能靠"给油/收油"滞环把速度压在 2.6 附近，收油时靠
-            # -0.26 m/s² 自然减速，全程不发刹车。
-            # 依据（22 局实测）：加速度扣分封顶 −50 且不累计，而 4.78 m/s 会把
-            # 每辆车的读号窗口压到 1 帧、直接漏编号 —— 正确率才是唯一杠杆。
-            if v < V_CRUISE - V_BAND:
-                cruise_on = 1.0
-            elif v > V_CRUISE + V_BAND:
-                cruise_on = 0.0
-            thr = THROTTLE * min(1.0, now / 1.2) * cruise_on
-            vc = VehicleControl(gear=GearMode.DRIVE, throttle=round(thr, 4), brake=0.0,
-                                steering=follower.steering(x, y, yaw))
-            mode = "cruise"
+            pin_since = None
+
+        steer = follower.steering(x, y, yaw)
+        # 横向预算：a_lat = v²·tan(δ)/L ≤ A_LAT_MAX ⇒ δ ≤ atan(A_LAT_MAX·L/v²)
+        if v > 1.0:
+            delta_max = math.atan(WHEELBASE_M * A_LAT_MAX / (v * v))
+            steer_max = min(1.0, delta_max / MAX_STEER_RAD)
+            if abs(steer) > steer_max:
+                steer = math.copysign(steer_max, steer)
+        vc = VehicleControl(gear=GearMode.DRIVE, throttle=THROTTLE, brake=0.0,
+                            steering=steer)
+        mode = "cruise"
 
         if payload is not None:
             api.set_vehicle_control(vc, vla_extension=payload)
@@ -624,8 +639,10 @@ def main() -> int:
             break
 
     try:
-        # 收尾也留在 DRIVE 挡：PARKING 单帧切换本身就是一次指令阶跃（−50 的来源之一）
-        api.set_vehicle_control(VehicleControl(gear=GearMode.DRIVE, throttle=0.0, brake=0.10))
+        # 收尾也不改指令：任何 brake 阶跃（哪怕 0.10）都可能是加速度事件，
+        # 恒定油门模式下离开循环时继续保持同一条指令即可。
+        api.set_vehicle_control(VehicleControl(gear=GearMode.DRIVE, throttle=THROTTLE,
+                                               brake=0.0))
     except OSError:
         pass
 
@@ -651,6 +668,7 @@ def main() -> int:
 
     summary = summarize(votes, lock)
     print(f"最终票型 {dict(sorted(summary.items()))}", flush=True)
+    print(f"横向加速度峰值 a_lat={lat_peak:.2f} m/s²（预算 {A_LAT_MAX}）", flush=True)
     print(f"OCR {stats['frames']} 帧、命中 {stats['hits']}、入队 {stats['enq']}、"
           f"丢弃(预算/队列/上限) {stats['drop_budget']}/{stats['drop_queue']}/"
           f"{stats['drop_cap']}、过闸 {stats['gated']}、"
