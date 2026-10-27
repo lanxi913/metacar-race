@@ -77,11 +77,7 @@ CAR_DEDUPE_M = 8.0
 CAR_MIN_W = 80.0        # 车框太远（<80 px）不存（A3：95 时每车只攒到 1~4 帧）
 CAR_MAX_W = 560.0       # 车框太近/被裁切（>560 px）不存
 CAM0_EVERY = 5          # 车头相机抽样：每 5 帧一次（其余 4 帧全给左右侧相机，车都在航线两侧）
-YELLOW_MIN = 200        # 黄车块面积阈值（原 350 太严，三轮车进不来）
-TRI_STOP_S = 3.0        # 车头看到三轮车后停车连拍的时长
-TRI_TRIGGER_W = 90      # 车头画面里黄绿车身的宽度到 90 px 就刹停（实测：10 m 外 28 px、5 m 处 135 px）
-TRI_MAX_READ = 3        # 三轮车读号期间允许就地 OCR 的 cam0 帧数（停太久平台会挪车）
-ROI_TOP = 180         # 历史阈值：OCR 现在送整帧（裁 ROI 实测反而更慢）
+YELLOW_MIN = 200        # 黄车块面积阈值（车头相机只保留"能看见三轮车车身"的帧）
 
 CODE_RE = re.compile(r"C\s*[-—–·.．:：_]?\s*(0?\d{1,2})")
 CANDIDATE_CODES = [f"C-{i:02d}" for i in range(1, 7)]
@@ -126,20 +122,6 @@ def has_yellow_blob(img: np.ndarray, min_px: int = YELLOW_MIN) -> bool:
     h, s, v = hsv[band, :, 0], hsv[band, :, 1], hsv[band, :, 2]
     mask = (h >= 25) & (h <= 45) & (s >= 130) & (v >= 80)
     return int(mask.sum()) >= min_px
-
-
-def yellow_blob_w(img: np.ndarray, min_px: int = YELLOW_MIN) -> int:
-    """返回车头画面里最大黄绿色块的宽度（px，按 640 宽口径），用来判断"贴太近"该停了。"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    hsv[: int(0.52 * hsv.shape[0]), :] = 0        # 地平线以上的黄块（规则牌）不算车身
-    mask = cv2.inRange(hsv, np.array((25, 130, 80)), np.array((45, 255, 255)))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    n, _lab, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
-    best = 0
-    for i in range(1, n):
-        if int(stats[i, cv2.CC_STAT_AREA]) >= min_px:
-            best = max(best, int(stats[i, cv2.CC_STAT_WIDTH]))
-    return best
 
 
 def body_hue(img: np.ndarray, box) -> float:
@@ -361,16 +343,11 @@ def main() -> int:
     lock = threading.Lock()
     stats = {"frames": 0, "hits": 0, "enq": 0,
              "drop_budget": 0, "drop_queue": 0, "drop_cap": 0, "gated": 0}
-    eng = None
     q: "queue.Queue" = queue.Queue(maxsize=QUEUE_MAX)
     reader: "Reader | None" = None
     try:
-        from rapidocr_onnxruntime import RapidOCR
-        t_ocr = time.time()
-        eng = RapidOCR(intra_op_num_threads=1)     # 主线程这份只给三轮车停靠时用
-        eng(np.zeros((240, 320, 3), np.uint8))     # 预热，别让首帧多花 2 s
-        print(f"OCR 引擎就绪（RapidOCR/PP-OCRv4，1 线程，预热 {time.time() - t_ocr:.1f}s）",
-              flush=True)
+        from rapidocr_onnxruntime import RapidOCR    # noqa: F401 - 只做依赖可用性检查
+        print("OCR 依赖就绪（RapidOCR/PP-OCRv4；引擎由 worker 线程自建）", flush=True)
     except Exception as exc:      # noqa: BLE001
         # 没有 OCR 就没有任何编号可报，硬跑等于白跑一局：直接失败退出（评审 B2）
         raise SystemExit(f"OCR 初始化失败，无法读号: {exc}") from exc
@@ -378,14 +355,6 @@ def main() -> int:
     reader.start()
     car_slots: list = []      # 按自车位置去重：{"pos":(x,y), "n":已存帧数, "cam":cid}
     read_brake = 0.0          # 读阶段渐进刹车（每帧 +0.01，绝不单帧大跳变）
-    tri_done = False          # 三轮车专用停靠只做一次
-    tri_state = ""            # 三轮车读号状态机：brake / read / creep（空串=不启用）
-    tri_end = 0.0
-    tri_cycles = 0
-    tri_start = 0.0
-    creep_thr = 0.0
-    tri_brake = 0.0
-    tri_reads = 0
     cruise_on = 0.0           # 巡航油门滞环状态（1=给油 0=收油滑行）
 
     print("连接仿真场景（先跑脚本，再点启动场景）...", flush=True)
@@ -442,39 +411,6 @@ def main() -> int:
         stats["enq"] += 1
         return True
 
-    def ocr_frame(tag_: int, t_: float, cid_: int, img_, now_: float) -> None:
-        """三轮车停靠时就地读一帧（主线程串行，车已停/很慢）。
-
-        读**整帧**：实测 ROI 裁剪反而更慢（裁 y<180 后短边 300 被 rapidocr 的
-        limit_side_len=736 放大 2.45 倍，281 ms → 444 ms）。
-        """
-        t_step = time.time()
-        try:
-            res, _ = eng(img_)
-        except Exception as exc:      # noqa: BLE001
-            res = []
-            print(f"!! OCR 异常 {exc}", flush=True)
-        stats["frames"] += 1
-        for box, txt, score in (res or []):
-            if float(score) < 0.5:
-                continue
-            m = CODE_RE.search(str(txt).replace(" ", ""))
-            if not m:
-                continue
-            code = f"C-{int(m.group(1)):02d}"
-            if code not in CANDIDATE_CODES:
-                continue            # A1：只认 C-01..C-06
-            hue = body_hue(img_, box)
-            cls = hue_class(hue)
-            with lock:
-                votes.setdefault(code, []).append(
-                    (round(float(score), 2), round(hue, 1), cls, round(t_, 1)))
-                stats["hits"] += 1
-            print(f"[{now_:5.1f}s] 读到 {code} score={float(score):.2f} "
-                  f"色相={hue:5.1f}→{cls} cam{cid_}@{t_:.1f}s", flush=True)
-        print(f"[{now_:5.1f}s] 就地读帧 t{tag_:04d} cam{cid_} 用时 {time.time() - t_step:.2f}s"
-              f"（队内 {q.qsize()} 帧）", flush=True)
-
     for msg, frames in api.main_loop():
         now = time.time() - t0
         pose = msg.pose_gnss
@@ -519,22 +455,8 @@ def main() -> int:
 
         if phase == "drive" and (follower.done() or now >= args.phase_a):
             phase = "read"
-            if tri_state:
-                tri_state = ""
-                print(f"[{now:5.1f}s] 进读阶段，三轮车状态机强制收尾", flush=True)
             print(f"[{now:5.1f}s] 巡航段结束 → 停车排空读号队列（队内 {q.qsize()} 帧，"
                   f"已读 {stats['frames']} 帧）", flush=True)
-
-        # 三轮车专用停靠：它只在车头方向出现（左右侧相机看不到），所以车头一旦
-        # 看到黄绿色车身就地停 3 s 连拍，读号靠这几帧
-        if phase == "drive" and not tri_done and now > 8.0 and frames:
-            cam0_img = next((getattr(c, "frame", None) for c in frames if int(c.id) == 0), None)
-            if cam0_img is not None and yellow_blob_w(cam0_img) >= TRI_TRIGGER_W:
-                tri_done = True
-                tri_state = "brake"
-                tri_end = now
-                tri_start = now
-                print(f"[{now:5.1f}s] 车头看到黄绿色车身 → 刹停后近距离读号", flush=True)
 
         # ---- 上报判定（上报即结算，先算） ----
         if payload is None:
@@ -579,48 +501,6 @@ def main() -> int:
             vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
                                 brake=round(read_brake, 3), steering=0.0)
             mode = "read"
-        elif tri_state:
-            # 三轮车读号：刹停 → 连拍读 → 没读清就小步靠近（≤3 次），车已停/慢，卡顿无妨
-            steer = follower.steering(x, y, yaw)
-            if tri_state == "brake":
-                if v > 0.25 and now < tri_end + 3.5:
-                    # 刹车给到 0.25：0.10 从 2.6 m/s 要 11 m 才停得住（r16 就是没停住撞上）
-                    tri_brake += max(-0.02, min(0.02, 0.25 - tri_brake))
-                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                        brake=round(tri_brake, 3), steering=steer)
-                else:
-                    tri_state = "read"
-                    tri_end = now + 1.3
-                    tri_brake += max(-0.01, min(0.01, 0.0 - tri_brake))
-                    vc = VehicleControl(gear=GearMode.DRIVE, throttle=0.0,
-                                        brake=round(tri_brake, 3), steering=steer)
-            elif tri_state == "read":
-                tri_brake += max(-0.01, min(0.01, 0.0 - tri_brake))
-                vc = VehicleControl(gear=GearMode.DRIVE, throttle=round(creep_thr, 3),
-                                    brake=round(tri_brake, 3), steering=steer)
-                if now > tri_end:
-                    got = any(k == "green" and s >= 0.80 and n >= 2
-                              for (n, k, s) in summarize(votes, lock).values())
-                    if got or tri_cycles >= 3 or now - tri_start > 9.0:
-                        tri_state = ""
-                        print(f"[{now:5.1f}s] 三轮车读号结束（靠近 {tri_cycles} 次，"
-                              f"读到={got}）", flush=True)
-                    else:
-                        tri_state = "creep"
-                        tri_end = now + 1.1
-                        tri_cycles += 1
-                        creep_thr = 0.006
-                        print(f"[{now:5.1f}s] 三轮车还没读清 → 第 {tri_cycles} 次小步靠近",
-                              flush=True)
-            else:                      # creep：低速贴近，方向盘继续跟航线
-                tri_brake += max(-0.01, min(0.01, 0.0 - tri_brake))
-                creep_thr = min(THROTTLE, creep_thr + 0.004)
-                vc = VehicleControl(gear=GearMode.DRIVE, throttle=round(creep_thr, 3),
-                                    brake=round(tri_brake, 3), steering=steer)
-                if now > tri_end:
-                    tri_state = "brake"
-                    tri_end = now
-            mode = "tri"
         elif back_until > now:
             vc = VehicleControl(gear=GearMode.REVERSE, throttle=0.01, brake=0.0, steering=0.0)
             mode = "back"
@@ -668,7 +548,7 @@ def main() -> int:
                   flush=True)
 
         # ---- 取帧：用 YOLO 当闸门（0.03 s/帧），只把"侧向近处有车"的帧送 OCR ----
-        if frames and now - last_shot >= (0.2 if tri_state else args.shot_every):
+        if frames and now - last_shot >= args.shot_every:
             last_shot = now
             tag += 1
             if tag % CAM0_EVERY == 0:
@@ -679,20 +559,6 @@ def main() -> int:
                 cid = int(cam.id)
                 img = getattr(cam, "frame", None)
                 if img is None or now < 2.0:
-                    continue
-                if tri_state:
-                    # 三轮车读号期间只走**就地读**（cam0），不再入队：
-                    # 同一帧既入队又就地读会被记两票，直接击穿 green「≥0.80 且 ≥2 票」
-                    # 的防误报条件（评审 MAJOR）。
-                    # 贴近保护：黄绿块在车头画面里已经很大 → 立刻刹停，别再蹭
-                    if cid == 0 and tri_state == "creep" and yellow_blob_w(img) > 250:
-                        tri_state = "brake"
-                        tri_end = now
-                        print(f"[{now:5.1f}s] 三轮车已贴近 → 刹停", flush=True)
-                    # 车已停/很慢，就地 OCR cam0（不会拖慢控制）
-                    if cid == 0 and eng is not None and tri_reads < TRI_MAX_READ:
-                        tri_reads += 1
-                        ocr_frame(tag, now, cid, img, now)
                     continue
                 if cid != want:
                     continue
