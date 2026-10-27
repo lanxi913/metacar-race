@@ -1,14 +1,20 @@
-"""功能区合规检测（v1 实跑版）：绕场实时读侧门编号，按车型分类上报。
+"""功能区合规检测（v2）：绕场实时读侧门编号，按车型分类上报。
+
+两套任务共用
+----
+- 任务一 `功能区合规检测任务`：牌子 `RU1 不允许蓝色小轿车` / `RU2 禁止三轮车`（`--violator blue`）
+- 任务二 `功能区合规检测任务（二）`：牌子 `R01 不允许红色小轿车` / `R02 禁止三轮车`（`--violator red`）
+  两场景除"R01 禁停车型"外逐项相同：50×50 功能区、120 s、起点 `(34.60,-4.05)`、
+  路牌杆 `(30.0,-3.9)`、场内 6 辆（4 蓝 + 1 红 + 1 三轮车）、编号每局重排。
 
 依据
 ----
-- 规则牌（入口 `(30.0,-3.9)` 杆上）：`RU1 不允许蓝色小轿车` / `RU2 禁止三轮车`
-  （代码里按结算字段写 `R01`/`R02`；平台实际用哪个键名以提交回报为准）。
 - 场内固定 6 辆：4 辆蓝色小轿车 + 1 辆三轮车 + 1 辆红色小轿车；**编号每局重排**，
-  但车辆位置、数量、车型不变（用户 2026-10-26 确认，多局帧对照一致）。
-- 侧门白字编号在 3~6 m 侧距上可读：RapidOCR（PP-OCRv4 ONNX）在 `vla-perimeter-r2`
-  那局把 5 个编号全读出来了（0.71~0.99），一圈 27 s。
-  车型判据（该局六帧真值实测）：车漆色相 蓝 109~115 / 红 169~172 / 三轮车 32~35。
+  但车辆位置、数量、车型不变（多局帧对照一致）。
+- 车型判据（实测）：车漆色相 蓝 109~115 / 红 169~172 / 三轮车 32~35。
+- 车号在车侧白字，3~6 m 侧距可读（RapidOCR PP-OCRv4 整帧 0.71~0.99）。
+  但红车那处只有 30×8 px，**整帧常常读不出**：r1/r2/r3/r4 的红车分别读到 1/1/0/0 票，
+  而把 YOLO 框裁出来原尺寸送同一个模型，同一帧就从零命中变 `C-04` 0.84 ⇒ `--crop-ocr`。
 
 策略（2026-10-27 二改：**恒定油门、零刹车**，依据 `docs/accel-research.md` §0.7/§0.9）
 ----
@@ -99,7 +105,7 @@ SIDE_CAMS = (1, 2)          # cam1 左、cam2 右
 #   抖动 p95 33.6 ms / max 34.4 ms / >100 ms 卡顿 0 次 ⇒ 巡航中 inline 读号不掉帧；
 #   而 RapidOCR() 默认线程（8+ 线程）两个 worker 会把主循环拖到 1 Hz（r4/r12 的
 #   "读不到号"就是这么来的，不是物理极限）。
-QUEUE_MAX = 6
+QUEUE_MAX = 6        # 队列深度：一帧 0.9 MB，6 帧≈5 MB；实测单 worker 1.1 s/帧
 WORKERS = 1          # 只允许 1 个 worker：多线程推理会把主循环拖到 1 Hz
 
 
@@ -133,6 +139,19 @@ def has_yellow_blob(img: np.ndarray, min_px: int = YELLOW_MIN) -> bool:
     h, s, v = hsv[band, :, 0], hsv[band, :, 1], hsv[band, :, 2]
     mask = (h >= 25) & (h <= 45) & (s >= 130) & (v >= 80)
     return int(mask.sum()) >= min_px
+
+
+def crop_rect(img: np.ndarray, cx: float, w: float) -> tuple[int, int, int, int]:
+    """侧向读号的裁块：YOLO 框横向外扩到 1.5 倍，纵向从车窗线往下到画面底。
+
+    参数是扫出来的（18 帧网格扫描 `crop_sweep.py`，y0 0.40~0.55 × 外扩 0.6~1.1 倍）：
+    0.45/0.75 这一档同时救回 r3 的 `C-01`（0.75）和 r4 的 `C-04`（0.84），而这两帧
+    整帧 OCR 都是零命中或 `C-O1` 这种带字母 O 的半截串。
+    **只裁不放**：放大 ×2/×3 会把细笔画糊成 `G-O4`/`C-OL`，PP-OCRv4 自己会做缩放。
+    """
+    h, wimg = img.shape[:2]
+    return (max(0, int(cx - 0.75 * w)), int(h * 0.45),
+            min(wimg, int(cx + 0.75 * w)), h)
 
 
 def body_hue(img: np.ndarray, box) -> float:
@@ -199,34 +218,60 @@ class Reader(threading.Thread):
             item = self.q.get()
             if item is None:
                 return
-            tag, t, cid, img = item
+            tag, t, cid, img, crop = item
             self.busy = True
             try:
-                res, _ = engine(img)
-            except Exception as exc:      # noqa: BLE001 - 线程里不炸主循环
-                print(f"!! OCR 异常 {exc}", flush=True)
-                res = []
+                for source, view in self._views(img, crop):
+                    try:
+                        res, _ = engine(view)
+                    except Exception as exc:      # noqa: BLE001 - 线程里不炸主循环
+                        print(f"!! OCR 异常 {exc}", flush=True)
+                        res = []
+                    finally:
+                        self.stats["passes"] += 1
+                    if self._absorb(res, view, t, cid, source) and source == "crop":
+                        break        # 裁块已经命中就不再做整帧，省一半推理
             finally:
+                self.stats["frames"] += 1
+                self.last_done = time.time()
                 self.busy = False
-            self.stats["frames"] += 1
-            self.last_done = time.time()
-            for box, txt, score in (res or []):
-                if float(score) < 0.45:
-                    continue
-                m = CODE_RE.search(str(txt).replace(" ", ""))
-                if not m:
-                    continue
-                code = f"C-{int(m.group(1)):02d}"
-                if code not in CANDIDATE_CODES:
-                    continue        # A1：只认 C-01..C-06，`C-64` 这类是误读（r17 实测出现）
-                hue = body_hue(img, box)
-                cls = hue_class(hue)
-                with self.lock:
-                    self.votes.setdefault(code, []).append(
-                        (round(float(score), 2), round(hue, 1), cls, round(t, 1)))
-                    self.stats["hits"] += 1
-                print(f"[{t:5.1f}s] 读到 {code} score={float(score):.2f} "
-                      f"色相={hue:5.1f}→{cls} cam{cid}", flush=True)
+
+    @staticmethod
+    def _views(img: np.ndarray, crop):
+        """裁剪优先、整帧兜底：车侧裁块里字更大，整帧经常"看不见"。
+
+        依据（2026-10-27 四局实测）：同一帧 `gate_t0136_cam2.jpg`（r4 红车 `C-04`），
+        整帧 OCR 零命中，裁块 282×264 原尺寸送进 PP-OCRv4 出 `C-04` 0.84；
+        再放大 ×2/×3 反而退化成 `G-04`（插值把细笔画糊了）⇒ 只裁不放。
+        """
+        if crop is not None:
+            x0, y0, x1, y1 = crop
+            if x1 - x0 >= 48 and y1 - y0 >= 48:
+                yield "crop", img[y0:y1, x0:x1]
+        yield "full", img
+
+    def _absorb(self, res, img: np.ndarray, t: float, cid: int, source: str) -> bool:
+        """一次 OCR 的文本结果 → 票；返回这一遍有没有命中。"""
+        hit = False
+        for box, txt, score in (res or []):
+            if float(score) < 0.45:
+                continue
+            m = CODE_RE.search(str(txt).replace(" ", ""))
+            if not m:
+                continue
+            code = f"C-{int(m.group(1)):02d}"
+            if code not in CANDIDATE_CODES:
+                continue        # A1：只认 C-01..C-06，`C-64` 这类是误读（r17 实测出现）
+            hue = body_hue(img, box)
+            cls = hue_class(hue)
+            with self.lock:
+                self.votes.setdefault(code, []).append(
+                    (round(float(score), 2), round(hue, 1), cls, round(t, 1)))
+                self.stats["hits"] += 1
+            hit = True
+            print(f"[{t:5.1f}s] 读到 {code} score={float(score):.2f} "
+                  f"色相={hue:5.1f}→{cls} cam{cid} {source}", flush=True)
+        return hit
 
 
 def summarize(votes: dict, lock: threading.Lock) -> dict[str, tuple[int, str, float]]:
@@ -245,12 +290,24 @@ def summarize(votes: dict, lock: threading.Lock) -> dict[str, tuple[int, str, fl
 
 def build_violations(summary: dict[str, tuple[int, str, float]],
                      min_votes: int,
-                     violator_cls: str = "blue") -> tuple[list[str], list[str], str]:
+                     violator_cls: str = "blue",
+                     fill_red: bool = False,
+                     fill_max: int = 1) -> tuple[list[str], list[str], str]:
     """R01 = `violator_cls` 这一类车的编号集合，R02 = 三轮车（green）。
 
     任务一牌子写「RU1 不允许蓝色小轿车」⇒ violator_cls="blue"；
     任务二（`功能区合规检测任务（二）`）牌子写「R01 不允许红色小轿车」⇒ "red"。
     类别语义只在这一处换，其余（取帧、读号、判类、兜底）两任务完全共用。
+
+    `fill_red` / `fill_max`（默认关，任务二显式传参）：任务二全场只有 1 辆红车，若
+    4 辆蓝车和三轮车都已经读到、红车那个号在 `missing` 里，就按排除法直接把它补进
+    R01，不必真的读到红车门上的字。依据 r4：红车 `C-04` 四帧全部 OCR 零命中，其余
+    5 辆都读到，缺号正好是 `C-04`（这局本该 1000，实际 642.86）。
+
+    `fill_max` 允许把**整个缺号集合**都报上去：评分是 `2C/(A+B)`，A=真实违规 1 辆、
+    B=上报条数，所以缺 1 报 1 得 1.0、缺 2 报 2 得 2/3、缺 2 却按「六号全报」只得
+    2/7=0.286。r6 就是缺 2 个（`C-01` 红车 + 一辆没读到的蓝车 `C-06`），报 2 个能把
+    该规则从 0.286 提到 0.667，整局 643 → 833。
     """
     cand = set(CANDIDATE_CODES)
     cars = sorted(c for c, (n, k, _s) in summary.items()
@@ -269,6 +326,15 @@ def build_violations(summary: dict[str, tuple[int, str, float]],
             note = f"三轮车没读到，按缺号补 {missing[0]}"
         else:
             note = f"三轮车没读到，缺号 {missing}"
+    if fill_red and not cars:
+        seen = set(summary)
+        missing = [c for c in CANDIDATE_CODES if c not in seen]
+        n_blue = sum(1 for c, (n, k, _s) in summary.items()
+                     if k == "blue" and n >= min_votes and c in cand)
+        if 1 <= len(missing) <= max(1, fill_max) and n_blue >= 3 and green:
+            cars = missing
+            note += (f"；R01 按排除法补 {missing}（已识别 {len(summary)} 个号："
+                     f"{n_blue} 辆蓝车 + 三轮车，缺 {len(missing)} 个号）")
     return cars, green, note
 
 
@@ -286,6 +352,17 @@ def main() -> int:
     ap.add_argument("--expect-violators", type=int, default=4,
                     help="算「读完」需要凑到的违停车数量；任务一固定 4 辆，任务二未知时"
                          "给大值（如 9）即只在圈末按已有票上报")
+    # 两处任务二专用加固（默认关，不影响任务一跑法）
+    ap.add_argument("--crop-ocr", action="store_true",
+                    help="侧向帧先用 YOLO 框裁块读号、整帧兜底（默认整帧）")
+    ap.add_argument("--fill-red", action="store_true",
+                    help="4 辆蓝车 + 三轮车都读到且只缺 1 个号时，按排除法把它判给 R01")
+    ap.add_argument("--fill-max", type=int, default=1,
+                    help="排除法最多允许缺几个号（缺 1 报 1 得 1.0、缺 2 报 2 得 2/3；"
+                         "缺 2 却按六号全报只有 0.286）")
+    ap.add_argument("--drain", type=float, default=0.0,
+                    help="圈末等 OCR 队列排空的秒数（r6：三轮车两帧 26.1/26.3 s 进队、"
+                         "27.2 s 就提交，绿票没赶上 ⇒ R02 六号全报）")
     ap.add_argument("--yolo", default=r"D:\download3\算法邀請賽\accel_window_probe\_vla_ref\models\yolov8n.pt")
     ap.add_argument("--lookahead", type=float, default=6.0)
     ap.add_argument("--accept", type=float, default=4.0)
@@ -299,7 +376,9 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"实验配置: R01 禁停车型={args.violator} expect={args.expect_violators} "
-          f"min-submit={args.min_submit} hard-submit={args.hard_submit} laps={args.laps}",
+          f"min-submit={args.min_submit} hard-submit={args.hard_submit} laps={args.laps} "
+          f"crop-ocr={args.crop_ocr} fill-red={args.fill_red} fill-max={args.fill_max} "
+          f"drain={args.drain}",
           flush=True)
 
     # 两圈兜底：引擎 30 fps，采样从 0.25 s/帧 提高到 0.09 s/帧（≈11 Hz），
@@ -347,6 +426,31 @@ def main() -> int:
         r1 = build_violations(fake, 1, "blue")
         r2 = build_violations(fake, 1, "red")
         print(f"   规则回归 blue→R01={r1[0]} R02={r1[1]} | red→R01={r2[0]} R02={r2[1]}")
+        # 排除法回归：r4 真实票型（红车 C-04 一票没读到，其余 5 辆都读到了）
+        r4 = {"C-01": (5, "blue", 0.99), "C-02": (2, "blue", 0.97),
+              "C-03": (6, "blue", 0.99), "C-05": (3, "green", 0.99),
+              "C-06": (4, "blue", 0.97)}
+        e0 = build_violations(r4, 1, "red")
+        e1 = build_violations(r4, 1, "red", True)
+        print(f"   排除法回归 fill-red 关→R01={e0[0]} 开→R01={e1[0]}（{e1[2]}）")
+        # 缺 2 个号的回归：r6 真实票型（红车 C-01 没读到，另一辆蓝车 C-06 也没读到）
+        # 缺 2 报 2 得 2/3；照老的「六号全报」只得 2/7=0.286 ⇒ 这局 643 → 833
+        r6 = {"C-02": (5, "blue", 0.99), "C-03": (5, "green", 0.99),
+              "C-04": (6, "blue", 0.99), "C-05": (4, "blue", 0.99)}
+        f1 = build_violations(r6, 1, "red", True, 1)
+        f2 = build_violations(r6, 1, "red", True, 2)
+        print(f"   缺2回归 fill-max 1→R01={f1[0]} | 2→R01={f2[0]}（{f2[2]}）")
+        # 裁块回归：r4 那帧整帧 OCR 零命中，裁块应读出 C-04（2026-10-27 实测 0.84）
+        f136 = Path(r"D:\download3\算法邀請賽\accel_window_probe\_vla_ref\runs"
+                    r"\zone2-read-r4\f\gate_t0136_cam2.jpg")
+        if f136.is_file():
+            from rapidocr_onnxruntime import RapidOCR
+            img3 = cv2.imdecode(np.fromfile(f136, dtype=np.uint8), cv2.IMREAD_COLOR)
+            x0, y0, x1, y1 = crop_rect(img3, 201.0, 188.0)
+            res3, _ = RapidOCR(intra_op_num_threads=1)(img3[y0:y1, x0:x1])
+            got3 = [(str(txt).strip(), round(float(sc), 2)) for _b, txt, sc in (res3 or [])
+                    if float(sc) >= 0.45]
+            print(f"   裁块回归 {x1 - x0}×{y1 - y0} 读出={got3 or '(无)'}（整帧同帧为零命中）")
         return 0
 
     out = Path(args.out)
@@ -378,7 +482,7 @@ def main() -> int:
     # 而停车串行会把每辆车的读号窗口压到 1~2 帧（r12 漏掉 C-04 就是这么发生的）。
     votes: dict = {}
     lock = threading.Lock()
-    stats = {"frames": 0, "hits": 0, "enq": 0,
+    stats = {"frames": 0, "passes": 0, "hits": 0, "enq": 0,
              "drop_budget": 0, "drop_queue": 0, "drop_cap": 0, "gated": 0}
     q: "queue.Queue" = queue.Queue(maxsize=QUEUE_MAX)
     reader: "Reader | None" = None
@@ -423,7 +527,7 @@ def main() -> int:
     pose_fh = open(shots.parent / "gates.csv", "w", encoding="utf-8")
     pose_fh.write("tag,t,ego_x,ego_y,yaw,v,cam,box_cx,box_w\n")
 
-    def offer(tag_: int, now_: float, cid: int, img) -> bool:
+    def offer(tag_: int, now_: float, cid: int, img, crop=None) -> bool:
         """把一帧塞进 OCR 队列；队列满了丢**最旧**的一帧——保证读的是最新画面。"""
         if stats["enq"] >= args.frame_budget:
             stats["drop_budget"] += 1
@@ -433,7 +537,7 @@ def main() -> int:
                       f"{pose_now['yaw']:.1f},{pose_now['v']:.2f},{cid},"
                       f"{pose_now['cx']:.0f},{pose_now['w']:.0f}\n")
         pose_fh.flush()
-        item = (tag_, now_, cid, img.copy())
+        item = (tag_, now_, cid, img.copy(), crop)
         try:
             q.put_nowait(item)
         except queue.Full:
@@ -505,22 +609,28 @@ def main() -> int:
 
         if phase == "drive" and (follower.done() or now >= args.phase_a):
             phase = "read"
-            # 恒定油门模式下没有"停车排空"，圈数跑完就按已有票结算（上报即结算）
-            args.hard_submit = min(args.hard_submit, now)
-            print(f"[{now:5.1f}s] 巡航段结束（{args.laps} 圈跑完）→ 立即按已有票上报"
-                  f"（已读 {stats['frames']} 帧，命中 {stats['hits']}）", flush=True)
+            # 圈末排空（--drain）：r6 的三轮车两帧 t=26.1/26.3 s 才进队，27.2 s 就提交，
+            # 绿票没赶上 ⇒ R02 六号全报。给最多 `--drain` 秒把队列吃完再结算。
+            args.hard_submit = min(args.hard_submit, now + max(0.0, args.drain))
+            print(f"[{now:5.1f}s] 巡航段结束（{args.laps} 圈跑完）→ 按已有票上报"
+                  f"（已读 {stats['frames']} 帧，命中 {stats['hits']}"
+                  + (f"，圈末最多再等 {args.drain:.1f} s 排空）" if args.drain > 0 else "）"),
+                  flush=True)
 
         # ---- 上报判定（上报即结算，先算） ----
         if payload is None:
             summary = summarize(votes, lock)
-            cars, green, note = build_violations(summary, args.min_votes, args.violator)
+            cars, green, note = build_violations(summary, args.min_votes, args.violator,
+                                                 args.fill_red, args.fill_max)
             # 「读完」= 队列空 + worker 不在推理 + 已安静 0.4 s。只看 q.empty() 会把
             # 「worker 刚取走最后一帧、正在推理」误判成「已读完」（评审 MAJOR）。
             idle = q.empty() and not reader.busy and (time.time() - reader.last_done >= 0.4)
             force = now >= args.hard_submit
+            # 排空完成即结算：--drain 期间队列真空了就马上提交，不必耗满 `--drain` 秒
+            drained = args.drain > 0 and phase == "read" and idle
             full = len(cars) >= args.expect_violators and len(green) >= 1
-            if (full and now >= args.min_submit) or force:
-                if force and not full:
+            if (full and now >= args.min_submit) or force or drained:
+                if (force or drained) and not full:
                     # 到点还没读全：**按规则分别兜底**，绝不再往后推时间。
                     # 旧版这里 args.hard_submit = now + 8，而 q.empty() 分支在进读阶段后
                     # 恒真，两者叠加会把「没读到号」变成「永不提交」（评审 BLOCKER-1）。
@@ -603,6 +713,7 @@ def main() -> int:
                 if cid != want:
                     continue
                 car_slot_here = None          # 评审 BLOCKER-3：无 YOLO 权重时这里必须已定义
+                crop = None                   # 裁块读号（--crop-ocr 才用）
                 if cid == 0:
                     # 三轮车在车头方向出现过（cam0 读到 C-06 那帧），单独用黄车闸门
                     if not has_yellow_blob(img):
@@ -633,6 +744,8 @@ def main() -> int:
                         continue
                     stats["gated"] += 1
                     pose_now["cx"], pose_now["w"] = good[1], good[0]
+                    if args.crop_ocr:
+                        crop = crop_rect(img, good[1], good[0])
                     # 去重：自车位置 8 m 内视为同一辆车，每车最多存 PER_CAR_MAX 帧
                     car_slot_here = None
                     for slot in car_slots:
@@ -647,7 +760,7 @@ def main() -> int:
                         continue
                 elif not has_white_text(img):
                     continue
-                if offer(tag, now, cid, img) and car_slot_here is not None:
+                if offer(tag, now, cid, img, crop) and car_slot_here is not None:
                     car_slot_here["n"] += 1
 
         if now - last_log >= 2.0:
@@ -694,7 +807,9 @@ def main() -> int:
     summary = summarize(votes, lock)
     print(f"最终票型 {dict(sorted(summary.items()))}", flush=True)
     print(f"横向加速度峰值 a_lat={lat_peak:.2f} m/s²（预算 {A_LAT_MAX}）", flush=True)
-    print(f"OCR {stats['frames']} 帧、命中 {stats['hits']}、入队 {stats['enq']}、"
+    print(f"OCR {stats['frames']} 帧（推理 {stats['passes']} 次，"
+          f"裁块+整帧两遍）、命中 {stats['hits']}、"
+          f"入队 {stats['enq']}、"
           f"丢弃(预算/队列/上限) {stats['drop_budget']}/{stats['drop_queue']}/"
           f"{stats['drop_cap']}、过闸 {stats['gated']}、"
           f"上报 {'是' if payload is not None else '否'}", flush=True)
