@@ -139,3 +139,29 @@ elease。
 4. 速度：B 段两车并行 4.2/4.6 → **5.2 m/s**；`west_cc` 4.2 → 5.0。
 5. B 交付：每次试交前强制 6×`PARKING+brake=1.0`（1.2 s），解决 `must hold a stable position`。
 6. B 观测：`tok_of()` 双门控（两车同时有凭证才成对提交）+ Car_A 站位 (826.2,-65.2) 朝东（与 Car_B 间距 7.6 m ≥ 5.30）。
+
+
+## 九、满分里程碑（phase=Complete，两次连续）
+
+| 跑次 | 信号 | 路障 scan | 路口 A/B | 泊位 A | 泊位 B | phase | 耗时 |
+|---|---|---|---|---|---|---|---|
+| m93 | 171.5 s 3/3 | 183.0 s | 251.5 / 320.7 s | 413.0 s ✅ | 503.6 s ✅ | **Complete** | **503.7 s** |
+| m94 | 172.5 s 3/3 | 183.8 s | 249.0 / 316.9 s | 412.7 s ✅ | 503.2 s ✅ | **Complete** | **503.2 s** |
+
+两次均：`signals=3/3`、`unlocked=2/2`、`Berth_A/Berth_B` 均 `lv3/precise`、无超速/无碰撞/无未授权进区。㜮制 600 s，余量 ~96 s。
+按计分规则：240 + 160 + 200 + 400 = **1000**。
+
+### 让 B 泊位成功的两行修复（关键）
+1. 泊位 A 观测点改为固定值：`Car_A (634.4,-60.8)` + `Car_D (641.0,-57.6)`（间距 7.3 m ≥ 5.30 m），不再用“沿射线自动摆位”（那版两点只隔 4.5 m、Car_D 还站进车位口袋）。
+2. B 交付前强制 6×`PARKING + brake=1.0`（1.2 s）静置，写死 `must hold a stable position` / `hold position to confirm` 两连拒。
+
+### 复现命令
+```powershell
+Stop-Process SmartCar,metapower_desktop -Force -ErrorAction SilentlyContinue; Start-Sleep 12
+cd 'D:\无人算法\metacar-race'
+$env:FOG_DELIVER_B='1'
+& .\tools\auto_scene.ps1 -Script 'C:\Users\Administrator\Documents\deepseek-harness\default-workspace\fog_mission.py' `\
+  -SceneCp '6E2F,53E3,8FF7,96FE' `\
+  -PythonArgs '--out D:\无人算法\metacar-race\logs\fog_run --seconds 620 --cross 1 --deliver 1' `\
+  -TimeoutSeconds 900
+```
