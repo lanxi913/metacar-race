@@ -1148,9 +1148,21 @@ def stage_deliver(ctx, seconds):
                 if vid == "Car_D" and abs(bx - 834.47) < 1.0:
                     g1 = (838.5, -52.0)
                     g2 = (838.5, -56.0)
+                elif abs(bx - 630.97) < 1.0:
+                    # Berth_A 固定观测点（m63/m64/m65 实测有效，两点间距 7.3 m >= 5.30）
+                    if vid == "Car_D":
+                        g1 = (641.5, -55.0)
+                        g2 = (641.0, -57.6)
+                    else:
+                        g1 = (634.4, -58.0)
+                        g2 = (634.4, -60.8)
                 else:
                     g1 = (bx + ux * (standoff + 3.0), by + uy * (standoff + 3.0))
                     g2 = (bx + ux * standoff, by + uy * standoff)
+                if math.hypot(pv[0] - g2[0], pv[1] - g2[1]) < 1.6:
+                    note("[deliver] %s 已在观测点 %.1fm 内，不再开车"
+                         % (vid, math.hypot(pv[0] - g2[0], pv[1] - g2[1])))
+                    continue
                 note("[deliver] %s 就位 (%.1f,%.1f)->(%.1f,%.1f)" % (vid, g1[0], g1[1], g2[0], g2[1]))
                 drive_polyline(ctx, vid, [g1, g2], seconds,
                                v_cap=(1.4 if abs(bx - 834.47) < 1.0 else 2.2))
