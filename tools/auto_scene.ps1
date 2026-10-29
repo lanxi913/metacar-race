@@ -124,7 +124,8 @@ function Test-ClientVisible {
 
 if (-not (Test-ClientVisible)) {
     Write-Host "client window missing, starting the client..."
-    $exe = 'D:\' + (-join ([char]0x65E0,[char]0x4EBA,[char]0x7B97,[char]0x6CD5)) + '\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
+    # 2026-10-24: client lives under D:\download3 (the old D:\<renamed> path was stale).
+    $exe = 'D:\download3\' + (-join ([char]0x5143,[char]0x52A8,[char]0x529B,[char]0x5BA2,[char]0x6237,[char]0x7AEF)) + '\metapower_desktop.exe'
     if (Test-Path $exe) {
         Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
         Start-Sleep -Seconds 18
