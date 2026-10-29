@@ -1109,17 +1109,16 @@ def stage_deliver(ctx, seconds):
     north_b = [(728.8, 6.0), (743.3, 4.7), (790.0, 4.7), (790.0, -30.0),
                (812.0, -40.0), (830.0, -56.0), (834.0, -63.8)]
     from_a = [(636.0, -58.5), (638.4, -40.0), (638.4, 4.7), (700.0, 4.7), (790.0, 4.7),
-              (800.0, -10.0), (812.0, -30.0), (838.5, -49.5), (838.5, -59.5)]
+              (800.0, -10.0), (812.0, -30.0), (838.5, -49.5), (838.5, -57.0)]
     try:
-        from_a2 = [(632.0, -62.0), (636.0, -58.5)] + from_a[1:]
-        drive_multi(ctx, [("Car_B", north_b, 4.2, 3.0), ("Car_A", from_a2, 4.6, 3.0)], seconds)
+        drive_multi(ctx, [("Car_B", north_b, 4.2, 3.0), ("Car_D", from_a, 4.2, 3.0)], seconds)
         face_target(ctx, "Car_B", (834.47, -65.72), seconds)
-        face_target(ctx, "Car_A", (834.47, -65.72), seconds)
+        face_target(ctx, "Car_D", (834.47, -65.72), seconds)
     except Exception as exc:
         note("[deliver] 并行赶赴 B 异常 %s: %s" % (type(exc).__name__, exc))
     for k in range(8):
         b = _report(ctx, "Car_B", "Berth_B")
-        c = _report(ctx, "Car_A", "Berth_B", verbose=True)
+        c = _report(ctx, "Car_D", "Berth_B", verbose=True)
         lv = level_of(ctx, "Berth_B")
         ts = to_plain(api.get_task_state())
         note("[deliver] Berth_B obs B=%s D=%s level=lv%s unlocked=%s/%s"
@@ -1134,7 +1133,7 @@ def stage_deliver(ctx, seconds):
                 pass
             continue
         bx, by = 834.47, -65.72
-        for vid, standoff in (("Car_B", 6.0), ("Car_A", 8.0)):
+        for vid, standoff in (("Car_B", 6.0), ("Car_D", 8.5)):
             _pv0 = pose_of(api, vid)[0]
             if math.hypot(_pv0[0] - bx, _pv0[1] - by) > 35.0:
                 note("[deliver] %s 还远（%.0f m），本轮不就位"
