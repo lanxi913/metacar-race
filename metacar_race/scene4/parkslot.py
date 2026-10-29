@@ -329,6 +329,10 @@ class SlotParkStrategy(Strategy):
         self._stall_said = False
         self.fit_t = 0.0                     # FIT 收紧后累计时间（超时放宽容差）
         self.fit_relaxed = False
+        # 低速段的油门/刹车速率限制（见 return 处）：0.06 的刹车在 0.3 m/s 上
+        # 一帧就是 −5.6 m/s²，平台照样记一次加速度事件
+        self._thr_prev = 0.0
+        self._brk_prev = 0.0
         # 基向量在 `_set_basis` 里定；先给个安全默认（1.0, 0.0）
         self.eX = (1.0, 0.0)
         self.eY = (0.0, 1.0)
@@ -498,7 +502,11 @@ class SlotParkStrategy(Strategy):
             v_des = min(C.PARK_ALIGN_MS, math.sqrt(2.0 * C.PARK_ALIGN_DECEL_MS2 * dist))
             err = v_des - ctx.speed
             thr = max(0.0, min(0.30, 0.30 * err))
-            brk = max(0.0, min(0.12, 0.30 * (-err)))
+            # 2026-10-28：入口刹车封到 0.08。23:02 那局从元素 11 的 ~7.9 m/s 收进来时
+            # 用了 0.12（比例项截顶），0.50 s 那几帧逐帧 −5.7 / −6.65 m/s²，正好把
+            # 「平行车道泊车」的 +10 打掉（结算 200 而不是 210）。0.08 的减速更平缓，
+            # 到 staging 只多花 1~2 s（元素限时 200 s，本局泊车段只用了 52 s）。
+            brk = max(0.0, min(0.08, 0.30 * (-err)))
             if dist <= 0.7:
                 self.phase = "STOP"
                 self._say(f"[park] 到 staging（X={X:+.2f} Y={Y:+.2f} yaw_t={yaw_t:+.1f}，"
@@ -605,8 +613,20 @@ class SlotParkStrategy(Strategy):
                           f"横向 {lo_la:+.2f}..{hi_la:+.2f}（库边 ±{slot.width / 2.0:.2f}）"
                           f" 纵向 {lo_lo:+.2f}..{hi_lo:+.2f}（库边 ±{slot.length / 2.0:.2f}）"
                           f" | 平台元素 '{getattr(ctx, 'platform_element', '') or '?'}'")
-            return Command(steer=float(vc.steering), throttle=float(vc.throttle),
-                           brake=float(vc.brake), gear=vc.gear, final=True,
+            # 低速段（|v|<1.0）给油门/刹车做速率限制：入库时车速只有 0.3~0.6 m/s，
+            # 控制器 0.06 的刹车一帧就能甩出 −5.6 m/s²，平台按"加速度超限"记一次，
+            # 泊车的 +10 就没了（2026-10-29 15:26 那局 42.44 s 的 +5.6 就是这样）。
+            thr_out, brk_out = float(vc.throttle), float(vc.brake)
+            if abs(ctx.speed) < 1.0 and info.phase != "DONE":
+                thr_out = min(max(thr_out, self._thr_prev - 0.02),
+                              self._thr_prev + 0.02)
+                brk_out = min(max(brk_out, self._brk_prev - 0.015),
+                              self._brk_prev + 0.015)
+                if abs(ctx.speed) < 0.6:      # 0.1 的刹车在 0.38 m/s 上就是 −5.3 m/s²
+                    brk_out = min(brk_out, 0.045)
+            self._thr_prev, self._brk_prev = thr_out, brk_out
+            return Command(steer=float(vc.steering), throttle=thr_out,
+                           brake=brk_out, gear=vc.gear, final=True,
                            note="park:%s dx=%+.2f dy=%+.2f" % (info.phase, info.dx, info.dy))
 
         # DONE：驻车挡保持，等平台收尾

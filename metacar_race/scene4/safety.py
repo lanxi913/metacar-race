@@ -55,10 +55,12 @@ class LightGate:
       用它的 `straight_state / straight_remaining_time` 判 ETA。
     """
 
-    def __init__(self, enabled: bool = True, log=None, track=None) -> None:
+    def __init__(self, enabled: bool = True, log=None, track=None,
+                 vmax: float = 9.0) -> None:
         self.enabled = bool(enabled)
         self.log = log
         self.track = track
+        self.vmax = float(vmax)      #: 估「走完整组」用的巡航速度（= 本轮 --vmax）
         self.reset()
 
     def reset(self) -> None:
@@ -274,6 +276,11 @@ class LightGate:
                 continue
             if g0 - s_now > C.LIGHT_DECIDE_M:    # 还太远，不预先减速
                 break
+            if s_now > g0 + 0.5:
+                # 已经越过组首（没承诺就进来了）：不要再回头"等灯"。
+                # elem5-r2 就是在这里 g0−s=−42 m 还判非绿 → 在路口中间刹停，
+                # 被平台判「红灯时停车位置不正确」−20。
+                continue
             target = (g0, g1)
             break
         if target is None:
@@ -297,8 +304,20 @@ class LightGate:
             cap = float(C.LIGHT_APPROACH_MS)
             d.v_cap = cap if d.v_cap is None else min(float(d.v_cap), cap)
 
-        # ④ 绿灯（含「非绿→绿」那一帧）：够近就承诺通过整组，组内不再看灯
+        # ④ 绿灯：先确认这盏绿灯够不够把整组线走完（含从当前车速起步的加速段），
+        #    不够就当红灯处理——宁可在线前等下一次整灯，也不中途变红硬闯。
+        #    依据：elem5-r2（2026-10-27）在距线 76.9 m 见到剩 10 s 的绿灯就放行，
+        #    按 5 m/s 接近到线时灯已变红，闯红灯 −45 + 路口中间停车 −20 = 一局丢 65 分。
+        green_enough = True
         if state == TrafficLightState.GREEN:
+            need = (self._time_to_clear(max(g1 - s_now, 0.0), float(speed))
+                    + C.LIGHT_CLEAR_MARGIN_S)
+            green_enough = remain >= need
+            if not green_enough and self.log:
+                self.log("[light] 绿灯只剩 %.1f s < 走完整组要 %.1f s → 按红灯处理，"
+                         "线前等下一次整灯" % (remain, need))
+
+        if state == TrafficLightState.GREEN and green_enough:
             if self._wait:
                 waited = self._wait_frames / 30.0
                 self._wait = False
@@ -315,7 +334,7 @@ class LightGate:
                 self._committed = (g0, g1)
             return d
 
-        # ⑤ 非绿：松油滑行到线前停住等绿（不判断能否通过）
+        # ⑤ 非绿（或绿灯不够长）：松油滑行到线前停住等绿
         if not self._wait:
             self._wait = True
             self._wait_frames = 0
@@ -352,6 +371,27 @@ class LightGate:
     def _group_count(self, g0: float, g1: float) -> int:
         """这个路口组里有几条停止线（只用于日志）。"""
         return sum(1 for s in (self.lines or []) if g0 - 1e-6 <= float(s) <= g1 + 1e-6)
+
+    def _time_to_clear(self, dist: float, v_now: float) -> float:
+        """从当前车速走完 `dist` 米需要多久（先按固定加速度加到巡航，再匀速）。
+
+        只用来判断「这盏绿灯够不够过完整个路口组」，所以刻意**偏保守**：
+        加速度取 `LIGHT_CLEAR_ACCEL_MS2`（平台起步实测 1.2~2.0 m/s²），
+        巡航取 `self.vmax`（本轮 --vmax）。实际接近段还被 `LIGHT_APPROACH_MS`
+        压着，所以这里的估计只会偏乐观一点点，故判断时另加 `LIGHT_CLEAR_MARGIN_S`。
+        """
+        d = max(float(dist), 0.0)
+        v = max(float(v_now), 0.0)
+        a = max(float(C.LIGHT_CLEAR_ACCEL_MS2), 1e-3)
+        v_top = max(float(self.vmax), 1.0)
+        if v >= v_top:
+            return d / v
+        d_acc = (v_top * v_top - v * v) / (2.0 * a)
+        if d <= d_acc:
+            # 全程都在加速段：t = (−v + sqrt(v² + 2·a·d)) / a
+            return (-v + math.sqrt(v * v + 2.0 * a * d)) / a
+        t_acc = (v_top - v) / a
+        return t_acc + (d - d_acc) / v_top
 
 
 class EndPark:
