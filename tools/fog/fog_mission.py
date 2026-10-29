@@ -171,6 +171,24 @@ def sig_state(ctx, vid, sig_id):
 GATE_BOX = (723.8, 733.8, -30.0, 10.0)   # x0,x1,y0,y1：交叉口 6 m 互斥区所在的闸口竖段
 
 
+
+def mark_done(ctx, key):
+    try:
+        st = getattr(ctx, "done", None)
+        if st is None:
+            ctx.done = st = set()
+        if key not in st:
+            st.add(key)
+            ctx.note("[mission] 完成 %s (%d/8)" % (key, len(st)))
+    except Exception:
+        pass
+
+
+def mission_done(ctx):
+    st = getattr(ctx, "done", None) or set()
+    return len(st) >= 8
+
+
 def grid_with_gate(ctx, inflate=2.4):
     """返回一个把闸口竖段标记为不可通行的栅格图（避免未授权穿越）。"""
     if getattr(ctx, "grid_gate", None) is None:
@@ -209,6 +227,29 @@ def nav_path(ctx, frm, to, inflate=2.4):
     if pts:
         pts = fog_nav.smooth(pts, ctx.grid)
     return pts or [frm, to]
+
+
+
+def stage_prepos(ctx, seconds):
+    """在验信号的同时，把两辆运输车预先开到中央路口两侧的进车道（并行）。"""
+    jobs = []
+    for vid, tgt in (("Car_A", (731.0, -31.0)), ("Car_B", (731.0, -56.0))):
+        try:
+            pos = pose_of(ctx.api, vid)[0]
+            q = nav_path(ctx, pos, tgt, inflate=2.0)
+            ctx.note("[prepos] %s (%.1f,%.1f) -> (%.1f,%.1f) %d wp" % (vid, pos[0], pos[1], tgt[0], tgt[1], len(q)))
+            jobs.append((vid, q, 5.2, 4.0))
+        except Exception as exc:
+            ctx.note("[prepos] %s 规划异常 %s" % (vid, exc))
+    if not jobs:
+        return False
+    try:
+        drive_multi(ctx, jobs, seconds)
+        ctx.note("[prepos] 两车就位完成")
+        return True
+    except Exception as exc:
+        ctx.note("[prepos] 异常 %s: %s" % (type(exc).__name__, exc))
+        return False
 
 
 def stage_signals(ctx, seconds):
@@ -270,6 +311,7 @@ def stage_signals(ctx, seconds):
                                 res.get("message")))
                     if res.get("granted"):
                         ok[sig_id] = key
+                        mark_done(ctx, "sig" + sig_id[-1])
                         break
             else:
                 ctx.note("  !! %s 仍未通过" % sig_id)
@@ -440,6 +482,7 @@ def stage_scan(ctx, seconds):
                                      % (o.get("object_id"), o.get("road_ids"),
                                         json.dumps(o.get("position") or {},
                                                    ensure_ascii=False)[:70]))
+                    mark_done(ctx, "scan")
                     dump_state(ctx, "after_scan")
                     return True
                 hold_still(ctx, "Car_C", seconds=1.0)
@@ -585,6 +628,19 @@ def stage_probe(ctx, seconds):
     return True
 
 
+
+def tok_of(ctx, vid, name):
+    """取本车对目标 name 的观测凭证（空串表示暂无）。"""
+    try:
+        ob = to_plain(ctx.api.get_observation(vid))
+    except Exception:
+        return ""
+    for it in (ob.get("visible_objects") or []):
+        if str(it.get("object_id") or "") == name:
+            return it.get("observation_token") or ""
+    return ""
+
+
 def _report(ctx, carrier, name, verbose=False):
     """对目标 name（Berth_A/Berth_B/Obstacle_x）提交一次观测凭证。"""
     ob = to_plain(ctx.api.get_observation(carrier))
@@ -646,10 +702,15 @@ def stage_cross(ctx, seconds):
         if time.time() - ctx.t0 > seconds:
             return
         pos0, _y, _v = pose_of(ctx.api, car)
-        detour = nav_path(ctx, pos0, south_in[-1])
-        ctx.note("[cross] %s 栅格规划 %d 点 → (%.1f,%.1f)"
-                 % (car, len(detour), south_in[-1][0], south_in[-1][1]))
-        drive_polyline(ctx, car, detour, seconds, v_cap=4.0)  # grid route
+        d_in = math.hypot(pos0[0] - south_in[-1][0], pos0[1] - south_in[-1][1])
+        if d_in <= 30.0:
+            ctx.note("[cross] %s 已在入口 (%.1f,%.1f) d=%.1f，跳过赶路"
+                     % (car, pos0[0], pos0[1], d_in))
+        else:
+            detour = nav_path(ctx, pos0, south_in[-1])
+            ctx.note("[cross] %s 栅格规划 %d 点 → (%.1f,%.1f)"
+                     % (car, len(detour), south_in[-1][0], south_in[-1][1]))
+            drive_polyline(ctx, car, detour, seconds, v_cap=5.2)
         granted = [False]
 
         def poll(pos, speed, _a=None):
@@ -696,6 +757,8 @@ def stage_cross(ctx, seconds):
                      (728.79, 4.0), (728.79, 20.0), (728.79, 46.0)]
         got_rel = drive_polyline(ctx, car, gate_line, seconds, v_cap=1.8, poll=relpoll)
         ok = (got_rel == "released")
+        if ok:
+            mark_done(ctx, "cross" + car[-1])
         if not ok:
             for pt in [(734.0, 42.0), (745.0, 4.7), (715.0, 4.7)]:
                 drive_to(ctx, car, pt, seconds, stop_xy=pt, stop_m=3.0)
@@ -940,7 +1003,9 @@ def level_of(ctx, name):
 
 
 def face_target(ctx, vid, tgt_xy, seconds, gap=4.5):
+    note = ctx.note
     """\u628a\u8f66\u5934\u8f6c\u5411\u76ee\u6807\uff08\u5f00\u5230\u6cbf\u7740\u6307\u5411\u76ee\u6807\u65b9\u5411 4.5 m \u7684\u70b9\uff09\u3002"""
+    api = ctx.api
     try:
         pv, yaw_v = pose_of(api, vid)[:2]
         dx, dy = tgt_xy[0] - pv[0], tgt_xy[1] - pv[1]
@@ -957,6 +1022,44 @@ def face_target(ctx, vid, tgt_xy, seconds, gap=4.5):
         note("[face] %s \u5f02\u5e38 %s" % (vid, exc))
 
 
+def turn_around(ctx, vid, seconds, want_deg=90.0, max_rounds=6):
+    """三点掉头：倒车满舵 + 前进满舵 交替，直到朝向接近 want_deg。"""
+    note = ctx.note
+    api = ctx.api
+    for rnd in range(max_rounds):
+        pos, yaw, spd = pose_of(api, vid)
+        err = (want_deg - yaw + 540.0) % 360.0 - 180.0
+        note("    %s [turn] @(%.1f,%.1f) yaw=%.0f err=%.0f" % (vid, pos[0], pos[1], yaw, err))
+        if abs(err) < 28.0:
+            break
+        sign = 1.0 if err > 0 else -1.0
+        # 倒车一把（倒车时舵轮反向才能让车头向 sign 方向转）
+        t_end = time.time() + 2.2
+        while time.time() < t_end and time.time() - ctx.t0 < seconds:
+            ctl = VehicleControl(throttle=0.30, brake=0.0, steering=max(-0.55, min(0.55, -sign * 0.55)))
+            ctl.gear = GearMode.REVERSE
+            try:
+                api.set_vehicle_control(ctl, vehicle_id=vid)
+            except Exception:
+                return
+            time.sleep(0.1)
+        # 前进一把
+        t_end = time.time() + 2.0
+        while time.time() < t_end and time.time() - ctx.t0 < seconds:
+            ctl = VehicleControl(throttle=0.16, brake=0.0, steering=max(-0.55, min(0.55, sign * 0.55)))
+            try:
+                api.set_vehicle_control(ctl, vehicle_id=vid)
+            except Exception:
+                return
+            time.sleep(0.1)
+    try:
+        api.set_vehicle_control(VehicleControl(throttle=0.0, brake=0.6, gear=GearMode.PARKING), vehicle_id=vid)
+    except Exception:
+        pass
+    pos, yaw, _ = pose_of(api, vid)
+    note("    %s [turn] 完成 @(%.1f,%.1f) yaw=%.0f" % (vid, pos[0], pos[1], yaw))
+
+
 def back_out(ctx, vid, seconds, dist_m=8.0, v_target=1.3):
     """切 R 档倒车直退 dist_m 米（出泊位用）。"""
     api = ctx.api
@@ -969,7 +1072,7 @@ def back_out(ctx, vid, seconds, dist_m=8.0, v_target=1.3):
         if abs(spd) > v_target:
             ctl = VehicleControl(throttle=0.0, brake=0.30, steering=0.0, gear=GearMode.REVERSE)
         else:
-            ctl = VehicleControl(throttle=0.10, brake=0.0, steering=0.0, gear=GearMode.REVERSE)
+            ctl = VehicleControl(throttle=0.35, brake=0.0, steering=0.0, gear=GearMode.REVERSE)
         try:
             api.set_vehicle_control(ctl, vehicle_id=vid)
         except Exception:
@@ -1000,7 +1103,7 @@ def stage_deliver(ctx, seconds):
 
     # 4.1 两车并行：Car_C 从灯塔、Car_A 从闸口北口，同时赶去泊位 A
     try:
-        drive_multi(ctx, [("Car_D", west_cc, 4.2, 3.0), ("Car_A", west_ca, 1.8, 4.0)], seconds)
+        drive_multi(ctx, [("Car_D", west_cc, 5.0, 3.0), ("Car_A", west_ca, 1.8, 4.0)], seconds)
     except Exception as exc:
         note("[deliver] 并行赶赴 A 异常 %s: %s" % (type(exc).__name__, exc))
 
@@ -1086,6 +1189,7 @@ def stage_deliver(ctx, seconds):
              % (attempt + 1, getattr(r, "granted", None), getattr(r, "message", "")[:90]))
         if getattr(r, "granted", False):
             got_a = True
+            mark_done(ctx, "berthA")
             break
         park_and_hold(ctx, "Car_A", seconds, need_s=1.2)
     dump_state(ctx, "after_deliver_A")
@@ -1094,6 +1198,11 @@ def stage_deliver(ctx, seconds):
             back_out(ctx, "Car_A", seconds, dist_m=9.0)
         except Exception as exc:
             note("[deliver] Car_A 倒车出位异常 %s" % exc)
+        # Car_A 已倒车退出小袋；再掉头点向北，为后续让路做准备
+        try:
+            turn_around(ctx, "Car_A", seconds, want_deg=90.0, max_rounds=5)
+        except Exception as exc:
+            note("[deliver] Car_A 掉头异常 %s" % exc)
 
     if not args_deliver_b():
         return True
@@ -1104,56 +1213,78 @@ def stage_deliver(ctx, seconds):
     except Exception as exc:
         note("[deliver] Car_B 出闸口异常 %s" % exc)
 
-    # 4.4 泊位 B：Car_B 从闸口北口经绕行去 B，Car_C 同时从 A 出发
-    # Car_B 直接进车位（它是交付车）；Car_D 只停在车位正北的走廊上，避免堆在 Car_B 后面
+    # 4.4 泊位 B：Car_B 进车位，Car_A（已交付 A）绕主路去西侧观测点
     north_b = [(728.8, 6.0), (743.3, 4.7), (790.0, 4.7), (790.0, -30.0),
-               (812.0, -40.0), (830.0, -56.0), (834.0, -63.8)]
-    from_a = [(636.0, -58.5), (638.4, -40.0), (638.4, 4.7), (700.0, 4.7), (790.0, 4.7),
-              (800.0, -10.0), (812.0, -30.0), (838.5, -49.5), (838.5, -57.0)]
+               (812.0, -40.0), (828.0, -55.0), (833.8, -60.5), (834.4, -65.0)]
+    a_to_b = [(644.0, -52.0), (660.0, -46.2), (704.2, -46.2), (712.0, -46.0), (714.6, -33.2),
+              (714.6, -20.0), (714.6, 0.0), (718.0, 4.7), (743.3, 4.7), (790.0, 4.7),
+              (790.0, -30.0), (812.0, -40.0), (826.0, -52.0), (826.0, -60.0), (826.2, -65.2)]
     try:
-        drive_multi(ctx, [("Car_B", north_b, 4.2, 3.0), ("Car_D", from_a, 4.2, 3.0)], seconds)
-        face_target(ctx, "Car_B", (834.47, -65.72), seconds)
-        face_target(ctx, "Car_D", (834.47, -65.72), seconds)
+        drive_multi(ctx, [("Car_B", north_b, 5.2, 2.5), ("Car_A", a_to_b, 5.2, 2.5)], seconds)
+        # Car_A 已直接停在朝东的西侧观测点，不再额外开车
+        try:
+            hold_still(ctx, "Car_A", seconds=0.6)
+        except Exception as exc:
+            note("[deliver] Car_A 就位异常 %s" % exc)
     except Exception as exc:
         note("[deliver] 并行赶赴 B 异常 %s: %s" % (type(exc).__name__, exc))
-    for k in range(8):
-        b = _report(ctx, "Car_B", "Berth_B")
-        c = _report(ctx, "Car_D", "Berth_B", verbose=True)
-        lv = level_of(ctx, "Berth_B")
-        ts = to_plain(api.get_task_state())
-        note("[deliver] Berth_B obs B=%s D=%s level=lv%s unlocked=%s/%s"
-             % (b, c, lv, ts.get("unlocked_destination_count"), ts.get("total_destination_count")))
-        if lv >= 3:
-            break
-        if k <= 0 and abs(bx - 834.47) < 1.0:
-            try:
-                hold_still(ctx, "Car_B", seconds=1.2)
-                hold_still(ctx, "Car_A", seconds=1.2)
-            except Exception:
-                pass
-            continue
-        bx, by = 834.47, -65.72
-        for vid, standoff in (("Car_B", 6.0), ("Car_D", 8.5)):
-            _pv0 = pose_of(api, vid)[0]
-            if math.hypot(_pv0[0] - bx, _pv0[1] - by) > 35.0:
-                note("[deliver] %s 还远（%.0f m），本轮不就位"
-                     % (vid, math.hypot(_pv0[0] - bx, _pv0[1] - by)))
-                continue
-            try:
-                pv = pose_of(api, vid)[0]
-                dx, dy = pv[0] - bx, pv[1] - by
-                r = math.hypot(dx, dy) or 1.0
-                ux, uy = dx / r, dy / r
-                g1 = (bx + ux * (standoff + 3.0), by + uy * (standoff + 3.0))
-                g2 = (bx + ux * standoff, by + uy * standoff)
-                note("[deliver] %s 就位 B (%.1f,%.1f)->(%.1f,%.1f)" % (vid, g1[0], g1[1], g2[0], g2[1]))
-                drive_polyline(ctx, vid, [g1, g2], seconds, v_cap=1.4)
-            except Exception as exc:
-                note("[deliver] %s 就位 B 异常 %s" % (vid, exc))
+    # 等两车同时就位（观测必须在同一 30 s 窗口内成对）
+    for w in range(90):
         try:
-            hold_still(ctx, "Car_A", seconds=0.8)
+            pa = pose_of(api, "Car_A")[0]
+            pb = pose_of(api, "Car_B")[0]
+        except Exception:
+            time.sleep(1.0)
+            continue
+        da = math.hypot(pa[0] - 834.47, pa[1] + 65.72)
+        db = math.hypot(pb[0] - 834.47, pb[1] + 65.72)
+        if da <= 25.0 and db <= 25.0:
+            note("[deliver] 两车同时就位 A=%.1fm B=%.1fm" % (da, db))
+            break
+        time.sleep(1.0)
+    # 两车必须同时拿到凭证再报（同一 30 s 窗口 + 观测点间距 >= 5.30 m）
+    for w in range(120):
+        ta = tok_of(ctx, "Car_A", "Berth_B")
+        tb = tok_of(ctx, "Car_B", "Berth_B")
+        if ta and tb:
+            note("[deliver] 两车都拿到凭证，同步报送")
+            _report(ctx, "Car_B", "Berth_B")
+            _report(ctx, "Car_A", "Berth_B")
+            break
+        if w % 5 == 0:
+            note("[deliver] 等凭证 A=%s B=%s level=lv%s" % (bool(ta), bool(tb), level_of(ctx, "Berth_B")))
+        if level_of(ctx, "Berth_B") >= 3:
+            break
+        time.sleep(1.0)
+    for k in range(8):
+        try:
+            pa = pose_of(api, "Car_A")[0]
+            pb = pose_of(api, "Car_B")[0]
+            da = math.hypot(pa[0] - 834.47, pa[1] + 65.72)
+            db = math.hypot(pb[0] - 834.47, pb[1] + 65.72)
+            if da > 26.0 or db > 26.0:
+                note("[deliver] 等伴车（A=%.1f B=%.1f）" % (da, db))
+                time.sleep(1.5)
+                continue
         except Exception:
             pass
+        b_ok = _report(ctx, "Car_B", "Berth_B")
+        c_ok = _report(ctx, "Car_A", "Berth_B", verbose=True)
+        lv = level_of(ctx, "Berth_B")
+        ts = to_plain(api.get_task_state())
+        note("[deliver] Berth_B obs B=%s A=%s level=lv%s unlocked=%s/%s"
+             % (b_ok, c_ok, lv, ts.get("unlocked_destination_count"), ts.get("total_destination_count")))
+        if lv >= 3:
+            break
+        try:
+            pcur = pose_of(api, "Car_A")[0]
+            if math.hypot(pcur[0] - 826.0, pcur[1] + 65.7) > 5.0:
+                note("[deliver] Car_A 回到西侧观测点")
+                drive_polyline(ctx, "Car_A", [(826.0, -56.0), (826.0, -65.7)], seconds, v_cap=2.0)
+            hold_still(ctx, "Car_A", seconds=1.2)
+            hold_still(ctx, "Car_B", seconds=0.4)
+        except Exception as exc:
+            note("[deliver] Car_A 西侧就位异常 %s" % exc)
     tgt_b = precise_point(ctx, "Berth_B", (834.47, -65.72))
     note("[deliver] Berth_B 精确点 (%.2f,%.2f)" % (tgt_b[0], tgt_b[1]))
     try:
@@ -1168,17 +1299,27 @@ def stage_deliver(ctx, seconds):
     except Exception as exc:
         note("[deliver] 进泊位 B 异常 %s" % exc)
     park_and_hold(ctx, "Car_B", seconds, need_s=2.5)
-    for attempt in range(6):
+    for attempt in range(8):
+        # 强制先挂 P 档满刹静置 1.2 s，再交付（否则报 must hold a stable position）
+        try:
+            for _ in range(6):
+                api.set_vehicle_control("Car_B", VehicleControl(throttle=0.0, brake=1.0, gear=GearMode.PARKING))
+                time.sleep(0.2)
+        except Exception as exc:
+            note("[deliver] B 静置异常 %s" % exc)
         try:
             r = api.interact("Car_B", "Berth_B", "deliver")
         except Exception as exc:
             note("[deliver] deliver B 异常 %s: %s" % (type(exc).__name__, exc))
             break
-        note("[deliver] Car_B deliver B(%d) granted=%s msg=%s"
-             % (attempt + 1, getattr(r, "granted", None), getattr(r, "message", "")[:90]))
+        note("[deliver] Car_B deliver B(%d) granted=%s msg=%s 位置=(%.1f,%.1f) d=%.2f"
+             % (attempt + 1, getattr(r, "granted", None), getattr(r, "message", "")[:90],
+                pose_of(api, "Car_B")[0][0], pose_of(api, "Car_B")[0][1],
+                math.hypot(pose_of(api, "Car_B")[0][0] - tgt_b[0], pose_of(api, "Car_B")[0][1] - tgt_b[1])))
         if getattr(r, "granted", False):
+            mark_done(ctx, "berthB")
             break
-        hold_still(ctx, "Car_B", seconds=1.5)
+        time.sleep(0.8)
     dump_state(ctx, "after_deliver_B")
     return got_a
 
@@ -1209,6 +1350,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--seconds", type=float, default=560.0)
+    ap.add_argument("--prepos", type=int, default=0)
     ap.add_argument("--probe", type=int, default=0)
     ap.add_argument("--cross", type=int, default=1)
     ap.add_argument("--deliver", type=int, default=0)
@@ -1237,6 +1379,8 @@ def main():
         note("vehicles=%s" % vids)
 
         note("=== 阶段 0：三个现场信号 ===")
+        if args.prepos:
+            stage_prepos(ctx, args.seconds)
         got = stage_signals(ctx, args.seconds)
         note("signals ok=%s" % json.dumps(got, ensure_ascii=False))
         dump_state(ctx, "after_signals")
