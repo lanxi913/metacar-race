@@ -1,0 +1,30 @@
+{
+  "scene": "vla_IllegalParkingDetection_02",
+  "probe_only": true,
+  "note": "两遍 y=-4.0 直线、YOLO 车框底边反投影的合法车位中心。x 两次重复到 0.2 m；raw y=-5.2 是相机模型值，按路线 y=-4 实际未碰撞、车身半宽 0.9+0.9 反推 y≤-5.8，故取校正值 -6.0。",
+  "runs": ["legal-probe-r3", "legal-probe-r4"],
+  "slots": [
+    {
+      "name": "legal_west",
+      "x": 28.7,
+      "y": -6.0,
+      "y_raw": -5.2,
+      "observations": [
+        {"run": "legal-probe-r3", "t": 19.86, "ego": [25.2, -4.0], "box_world": [28.7, -5.2], "id_seen": "B-02"},
+        {"run": "legal-probe-r4", "t": 19.87, "ego": [25.1, -4.0], "box_world": [28.6, -5.2], "id_seen": "B-05"}
+      ],
+      "id_changes_between_runs": true
+    },
+    {
+      "name": "legal_east",
+      "x": 39.7,
+      "y": -6.0,
+      "y_raw": -5.1,
+      "observations": [
+        {"run": "legal-probe-r3", "t": 27.94, "ego": [36.4, -4.0], "box_world": [39.7, -5.0], "id_seen": "B-01"},
+        {"run": "legal-probe-r4", "t": 27.85, "ego": [36.1, -4.0], "box_world": [39.6, -5.2], "id_seen": "B-01"}
+      ],
+      "id_changes_between_runs": false
+    }
+  ]
+}
