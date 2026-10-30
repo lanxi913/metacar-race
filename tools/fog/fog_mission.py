@@ -1538,9 +1538,12 @@ def settle(ctx, brk=0.50, seconds=0.6):
     """
     t_end = min(time.time() + seconds, ctx.t0 + 600.0)
     cur = 0.12
+    hb = getattr(ctx, "hold_brk", None) or {}
     while time.time() < t_end:
         for v in ctx.vids:
-            _ctrl(ctx, v, 0.0, cur, 0.0)
+            # 已登记驻车的车（Car_C）保持大力刹车，别被这里的斜坡覆盖 ——
+            # 一覆盖它就从 1.0 掉到 0.12，车一晃一顿，一次一晃一条加速度违规。
+            _ctrl(ctx, v, 0.0, max(cur, hb.get(v, 0.0)), 0.0)
         _send(ctx, {})
         cur = min(brk, cur + 0.10)
         time.sleep(0.1)
@@ -1885,7 +1888,7 @@ def cross_one(ctx, car, seconds):
         y = pos[1]
         if not (-18.0 <= y <= -2.0):
             return None
-        mark = int(math.floor(y / 0.1))   # 出口窗只有 ~1 m 宽，0.5 m 一格容易整格跳过去
+        mark = int(math.floor(y / 0.05))   # 出口窗只有 ~1 m 宽，0.5 m 一格容易整格跳过去
         if tried[0] == mark:
             return None
         tried[0] = mark
@@ -1905,9 +1908,9 @@ def cross_one(ctx, car, seconds):
     got = drive_polyline(ctx, car, gate_fast, seconds, v_cap=1.6, poll=relpoll)
     ok = (got == "released")
     if not ok:
-        gate_slow = [(728.79, -14.0), (728.79, -11.4), (728.79, -10.6),
-                     (728.79, -9.4), (728.79, -6.0)]
-        got = drive_polyline(ctx, car, gate_slow, seconds, v_cap=0.5, poll=relpoll)
+        gate_slow = [(728.79, -14.0), (728.79, -12.0), (728.79, -11.0),
+                     (728.79, -9.0), (728.79, -7.0)]
+        got = drive_polyline(ctx, car, gate_slow, seconds, v_cap=0.8, poll=relpoll)
         ok = (got == "released")
     if not ok:
         # 还不行就在出口点周围做小网格补扫（通行权还在自己手里，别开出互斥区）
