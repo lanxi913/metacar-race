@@ -1889,11 +1889,10 @@ def cross_one(ctx, car, seconds):
         note("[cross] %s 20 s 拿不到通行权，放弃（不硬闯）" % car)
         return False
 
+    # 闸口两墙 x=726.26 / 731.32，正中是 728.79（写 729.0 会蹭右墙）。
+    # ⚠️ 这里不要再加 corridor_run：它会一路开到 y=+8，把出口窗整段跳过去
+    # （21:14 那局 A 就是这样 10 s 内从 −14 冲到 +4，一次 release 都没试）。
     ctx.no_bias = True
-    # 闸口两墙 x=726.26 / 731.32，正中是 728.79（写 729.0 会蹭右墙）
-    corridor_run(ctx, car, 728.79, 8.0, v_tgt=1.6, seconds=seconds)
-    ctx.no_bias = False
-
     tried = [None]
 
     def relpoll(pos, speed, _a=None):
@@ -1929,6 +1928,7 @@ def cross_one(ctx, car, seconds):
     if not ok:
         # 还不行就在出口点周围做小网格补扫（通行权还在自己手里，别开出互斥区）
         ok = _release_sweep(ctx, car, seconds)
+    ctx.no_bias = False
     note("[cross] %s 通行 %s" % (car, "成功" if ok else "失败"))
     return ok
 
