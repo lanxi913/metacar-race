@@ -1895,14 +1895,23 @@ def cross_one(ctx, car, seconds):
                  % (car, str(r.get("message") or r)[:52]))
         return None
 
-    p_now = pose_of(api, car)[0]
-    drive_polyline(ctx, car, [(p_now[0], p_now[1]), (728.79, -30.5)],
-                   seconds, v_cap=1.5, poll=reqpoll)
-    # 到线还没批：再原地试 6 s（有时是刚过窗口，稍等会批）
-    t_g = min(time.time() + 6.0, ctx.t0 + seconds - 10.0)
-    while not granted[0] and time.time() < t_g:
-        reqpoll(pose_of(api, car)[0], 0.0)
-        time.sleep(0.5)
+    # 申请线用 x=729.05（实测 A/B 拿到 granted 的位置都在 728.8~729.1，靠左的 728.7 会判 not eligible）
+    for attempt in range(2):
+        if granted[0]:
+            break
+        if attempt == 1:
+            note("[cross] %s 第一次没申请到，退回重进一次" % car)
+            p_back = pose_of(api, car)[0]
+            drive_polyline(ctx, car, [(p_back[0], p_back[1]), (729.05, -46.0)],
+                           seconds, v_cap=1.8)
+        p_now = pose_of(api, car)[0]
+        drive_polyline(ctx, car, [(p_now[0], p_now[1]), (729.05, -30.0)],
+                       seconds, v_cap=1.5, poll=reqpoll)
+        # 到线还没批：再原地试 6 s（有时是刚过窗口，稍等会批）
+        t_g = min(time.time() + 6.0, ctx.t0 + seconds - 10.0)
+        while not granted[0] and time.time() < t_g:
+            reqpoll(pose_of(api, car)[0], 0.0)
+            time.sleep(0.5)
     if not granted[0]:
         note("[cross] %s 拿不到通行权，放弃（不硬闯）" % car)
         return False

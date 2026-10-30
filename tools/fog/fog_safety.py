@@ -147,10 +147,14 @@ class Safety(object):
         cx, cy = info[0], info[1]
         rx, ry = x - cx, y - cy
         lateral = -math.sin(ph) * rx + math.cos(ph) * ry       # >0 障碍在左
+        # 干预要"按离得多近给多大"，别一帧把刹车从 0 跳到 0.70、油门从 0.5 砍到 0.10 ——
+        # 那种阶跃本身就会被判 excessive_acceleration（23:37 那局 21 次 [safe]）。
+        need = (sg - gap) / max(sg - sl, 1e-3)          # 0（刚进警告区）~1（快贴墙）
+        need = 0.0 if need < 0.0 else (1.0 if need > 1.0 else need)
         if gap <= sl:
-            return 0.0, max(brk, 0.7), steer, (gap, oid)
+            return 0.0, max(brk, 0.45 + 0.45 * need), steer, (gap, oid)
         new_steer = steer
         if allow_bias and gap <= STEER_GAP and abs(lateral) > 0.05:
             bias = 0.20 if lateral > 0 else -0.20
             new_steer = max(-1.0, min(1.0, steer + bias))
-        return min(thr, 0.10), max(brk, 0.05), new_steer, (gap, oid)
+        return min(thr, thr * max(0.20, 1.0 - 0.8 * need)), max(brk, 0.05), new_steer, (gap, oid)
