@@ -1426,8 +1426,19 @@ def sync_dyn_avoid(ctx, r=8.0):
         p = o.get("position") or {}
         if p.get("x") is None:
             continue
-        _dyn_register(ctx, (float(p["x"]), float(p["y"])), r,
-                      str(o.get("object_id")))
+        name = str(o.get("object_id"))
+        if not _dyn_register(ctx, (float(p["x"]), float(p["y"])), r, name):
+            continue
+        # 关键：路障是**动态**物体，static_objects 里没有它，所以 guard() 和
+        # path_clearance() 一直看不见它 —— Car_C 扫描时才会贴着它刮（一局 2~14 条 collision）。
+        # 这里把它当成一个 7×4 的实体塞进防撞层，车在 0.85 m 净空就会被刹住。
+        safe = getattr(ctx, "safety", None)
+        if safe is not None:
+            try:
+                safe.objs.append((float(p["x"]), float(p["y"]), 7.0, 4.0, 0.0, name))
+                ctx.note("[avoid] %s 同时登记进防撞层（7x4 实体）" % name)
+            except Exception as exc:                       # noqa: BLE001
+                ctx.note("[avoid] %s 登记防撞层失败 %s" % (name, exc))
 
 
 def _ctx_poll_events(self):
@@ -1500,6 +1511,9 @@ def _send(ctx, ctrls):
 
 
 def _ctrl(ctx, vid, thr=0.0, brk=0.0, steer=0.0, gear=None):
+    quiet = getattr(ctx, "quiet", None)
+    if quiet and vid in quiet:
+        return                      # 静默期：一条指令都不发（见 main 里的说明）
     veh = VehicleControl(throttle=thr, brake=brk, steering=steer)
     if gear is not None:
         veh.gear = gear
@@ -2043,6 +2057,10 @@ def _pre(ctx, jobs, seconds, tag):
     jobs = [j for j in jobs if j]
     if not jobs:
         return
+    q = getattr(ctx, "quiet", None)
+    if q:
+        for j in jobs:
+            q.discard(j["vid"])
     ctx.note("[pre] %s → %s" % (tag, " / ".join(
         "%s(%.0f,%.0f)%d点" % (j["vid"], j["stop_xy"][0], j["stop_xy"][1],
                                len(j["pts"])) for j in jobs)))
@@ -2565,6 +2583,9 @@ def main():
         ctx.safety = Safety(static)
         ctx.ctl = {v: VehicleControl(throttle=0.0, brake=0.0, steering=0.0)
                    for v in vids}
+        # Car_D 前 180 s 完全不动（它就是闲置车）。一开始就给它发控制指令，平台会
+        # 在 2.2 s 记一条 [excessive_acceleration] Car_D（车压根没动过）——每局白丢一条。
+        ctx.quiet = {"Car_D"}
         # ↑ 开局别一上来就踩 0.35 的刹车：实测每局 2.2 s 都会因为这一下判一次
         #   `[excessive_acceleration] Car_D`（那辆车根本没动过）。静止的车不需要刹车。
         note("vehicles=%s  防撞层：实体障碍 %d 个" % (vids, len(ctx.safety.objs)))
