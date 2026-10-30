@@ -253,7 +253,9 @@ class LaneDriver(object):
             if self.brk > 1e-6:
                 self.thr = 0.0
         elif dv < -0.25:
-            b = clip(0.10 + 0.40 * (-dv - 0.25), 0.10, THR_MAX)
+            # 刹车上限从 THR_MAX(0.50) 放到 0.90：v_cap=4.0 的车实测会冲到 5.4 m/s
+            # （长直道下坡），0.50 的刹车按不住，超速之后又只能硬刹，两头都挨违规
+            b = clip(0.10 + 0.40 * (-dv - 0.25), 0.10, 0.90)
             self.thr = max(0.0, self.thr - 0.04)
             self.brk = min(b, self.brk + 0.03) if self.thr <= 1e-6 else 0.0
         else:

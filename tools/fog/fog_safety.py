@@ -122,7 +122,8 @@ class Safety(object):
         return best
 
     # ---------------------------------------------------------- 运行时护栏
-    def guard(self, x, y, yaw, speed, thr, brk, steer, horizon=0.6, allow_bias=True):
+    def guard(self, x, y, yaw, speed, thr, brk, steer, horizon=0.6, allow_bias=True,
+              safe_gap=None, slow_gap=None):
         """按 0.6 s 后的预测位置判断，返回可能被修正过的 (thr, brk, steer, info)。
 
         allow_bias=False 时只限油门/刹车，不往旁边推 —— 5 m 宽的闸口里两侧对称，
@@ -137,14 +138,16 @@ class Safety(object):
         info = info_ahead if d_ahead <= d_now else info_now
         oid = oid_ahead if d_ahead <= d_now else oid_now
         gap = d - self.half_w
-        if gap > SAFE_GAP or info is None:
+        sg = SAFE_GAP if safe_gap is None else float(safe_gap)
+        sl = SLOW_GAP if slow_gap is None else float(slow_gap)
+        if gap > sg or info is None:
             return thr, brk, steer, (gap, oid)
 
         # 朝远离障碍的一侧打方向：把"障碍中心→车"的向量投到车身横向
         cx, cy = info[0], info[1]
         rx, ry = x - cx, y - cy
         lateral = -math.sin(ph) * rx + math.cos(ph) * ry       # >0 障碍在左
-        if gap <= SLOW_GAP:
+        if gap <= sl:
             return 0.0, max(brk, 0.7), steer, (gap, oid)
         new_steer = steer
         if allow_bias and gap <= STEER_GAP and abs(lateral) > 0.05:

@@ -1525,9 +1525,15 @@ def park_car(ctx, vid, brk=1.0):
     if hold is None:
         hold = ctx.hold_brk = {}
     hold[vid] = float(brk)
+    cur = 0.15
+    while cur < float(brk):
+        _ctrl(ctx, vid, 0.0, cur, 0.0)
+        _send(ctx, {})
+        cur = min(float(brk), cur + 0.15)
+        time.sleep(0.1)
     _ctrl(ctx, vid, 0.0, float(brk), 0.0)
     _send(ctx, {})
-    ctx.note("[park] %s 驻车（刹车 %.1f）" % (vid, brk))
+    ctx.note("[park] %s 驻车（刹车 %.1f，斜坡踩上去）" % (vid, brk))
 
 
 def settle(ctx, brk=0.50, seconds=0.6):
@@ -1668,6 +1674,8 @@ def drive_to(ctx, vid, goal_xy, seconds, stop_xy=None, stop_m=STOP_FAR,
             thr, brk, steer, (gap, oid) = safe.guard(
                 pos[0], pos[1], yaw, speed, thr, brk, steer,
                 horizon=0.6 if getattr(ctx, "no_bias", False) else 1.0,
+                safe_gap=0.40 if getattr(ctx, "no_bias", False) else None,
+                slow_gap=0.20 if getattr(ctx, "no_bias", False) else None,
                 allow_bias=not getattr(ctx, "no_bias", False))
             if gap < SAFE_GAP and now - last_guard > 3.0:
                 last_guard = now
@@ -1737,6 +1745,8 @@ def drive_polyline(ctx, vid, pts, seconds, poll=None, v_cap=3.8):
             thr, brk, steer, (gap, oid) = safe.guard(
                 pos[0], pos[1], yaw, speed, thr, brk, steer,
                 horizon=0.6 if getattr(ctx, "no_bias", False) else 1.0,
+                safe_gap=0.40 if getattr(ctx, "no_bias", False) else None,
+                slow_gap=0.20 if getattr(ctx, "no_bias", False) else None,
                 allow_bias=not getattr(ctx, "no_bias", False))
             if gap < SAFE_GAP and now - last_guard > 3.0:
                 last_guard = now
@@ -1934,8 +1944,22 @@ def cross_one(ctx, car, seconds):
         got = drive_polyline(ctx, car, gate_slow, seconds, v_cap=0.5, poll=relpoll)
         ok = (got == "released")
     if not ok:
-        # 还不行就在出口点周围做小网格补扫（通行权还在自己手里，别开出互斥区）
-        ok = _release_sweep(ctx, car, seconds)
+        pos = pose_of(api, car)[0]
+        if -15.0 <= pos[1] <= -8.0:
+            # 还在出口窗附近：做小网格补扫（通行权还在自己手里）
+            ok = _release_sweep(ctx, car, seconds)
+        else:
+            note("[cross] %s 已经越过出口（y=%.1f），不在原地补扫——"
+                 "倒回去重进闸会撞闸壁（23:32 那局撞了 44 次）" % (car, pos[1]))
+    if not ok:
+        # 开出去停住，别让它在闸口附近乱窜
+        try:
+            pos = pose_of(api, car)[0]
+            drive_polyline(ctx, car, [(pos[0], pos[1]), (728.79, max(pos[1], -6.0)),
+                                      (734.0, 30.0)], seconds, v_cap=1.4)
+            park_car(ctx, car, 0.8)
+        except Exception as exc:                                   # noqa: BLE001
+            note("[cross] %s 驶离闸口异常 %s" % (car, exc))
     ctx.no_bias = False
     note("[cross] %s 通行 %s" % (car, "成功" if ok else "失败"))
     return ok
@@ -2041,9 +2065,9 @@ def stage_cross(ctx, seconds):
     park_car(ctx, "Car_C", 1.0)
     # 3.1 A/B 提前出发：A 去闸口待命、B 去后方 19 m 的备用待命点（错峰 8 s，别挤同一条车道），
     #     同时把闲置的 Car_D 送到泊位 A 北侧见证位（278 m / 约 85 s）
-    _pre(ctx, [_job(ctx, "Car_A", GATE_READY, 4.0, 2.0, 130.0),
-               _job(ctx, "Car_B", GATE_HOLD, 4.0, 2.0, 150.0, delay=8.0),
-               _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 4.2, 2.0, 175.0)],
+    _pre(ctx, [_job(ctx, "Car_A", GATE_READY, 3.7, 2.0, 130.0),
+               _job(ctx, "Car_B", GATE_HOLD, 3.7, 2.0, 150.0, delay=8.0),
+               _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 3.9, 2.0, 175.0)],
          seconds, "A→闸口待命，B→备用待命点，D→泊位 A 见证位")
     # 3.2 A 过闸
     ok_a = cross_one(ctx, "Car_A", seconds)
@@ -2059,7 +2083,7 @@ def stage_cross(ctx, seconds):
         return
     # 3.3 A 去泊位南侧 → 立刻观测 + 交付（不等 B）
     if ok_a:
-        _pre(ctx, [_job(ctx, "Car_A", (ca[0], ca[1] - 28.0), 4.0, 2.0, 130.0)],
+        _pre(ctx, [_job(ctx, "Car_A", (ca[0], ca[1] - 28.0), 3.7, 2.0, 130.0)],
              seconds, "A→泊位 A 南侧（22 m 助跑位）")
         _deliver_one(ctx, "Berth_A", "Car_A", "Car_D", ca, seconds)
     # 3.4 B 过闸（B 早就在闸口待命）
@@ -2082,8 +2106,8 @@ def stage_cross(ctx, seconds):
     # 见证车用 Car_D：A 交付完就停在泊位旁边不动，D 从它北侧一路向东去 B 泊位。
     # （17:32 那局让 A 自己跑去 B 见证位，A 从 (629,-67) 向东正好撞上停在
     #   (631,-54) 的 D，`[collision] Car_A 与 Car_D`。）
-    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 4.0, 2.0, 130.0),
-               _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 4.2, 2.0, 175.0)],
+    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 3.7, 2.0, 130.0),
+               _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 3.9, 2.0, 175.0)],
          seconds, "B→泊位 B 南侧（22 m 助跑位），D→泊位 B 北侧见证位")
     # 3.6 B 交付
     _deliver_one(ctx, "Berth_B", "Car_B", "Car_D", cb, seconds)
@@ -2434,13 +2458,16 @@ def drive_parallel(ctx, jobs, seconds):
         j["n_unstick"] = 0
         j["done"] = False
         j["got"] = None
+        j["brk"] = 0.0
     while time.time() - ctx.t0 < seconds:
         ctrls = {}
         alive = 0
         for j in jobs:
             vid = j["vid"]
             if j["done"]:
-                _ctrl(ctx, vid, 0.0, 0.4, 0.0)
+                # 收工不要一帧踩 0.4：从 0 逐帧爬到 0.55（停车阶跃是加速度违规的大头）
+                j["brk"] = min(0.55, j.get("brk", 0.0) + 0.06)
+                _ctrl(ctx, vid, 0.0, j["brk"], 0.0)
                 continue
             pos, yaw, speed = pose_of(ctx.api, vid)
             ctx.poll_events_throttled()
@@ -2474,6 +2501,8 @@ def drive_parallel(ctx, jobs, seconds):
                 thr, brk, steer, _g = safe.guard(
                     pos[0], pos[1], yaw, speed, thr, brk, steer,
                     horizon=0.6 if getattr(ctx, "no_bias", False) else 1.0,
+                    safe_gap=0.40 if getattr(ctx, "no_bias", False) else None,
+                    slow_gap=0.20 if getattr(ctx, "no_bias", False) else None,
                     allow_bias=not getattr(ctx, "no_bias", False))
             _ctrl(ctx, vid, thr, brk, steer)
             if j.get("poll"):
