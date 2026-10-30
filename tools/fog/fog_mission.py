@@ -947,18 +947,26 @@ def precise_point(ctx, name, fallback):
 
 
 def creep_into(ctx, vid, target, seconds, tol=1.6, rounds=5):
-    """分段瞑头蜷行到目标点附近（tol 内），每段 4 s 重新对准。"""
+    """分段蜷行到目标点附近（tol 内）。
+
+    ⚠️ 已经进到 2 m 以内就**别再纠偏**：19:28 那局 Car_A 在 d=0.97 m 时还去纠，
+    1 m 的目标点落在车后 → 纯跟踪直接掉头，8 s 后甩到 (622.9,−61.8) 撞进
+    EastBulkCargoWarehouse。位姿精度交给后面的 `park_and_hold`（它只要求停稳）。
+    """
     for k in range(rounds):
         pos = pose_of(ctx.api, vid)[0]
         d = math.hypot(pos[0] - target[0], pos[1] - target[1])
         ctx.note("[creep] %s d=%.2f (%.1f,%.1f)" % (vid, d, pos[0], pos[1]))
-        if d <= tol:
+        if d <= max(tol, 2.0):
+            if d > tol:
+                ctx.note("[creep] %s 已在 %.1f m 内，不再纠偏（避免掉头甩出去）" % (vid, d))
             return True
         if time.time() - ctx.t0 > seconds - 5.0:
             return False
         try:
-            drive_polyline(ctx, vid, [(pos[0], pos[1]), (target[0], target[1])], seconds, v_cap=0.9)
-        except Exception as exc:
+            drive_polyline(ctx, vid, [(pos[0], pos[1]), (target[0], target[1])],
+                           seconds, v_cap=0.7)
+        except Exception as exc:                               # noqa: BLE001
             ctx.note("[creep] 异常 %s" % exc)
             return False
     return False
