@@ -19,7 +19,8 @@ $console = Join-Path $Out 'console.log'
 
 function Say($m) {
     $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m
-    Write-Output $line
+    Write-Host $line          # 不能用 Write-Output：会把 Say 的返回值变成数组，
+                              # 让 'if (Start-SceneOnce)' 恒为真（场景没起来也硬跑）
     Add-Content -Path $console -Value $line -Encoding UTF8
 }
 

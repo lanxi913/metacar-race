@@ -154,7 +154,10 @@ def hold_still(ctx, vid, seconds=6.0, speed_eps=0.06):
     cur = 0.15
     while time.time() < t_end:
         pos, yaw, sp = pose_of(ctx.api, vid)
-        ctrls = {v: VehicleControl(throttle=0.0, brake=min(cur, 0.40), steering=0.0)
+        hb = getattr(ctx, "hold_brk", None) or {}
+        ctrls = {v: VehicleControl(throttle=0.0,
+                                   brake=max(min(cur, 0.40), hb.get(v, 0.0)),
+                                   steering=0.0)
                  for v in ctx.vids}
         ctrls[vid] = VehicleControl(throttle=0.0, brake=cur, steering=0.0)
         ctx.api.set_vehicle_controls(ctrls)
@@ -179,7 +182,9 @@ def creep_to(ctx, vid, goal_xy, seconds, stop_m, v_cap=1.4):
         brk = 0.0 if speed > 0.4 else 0.0
         if abs(diff) > 50.0:
             thr, brk = 0.0, 0.35
-        ctrls = {v: VehicleControl(throttle=0.0, brake=0.35, steering=0.0)
+        hb = getattr(ctx, "hold_brk", None) or {}
+        ctrls = {v: VehicleControl(throttle=0.0, brake=max(0.35, hb.get(v, 0.0)),
+                                   steering=0.0)
                  for v in ctx.vids}
         ctrls[vid] = VehicleControl(throttle=thr, brake=brk, steering=steer)
         ctx.api.set_vehicle_controls(ctrls)
@@ -982,7 +987,9 @@ def park_and_hold(ctx, vid, seconds, need_s=2.0, eps=0.05):
             veh.gear = GearMode.PARKING
         except Exception:
             pass
-        ctrls = {v: VehicleControl(throttle=0.0, brake=0.5, steering=0.0) for v in ctx.vids}
+        hb = getattr(ctx, "hold_brk", None) or {}
+        ctrls = {v: VehicleControl(throttle=0.0, brake=max(0.5, hb.get(v, 0.0)),
+                                   steering=0.0) for v in ctx.vids}
         ctrls[vid] = veh
         try:
             ctx.api.set_vehicle_controls(ctrls)
@@ -1499,6 +1506,30 @@ def _ctrl(ctx, vid, thr=0.0, brk=0.0, steer=0.0, gear=None):
     ctx.ctl[vid] = veh
 
 
+def _brake_others(ctx, keep):
+    """刹住没在开的车。ctx.hold_brk 里登记过的车用更强的刹车：
+
+    19:44 那局 Car_C 早该停住了，可 0.35 的刹车在缓坡上按住不，它慢慢溜到
+    路障边上又蹭了 6 次（514 s 还在刷 collision）。
+    """
+    hold = getattr(ctx, "hold_brk", None) or {}
+    for v in ctx.vids:
+        if v == keep:
+            continue
+        _ctrl(ctx, v, 0.0, float(hold.get(v, 0.35)), 0.0)
+
+
+def park_car(ctx, vid, brk=1.0):
+    """把一辆车彻底停住并登记力度（之后 _brake_others 会一直用这个力度按住）。"""
+    hold = getattr(ctx, "hold_brk", None)
+    if hold is None:
+        hold = ctx.hold_brk = {}
+    hold[vid] = float(brk)
+    _ctrl(ctx, vid, 0.0, float(brk), 0.0)
+    _send(ctx, {})
+    ctx.note("[park] %s 驻车（刹车 %.1f）" % (vid, brk))
+
+
 def settle(ctx, brk=0.50, seconds=0.6):
     """踩刹车收尾：刹车从 0.12 逐帧爬上去。
 
@@ -1628,9 +1659,7 @@ def drive_to(ctx, vid, goal_xy, seconds, stop_xy=None, stop_m=STOP_FAR,
                 continue
         else:
             stall_t0 = None
-        for v in ctx.vids:
-            if v != vid:
-                _ctrl(ctx, v, 0.0, 0.35, 0.0)
+        _brake_others(ctx, vid)
         thr, brk, steer = drv.step(pos, yaw, speed, 0.1)
         if safe is not None:
             thr, brk, steer, (gap, oid) = safe.guard(
@@ -1699,9 +1728,7 @@ def drive_polyline(ctx, vid, pts, seconds, poll=None, v_cap=3.8):
                 continue
         else:
             stall_t0 = None
-        for v in ctx.vids:
-            if v != vid:
-                _ctrl(ctx, v, 0.0, 0.35, 0.0)
+        _brake_others(ctx, vid)
         thr, brk, steer = drv.step(pos, yaw, speed, 0.1)
         if safe is not None:
             thr, brk, steer, (gap, oid) = safe.guard(
@@ -1983,10 +2010,10 @@ def stage_cross(ctx, seconds):
     cb = _berth_center(ctx, "Berth_B", (834.47, -65.72))
     # 3.0 先把扫到的动态路障记成禁区：后面每辆车、每条路线都会自动绕开它
     sync_dyn_avoid(ctx)
-    # 3.0b Car_C 扫完路障就留在原地：阶段 3 之后没人给它发指令，它最后一条指令是
-    #     扫描时的油门，会自己继续乱窜（16:29 那局 175~430 s 又撞又刷加速度违规）。
-    settle(ctx, 0.60, seconds=0.8)
-    _send(ctx, {})
+    # 3.0b Car_C 扫完路障就彻底驻车：
+    #     ① 阶段 3 之后没人给它发指令，最后一条还是扫描时的油门，它会自己乱窜；
+    #     ② 0.35 的刹车在缓坡上按不住，19:44 那局它 514 s 还在路障边上蹭（6 条 collision）。
+    park_car(ctx, "Car_C", 1.0)
     # 3.1 A/B 提前出发：A 去闸口待命、B 去后方 19 m 的备用待命点（错峰 8 s，别挤同一条车道），
     #     同时把闲置的 Car_D 送到泊位 A 北侧见证位（278 m / 约 85 s）
     _pre(ctx, [_job(ctx, "Car_A", GATE_READY, 4.0, 2.0, 130.0),
