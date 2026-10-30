@@ -1858,29 +1858,41 @@ def cross_one(ctx, car, seconds):
     detour = nav_path(ctx, pos0, (728.8, -55.0))
     note("[cross] %s 栅格规划 %d 点 → (728.8,-55.0)" % (car, len(detour)))
     drive_polyline(ctx, car, detour, seconds, v_cap=4.0)
-    granted = [False]
 
-    def poll(pos, speed, _a=None):
-        if granted[0] or speed < 0.8:
-            return None
+    # ── 申请通行权：先停到"申请线"（离路口中心约 11 m，互斥区只有 6 m），再原地申请。
+    # 绝对不能一边往北开一边申请：被拒也照开的话，车一进 6 m 区就判
+    # `unauthorized_intersection_entry`，整局直接结束（21:06 那局 286 s 就是这么没的）。
+    hold = (728.79, -31.0)
+    p_h = pose_of(api, car)[0]
+    if math.hypot(p_h[0] - hold[0], p_h[1] - hold[1]) > 2.0:
+        drive_polyline(ctx, car, [(p_h[0], p_h[1]), hold], seconds, v_cap=1.5)
+    granted = False
+    tries = 0
+    t_g = min(time.time() + 20.0, ctx.t0 + seconds - 10.0)
+    while time.time() < t_g:
+        tries += 1
         try:
             r = to_plain(api.interact(car, "Intersection_Center", "request_entry"))
         except Exception:                                      # noqa: BLE001
-            return None
+            r = {}
         if r.get("granted"):
-            granted[0] = True
-            note("[cross] %s GRANTED @(%.1f,%.1f) v=%.2f" % (car, pos[0], pos[1], speed))
-            return "granted"
-        return None
+            granted = True
+            pos = pose_of(api, car)[0]
+            note("[cross] %s GRANTED @(%.1f,%.1f)（第 %d 次申请）"
+                 % (car, pos[0], pos[1], tries))
+            break
+        if tries <= 3 or tries % 8 == 0:
+            note("[cross] %s 申请未批 -> %s"
+                 % (car, str(r.get("message") or r)[:56]))
+        time.sleep(0.5)
+    if not granted:
+        note("[cross] %s 20 s 拿不到通行权，放弃（不硬闯）" % car)
+        return False
 
     ctx.no_bias = True
-    # 闸口两墙 x=726.26 / 731.32，正中是 728.79。之前这里写 729.0（右偏 0.21 m），
-    # 17:38 那局 Car_B 就在 (729.4,-17) 蹭到 Port_PassageBarrier_1_2。
-    corridor_run(ctx, car, 728.79, 8.0, v_tgt=1.6, poll=poll, seconds=seconds)
+    # 闸口两墙 x=726.26 / 731.32，正中是 728.79（写 729.0 会蹭右墙）
+    corridor_run(ctx, car, 728.79, 8.0, v_tgt=1.6, seconds=seconds)
     ctx.no_bias = False
-    if not granted[0]:
-        note("[cross] %s 未获批，跳过" % car)
-        return False
 
     tried = [None]
 
