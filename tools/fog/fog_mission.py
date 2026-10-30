@@ -1859,34 +1859,42 @@ def cross_one(ctx, car, seconds):
     note("[cross] %s 栅格规划 %d 点 → (728.8,-55.0)" % (car, len(detour)))
     drive_polyline(ctx, car, detour, seconds, v_cap=4.0)
 
-    # ── 申请通行权：先停到"申请线"（离路口中心约 11 m，互斥区只有 6 m），再原地申请。
-    # 绝对不能一边往北开一边申请：被拒也照开的话，车一进 6 m 区就判
-    # `unauthorized_intersection_entry`，整局直接结束（21:06 那局 286 s 就是这么没的）。
-    hold = (728.79, -31.0)
-    p_h = pose_of(api, car)[0]
-    if math.hypot(p_h[0] - hold[0], p_h[1] - hold[1]) > 2.0:
-        drive_polyline(ctx, car, [(p_h[0], p_h[1]), hold], seconds, v_cap=1.5)
-    granted = False
-    tries = 0
-    t_g = min(time.time() + 20.0, ctx.t0 + seconds - 10.0)
-    while time.time() < t_g:
-        tries += 1
+    # ── 申请通行权：沿进车走廊往北开、**边开边申请**（这个接口只在
+    # "车正在进车道上行驶"时判 eligible，站着申请会回
+    # `is not on an eligible intersection approach`，21:21 那局就是这么卡的），
+    # 但一到申请线 (728.79,-30.5) 就停死 —— 没获批绝不进 6 m 互斥区，
+    # 否则一进区就判 `unauthorized_intersection_entry`，整局直接结束。
+    granted = [False]
+    asks = [0]
+
+    def reqpoll(pos, speed, _a=None):
+        if granted[0]:
+            return "granted"
+        asks[0] += 1
         try:
             r = to_plain(api.interact(car, "Intersection_Center", "request_entry"))
         except Exception:                                      # noqa: BLE001
-            r = {}
+            return None
         if r.get("granted"):
-            granted = True
-            pos = pose_of(api, car)[0]
-            note("[cross] %s GRANTED @(%.1f,%.1f)（第 %d 次申请）"
-                 % (car, pos[0], pos[1], tries))
-            break
-        if tries <= 3 or tries % 8 == 0:
+            granted[0] = True
+            note("[cross] %s GRANTED @(%.1f,%.1f) v=%.2f（第 %d 次申请）"
+                 % (car, pos[0], pos[1], speed, asks[0]))
+            return "granted"
+        if asks[0] <= 3 or asks[0] % 12 == 0:
             note("[cross] %s 申请未批 -> %s"
-                 % (car, str(r.get("message") or r)[:56]))
+                 % (car, str(r.get("message") or r)[:52]))
+        return None
+
+    p_now = pose_of(api, car)[0]
+    drive_polyline(ctx, car, [(p_now[0], p_now[1]), (728.79, -30.5)],
+                   seconds, v_cap=1.5, poll=reqpoll)
+    # 到线还没批：再原地试 6 s（有时是刚过窗口，稍等会批）
+    t_g = min(time.time() + 6.0, ctx.t0 + seconds - 10.0)
+    while not granted[0] and time.time() < t_g:
+        reqpoll(pose_of(api, car)[0], 0.0)
         time.sleep(0.5)
-    if not granted:
-        note("[cross] %s 20 s 拿不到通行权，放弃（不硬闯）" % car)
+    if not granted[0]:
+        note("[cross] %s 拿不到通行权，放弃（不硬闯）" % car)
         return False
 
     # 闸口两墙 x=726.26 / 731.32，正中是 728.79（写 729.0 会蹭右墙）。
