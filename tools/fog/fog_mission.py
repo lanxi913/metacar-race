@@ -1920,7 +1920,7 @@ def cross_one(ctx, car, seconds):
                            seconds, v_cap=1.8)
         p_now = pose_of(api, car)[0]
         drive_polyline(ctx, car, [(p_now[0], p_now[1]), (729.05, -30.0)],
-                       seconds, v_cap=1.5, poll=reqpoll)
+                       seconds, v_cap=2.2, poll=reqpoll)
         # 到线还没批：再原地试 6 s（有时是刚过窗口，稍等会批）
         t_g = min(time.time() + 6.0, ctx.t0 + seconds - 10.0)
         while not granted[0] and time.time() < t_g:
@@ -2133,7 +2133,7 @@ def stage_cross(ctx, seconds):
     # 见证车用 Car_D：A 交付完就停在泊位旁边不动，D 从它北侧一路向东去 B 泊位。
     # （17:32 那局让 A 自己跑去 B 见证位，A 从 (629,-67) 向东正好撞上停在
     #   (631,-54) 的 D，`[collision] Car_A 与 Car_D`。）
-    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 3.7, 2.0, 130.0),
+    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 4.1, 2.0, 130.0),
                _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 3.9, 2.0, 175.0)],
          seconds, "B→泊位 B 南侧（22 m 助跑位），D→泊位 B 北侧见证位")
     # 3.6 B 交付
