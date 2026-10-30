@@ -1908,9 +1908,11 @@ def cross_one(ctx, car, seconds):
     got = drive_polyline(ctx, car, gate_fast, seconds, v_cap=1.6, poll=relpoll)
     ok = (got == "released")
     if not ok:
-        gate_slow = [(728.79, -14.0), (728.79, -12.0), (728.79, -11.0),
-                     (728.79, -9.0), (728.79, -7.0)]
-        got = drive_polyline(ctx, car, gate_slow, seconds, v_cap=0.8, poll=relpoll)
+        # 0.8 m/s 那版实测会漏（20:49 那局 B 在 x=728.6 一带连试 6 次都判 not reached，
+        # 然后撞闸壁 9 次）。0.5 m/s 能把出口箱（x>=728.75、y -12~-9.5）采满。
+        gate_slow = [(728.79, -15.0), (728.79, -12.0), (728.79, -10.0),
+                     (728.79, -8.0)]
+        got = drive_polyline(ctx, car, gate_slow, seconds, v_cap=0.5, poll=relpoll)
         ok = (got == "released")
     if not ok:
         # 还不行就在出口点周围做小网格补扫（通行权还在自己手里，别开出互斥区）
