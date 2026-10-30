@@ -97,7 +97,7 @@ def route(graph, start_xy, goal_xy, v_max=4.5):
         chain.append(came[chain[-1]])
     chain.reverse()
 
-    pts = [start_xy]
+    pts = []                       # 只放道路上的点，起点最后再拼回去
     speeds = []
     prev_h = None
     for rid in chain:
@@ -113,18 +113,32 @@ def route(graph, start_xy, goal_xy, v_max=4.5):
                 turn = 0.0
             else:
                 turn = abs(wrap_pi(hh - prev_h))
+            # 分段限速：原来 1.6/2.2/3.2 太保守（港口是直角网格，几乎每个路口都算大转角，
+            # 全程被压到 1.6~2 m/s，432 m 要跑 180 s）。车宽 2.45 m、路口倒过 3 m 角，
+            # 2.4/3.0/3.6 在这些路口是能过的（实测 23:40 那局最大横向 0.2 m）。
             if turn > 1.2:
-                v = min(v_max, 1.6)
+                v = min(v_max, 2.4)
             elif turn > 0.6:
-                v = min(v_max, 2.2)
+                v = min(v_max, 3.0)
             elif turn > 0.25:
-                v = min(v_max, 3.2)
+                v = min(v_max, 3.6)
             else:
                 v = v_max
             speeds.append(v)
         prev_h = _heading(road)
-    pts.append(goal_xy)
-    speeds.append(min(v_max, 2.2))
+
+    def _idx(seq, p):
+        return min(range(len(seq)),
+                   key=lambda i: math.hypot(seq[i][0] - p[0], seq[i][1] - p[1]))
+
+    # 起点投影所在的那一段之前的路点全丢掉：车常在某条路的中段，逐点铺下来会先往回开十几米
+    i0 = _idx(pts, start_xy) if pts else 0
+    pts, speeds = pts[i0:], speeds[i0:]
+    # 终点投影之后的点也丢掉（否则目标在后、路在前面，末尾形成 180° 发夹）
+    i1 = _idx(pts, goal_xy) if pts else 0
+    pts, speeds = pts[:i1 + 1], speeds[:i1 + 1]
+    pts = [start_xy] + pts
+    speeds = [(speeds[0] if speeds else v_max)] + speeds
     # 去重
     out_p, out_v = [pts[0]], []
     for i in range(1, len(pts)):
@@ -133,4 +147,19 @@ def route(graph, start_xy, goal_xy, v_max=4.5):
             out_v.append(speeds[i - 1])
     if len(out_p) < 2:
         return None
+
+    # 目标只有在最后一段的前方才追加，否则就地收尾（差多少交给 stop_m 处理）
+    if len(out_p) >= 2:
+        dx = out_p[-1][0] - out_p[-2][0]
+        dy = out_p[-1][1] - out_p[-2][1]
+        gx = goal_xy[0] - out_p[-1][0]
+        gy = goal_xy[1] - out_p[-1][1]
+        if dx * gx + dy * gy > 0:
+            out_p.append(goal_xy)
+            out_v.append(min(v_max, 2.2))
+    if len(out_p) < 2:
+        out_p = [start_xy, goal_xy]
+        out_v = [v_max]
+    if len(out_v) < len(out_p) - 1:
+        out_v = out_v + [out_v[-1] if out_v else v_max] * (len(out_p) - 1 - len(out_v))
     return Route(out_p, out_v)

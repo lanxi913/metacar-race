@@ -43,6 +43,36 @@ class Ctx(object):
         self.note = note
 
 
+def back_off_roadblock(ctx, vid, seconds, clear_m=12.0):
+    """扫完路障后把车倒出它的包围盒：不倒车直接开，会一路刮着 Roadblock_East 走。"""
+    rb = (766.5, -88.2)
+    for k in range(5):
+        try:
+            p, _y, _v = pose_of(ctx.api, vid)
+        except Exception:                                      # noqa: BLE001
+            return
+        d = math.hypot(p[0] - rb[0], p[1] - rb[1])
+        if d > clear_m:
+            ctx.note("    %s 离路障 %.1f m，够了" % (vid, d))
+            return
+        ctx.note("    %s 离路障只有 %.1f m，倒车让开" % (vid, d))
+        for v in ctx.vids:
+            _ctrl(ctx, v, 0.0, 0.4 if v != vid else 0.0, 0.0)
+        veh = VehicleControl(throttle=0.34, brake=0.0, steering=0.0)
+        try:
+            veh.gear = GearMode.REVERSE
+        except Exception:                                      # noqa: BLE001
+            pass
+        ctx.ctl[vid] = veh
+        t_end = time.time() + 2.4
+        while time.time() < t_end and time.time() - ctx.t0 < seconds:
+            _send(ctx, {})
+            time.sleep(0.1)
+        _ctrl(ctx, vid, 0.0, 0.6, 0.0)
+        _send(ctx, {})
+        reset_pose(vid)
+
+
 def drive_to(ctx, vid, goal_xy, seconds, stop_xy=None, stop_m=STOP_FAR,
              poll=None, approach_xy=None):
     """开到 goal_xy；stop_xy+stop_m 给了就按距离停车。返回 (ok, pos, speed)。
@@ -118,15 +148,17 @@ def drive_to(ctx, vid, goal_xy, seconds, stop_xy=None, stop_m=STOP_FAR,
 
 
 def hold_still(ctx, vid, seconds=6.0, speed_eps=0.06):
-    """踩住刹车直到车速接近 0。返回最终速度。"""
+    """踩住刹车直到车速接近 0。刹车逐帧爬上去（一帧 0→0.6 会被判一次加速度超限）。"""
     t_end = time.time() + seconds
     sp = 9.9
+    cur = 0.15
     while time.time() < t_end:
         pos, yaw, sp = pose_of(ctx.api, vid)
-        ctrls = {v: VehicleControl(throttle=0.0, brake=0.4, steering=0.0)
+        ctrls = {v: VehicleControl(throttle=0.0, brake=min(cur, 0.40), steering=0.0)
                  for v in ctx.vids}
-        ctrls[vid] = VehicleControl(throttle=0.0, brake=0.6, steering=0.0)
+        ctrls[vid] = VehicleControl(throttle=0.0, brake=cur, steering=0.0)
         ctx.api.set_vehicle_controls(ctrls)
+        cur = min(0.60, cur + 0.12)
         if abs(sp) < speed_eps:
             break
         time.sleep(0.12)
@@ -200,14 +232,32 @@ def gate_path(ctx, frm, to):
     return pts or [frm, to]
 
 
-def nav_path(ctx, frm, to, inflate=2.4):
-    """用栅格 A* 规划（避开静态物），返回折线船点。"""
+def nav_path(ctx, frm, to, inflate=2.4, avoid=None, avoid_r=4.0):
+    """用栅格 A* 规划（避开静态物），返回折线航点。"""
     if getattr(ctx, "grid", None) is None:
         st = to_plain(ctx.api.get_scene_static_data())
         ctx.grid = fog_nav.Grid(st)
-    pts = ctx.grid.astar(frm, to)
-    if pts:
-        pts = fog_nav.smooth(pts, ctx.grid)
+    # avoid：动态障碍按圆形禁区抹掉——static_objects 里没有它，不抹的话 A* 会
+    # 直接从路障身上穿过去（15:14 那局 Car_C 的 4 点路线压着 Roadblock_East 走，
+    # 撞了 60+ 条、卡死 5 次）。ctx.dyn_avoid 是全局禁区表，每辆车、每次规划都带上。
+    zones = list(avoid or []) + list(getattr(ctx, "dyn_avoid", None) or [])
+    saved = None
+    if zones:
+        saved = bytes(ctx.grid.block)
+        for z in zones:
+            ax, ay = float(z[0]), float(z[1])
+            rr = float(z[2]) if len(z) > 2 else avoid_r
+            try:
+                ctx.grid._disc(ax, ay, rr, block=True)
+            except Exception:                              # noqa: BLE001
+                pass
+    try:
+        pts = ctx.grid.astar(frm, to)
+        if pts:
+            pts = fog_nav.smooth(pts, ctx.grid)
+    finally:
+        if saved is not None:
+            ctx.grid.block = bytearray(saved)
     return pts or [frm, to]
 
 
@@ -244,8 +294,29 @@ def stage_signals(ctx, seconds):
                             return key
             return None
 
-        drive_to(ctx, "Car_C", sig_xy, seconds, stop_xy=sig_xy, stop_m=STOP_FAR,
-                 poll=poll)
+        if sig_id == "Signal_B" and not getattr(ctx, "prepos", False):
+            # C 去 B 的这 130 s 里，把一直闲着的 D 送到泊位 A 的见证位（约 170 m）
+            ctx.prepos = True
+            try:
+                pos_c = pose_of(ctx.api, "Car_C")[0]
+                rr = fog_route.route(ctx.graph, pos_c, sig_xy)
+                jobs = [{"vid": "Car_C", "route": fog_route.Route(rr.pts, rr.speeds),
+                         "v_cap": 4.8, "stop_xy": sig_xy, "stop_m": STOP_FAR,
+                         "poll": poll, "limit": 300.0}]
+                pd = pose_of(ctx.api, "Car_D")[0]
+                jobs.append({"vid": "Car_D",
+                             "pts": nav_path(ctx, pd, (631.0, -50.7)),
+                             "v_cap": 4.2, "stop_xy": (631.0, -50.7),
+                             "stop_m": 2.0, "limit": 170.0})
+                ctx.note("[pre] C 去 B 的同时把 D 送到泊位 A 见证位")
+                got_b = drive_parallel(ctx, jobs, seconds)
+                if got_b.get("Car_C"):
+                    state["key"] = got_b["Car_C"]
+            except Exception as exc:                               # noqa: BLE001
+                ctx.note("[pre] 并行送去见证位失败 %s" % exc)
+        else:
+            drive_to(ctx, "Car_C", sig_xy, seconds, stop_xy=sig_xy, stop_m=STOP_FAR,
+                     poll=poll)
         if state.get("key"):
             ok[sig_id] = state["key"]
         else:
@@ -313,7 +384,7 @@ def _chain_segments(segs, start):
     return pts
 
 
-def drive_polyline(ctx, vid, pts, seconds, poll=None, v_cap=4.2):
+def drive_polyline(ctx, vid, pts, seconds, poll=None, v_cap=3.8):
     """沿给定折线（不做路网规划）开过去，边开边 poll。"""
     if len(pts) < 2:
         pts = [pts[0], (pts[0][0] + 0.1, pts[0][1])]
@@ -459,7 +530,7 @@ def stage_scan(ctx, seconds):
                     for i in range(len(seq) - 1))
         ctx.note("[scan] %s 车道 %d 段 / 折线 %d 点 / 约 %.0f m"
                  % (zid, len(segs), len(seq), total))
-        drive_polyline(ctx, "Car_C", seq, seconds, poll=poll)
+        drive_polyline(ctx, "Car_C", seq, seconds, poll=poll, v_cap=3.2)
         if hit.get("id") and (hit.get("d") or 999) <= 10.5:
             ctx.note("[scan] 发现 %s d=%.1f，先停稳再扫"
                      % (hit["id"], hit.get("d") or -1))
@@ -597,8 +668,10 @@ def _report(ctx, carrier, name, verbose=False):
         if str(it.get("object_id") or "") != name:
             continue
         tok = it.get("observation_token") or ""
-        ctx.note("[obs] %s 看到 %s d=%.1f tok=%s"
-                 % (carrier, name, it.get("distance_m") or -1, tok[:12]))
+        _p, _yw, _sp = pose_of(ctx.api, carrier)
+        ctx.note("[obs] %s 看到 %s d=%.1f tok=%s yaw=%.0f @(%.1f,%.1f)"
+                 % (carrier, name, it.get("distance_m") or -1, tok[:12],
+                    _yw, _p[0], _p[1]))
         if not tok:
             ctx.note("[obs] %s 看到 %s 但无凭证" % (carrier, name))
             return False
@@ -1261,6 +1334,16 @@ def main():
             if args.deliver:
                 note("=== 阶段 4：泊位观测与交付 ===")
                 stage_deliver(ctx, args.seconds)
+        try:
+            for cmd in ("get_score", "get_run_report", "get_task_state"):
+                try:
+                    raw = api._request({"command": cmd})
+                except Exception as exc:                           # noqa: BLE001
+                    note("[score] %s 失败 %s" % (cmd, exc))
+                    continue
+                note("[score] %s -> %s" % (cmd, json.dumps(raw, ensure_ascii=False)[:700]))
+        except Exception as exc:                               # noqa: BLE001
+            pass
     finally:
         try:
             api.set_vehicle_controls({v: VehicleControl(throttle=0.0, brake=0.6,
@@ -1271,6 +1354,1169 @@ def main():
         try:
             api.close()
         except Exception:                              # noqa: BLE001
+            pass
+
+
+# ============================================================================
+# 以下是我在 2026-10-29/30 迭代出来的执行层（覆盖上面原版同名函数）。
+# 放在文件末尾、`if __name__ == "__main__": main()` 之前，靠"后定义覆盖先定义"生效。
+# 关键改动：防撞层、卡住立刻倒车、信号弧线补读、出口 0.5 m 细扫、过闸后直接去泊位。
+# ============================================================================
+from fog_run3 import pose_of, KEY_RE, WHEELBASE_RATIO, MAX_STEER, clip, reset_pose
+from fog_safety import Safety, SAFE_GAP, WARN_PATH_M
+
+
+def _dyn_register(ctx, xy, r=8.0, tag=""):
+    """把动态障碍（路障这类 static_objects 里没有的东西）记成圆形禁区。"""
+    lst = getattr(ctx, "dyn_avoid", None)
+    if lst is None:
+        lst = ctx.dyn_avoid = []
+    for (x, y, _rr) in lst:
+        if math.hypot(x - xy[0], y - xy[1]) < 3.0:
+            return False
+    lst.append((float(xy[0]), float(xy[1]), float(r)))
+    ctx.note("[avoid] 记入动态禁区 %s (%.1f,%.1f) r=%.0f m，之后所有路线绕开它"
+             % (tag, xy[0], xy[1], r))
+    return True
+
+
+def _dyn_xy_of(ctx, name):
+    """按名字找任务对象坐标（路障只在这里有精确位置）。"""
+    try:
+        ts = to_plain(ctx.api.get_task_state())
+    except Exception:                                          # noqa: BLE001
+        return None
+    for o in ts.get("shared_task_objects") or []:
+        if str(o.get("object_id") or "") != name:
+            continue
+        p = o.get("position") or {}
+        if p.get("x") is not None:
+            return (float(p["x"]), float(p["y"]))
+        unc = o.get("uncertainty_region") or {}
+        mn, mx = unc.get("minimum") or {}, unc.get("maximum") or {}
+        if mn and mx:
+            return (0.5 * (mn["x"] + mx["x"]), 0.5 * (mn["y"] + mx["y"]))
+    return None
+
+
+def sync_dyn_avoid(ctx, r=8.0):
+    """任务状态里的路障全部记成禁区。扫描一结束就调用，后面每条路线都会绕。"""
+    try:
+        ts = to_plain(ctx.api.get_task_state())
+    except Exception:                                          # noqa: BLE001
+        return
+    for o in ts.get("shared_task_objects") or []:
+        if o.get("object_type") != "roadblock":
+            continue
+        p = o.get("position") or {}
+        if p.get("x") is None:
+            continue
+        _dyn_register(ctx, (float(p["x"]), float(p["y"])), r,
+                      str(o.get("object_id")))
+
+
+def _ctx_poll_events(self):
+    """把上一帧之后的事件读出来，违规立刻落日志（不读就不知道车为什么卡住）。"""
+    try:
+        evs = self.api.get_events(getattr(self, "ev_seq", 0))
+    except Exception as exc:                               # noqa: BLE001
+        self.note("[events] 读取失败 %s" % exc)
+        return
+    for e in evs:
+        d = to_plain(e)
+        seq = int(d.get("sequence") or 0)
+        if seq > getattr(self, "ev_seq", 0):
+            self.ev_seq = seq
+        kind = d.get("event_type") or ""
+        msg = str(d.get("message"))
+        if kind in ("violation", "warning", "penalty"):
+            self.note("[violation] #%s %s" % (seq, msg[:110]))
+        # 撞到"实体障碍"= 那条路被堵了：把它记成禁区，别再往同一个地方撞
+        if "与实体障碍" in msg:
+            nm = msg.split("与实体障碍", 1)[1].split("发生碰撞", 1)[0].strip()
+            seen = getattr(self, "_blk_seen", None)
+            if seen is None:
+                seen = self._blk_seen = set()
+            if nm and nm not in seen:
+                seen.add(nm)
+                xy = _dyn_xy_of(self, nm)
+                if xy is not None:
+                    _dyn_register(self, xy, 8.0, nm)
+                else:
+                    self.note("[avoid] %s 是静态构件（已在栅格里），不用再记" % nm)
+
+
+def _ctx_poll_throttled(self, every=2.0):
+    now = time.time()
+    if now - getattr(self, "_ev_t", 0.0) < every:
+        return
+    self._ev_t = now
+    self.poll_events()
+
+
+Ctx.poll_events = _ctx_poll_events
+Ctx.poll_events_throttled = _ctx_poll_throttled
+
+
+STOP_FAR = 4.5          # 读码要 ≤7 m，停 6.7 m 太勉强
+
+
+def _dense(pts, step=2.0):
+    out = []
+    for i in range(len(pts) - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        seg = math.hypot(bx - ax, by - ay)
+        n = max(1, int(seg / step))
+        for k in range(n):
+            out.append((ax + (bx - ax) * k / n, ay + (by - ay) * k / n))
+    out.append(tuple(pts[-1]))
+    return out
+
+
+def _send(ctx, ctrls):
+    """合并式下发：只覆盖当前线程"占用"的车，其余保留上一帧指令。"""
+    for vid, veh in ctrls.items():
+        ctx.ctl[vid] = veh
+    try:
+        ctx.api.set_vehicle_controls(dict(ctx.ctl))
+    except Exception as exc:                                   # noqa: BLE001
+        ctx.note("[ctl] 发送失败 %s" % exc)
+
+
+def _ctrl(ctx, vid, thr=0.0, brk=0.0, steer=0.0, gear=None):
+    veh = VehicleControl(throttle=thr, brake=brk, steering=steer)
+    if gear is not None:
+        veh.gear = gear
+    ctx.ctl[vid] = veh
+
+
+def settle(ctx, brk=0.50, seconds=0.6):
+    """踩刹车收尾：刹车从 0.12 逐帧爬上去。
+
+    一帧 0→0.45/0.60 的刹车阶跃就够平台判一次 `[excessive_acceleration]`
+    （17:38 那局 C 在 170/178 s、D 在 223/352 s 都是这么丢的）。
+    """
+    t_end = min(time.time() + seconds, ctx.t0 + 600.0)
+    cur = 0.12
+    while time.time() < t_end:
+        for v in ctx.vids:
+            _ctrl(ctx, v, 0.0, cur, 0.0)
+        _send(ctx, {})
+        cur = min(brk, cur + 0.10)
+        time.sleep(0.1)
+
+
+def unstick(ctx, vid, seconds, back_s=1.2, thr=0.30, steer=0.0):
+    """车走不动了：先往反方向退一点（用户 29 日 23:07 定的规矩）。
+
+    油门按 0.06/帧 爬上去、收尾只踩 0.45 —— 原来 0→0.30 一脚踏出去、收手时
+    0→0.6 一脚刹住，每帧 Δv 都能顶到 5 m/s² 以上，这就是
+    `[excessive_acceleration]` 的主要来源。
+    """
+    for v in ctx.vids:
+        _ctrl(ctx, v, 0.0, 0.35 if v != vid else 0.0, 0.0)
+    _send(ctx, {})
+    t_end = min(time.time() + back_s, ctx.t0 + seconds)
+    p0 = pose_of(ctx.api, vid)[0]
+    cur = 0.06
+    while time.time() < t_end:
+        veh = VehicleControl(throttle=cur, brake=0.0, steering=steer)
+        try:
+            veh.gear = GearMode.REVERSE
+        except Exception:                                      # noqa: BLE001
+            pass
+        ctx.ctl[vid] = veh
+        _send(ctx, {})
+        cur = min(thr, cur + 0.06)
+        time.sleep(0.1)
+    for v in ctx.vids:
+        _ctrl(ctx, v, 0.0, 0.45, 0.0)
+    _send(ctx, {})
+    time.sleep(0.45)
+    p1 = pose_of(ctx.api, vid)[0]
+    reset_pose(vid)
+    moved = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+    ctx.note("    %s [unstick] 倒车 %.2f m -> (%.1f,%.1f)" % (vid, moved, p1[0], p1[1]))
+    return moved
+
+
+def back_off_roadblock(ctx, vid, seconds, clear_m=12.0):
+    """扫完路障后把车倒出它的包围盒：不倒车直接开，会一路刮着 Roadblock_East 走。"""
+    rb = (766.5, -88.2)
+    for k in range(5):
+        try:
+            p, _y, _v = pose_of(ctx.api, vid)
+        except Exception:                                      # noqa: BLE001
+            return
+        d = math.hypot(p[0] - rb[0], p[1] - rb[1])
+        if d > clear_m:
+            ctx.note("    %s 离路障 %.1f m，够了" % (vid, d))
+            return
+        ctx.note("    %s 离路障只有 %.1f m，倒车让开" % (vid, d))
+        for v in ctx.vids:
+            _ctrl(ctx, v, 0.0, 0.4 if v != vid else 0.0, 0.0)
+        veh = VehicleControl(throttle=0.34, brake=0.0, steering=0.0)
+        try:
+            veh.gear = GearMode.REVERSE
+        except Exception:                                      # noqa: BLE001
+            pass
+        ctx.ctl[vid] = veh
+        t_end = time.time() + 2.4
+        while time.time() < t_end and time.time() - ctx.t0 < seconds:
+            _send(ctx, {})
+            time.sleep(0.1)
+        _ctrl(ctx, vid, 0.0, 0.6, 0.0)
+        _send(ctx, {})
+        reset_pose(vid)
+
+
+def drive_to(ctx, vid, goal_xy, seconds, stop_xy=None, stop_m=STOP_FAR,
+             poll=None, approach_xy=None):
+    """开到 goal_xy（含路线体检 + 逐帧防撞 + 卡住倒车）。"""
+    safe = getattr(ctx, "safety", None)
+    pos, _y, _v = pose_of(ctx.api, vid)
+    r = fog_route.route(ctx.graph, pos, goal_xy)
+    if r is None:
+        ctx.note("  [nav] 无法规划到 (%.1f,%.1f)" % goal_xy)
+        return False, pos, 0.0, None
+    if safe is not None:
+        d_clear, at_c, oid_c = safe.path_clearance(r.pts, skip_tail=stop_m + 2.0,
+                                                    skip_head=6.0)
+        if d_clear < WARN_PATH_M:
+            ctx.note("  [safe] 路线最近 %.2f m（%s @(%.1f,%.1f)）→ 改用栅格绕行"
+                     % (d_clear, oid_c, at_c[0], at_c[1]))
+            det = nav_path(ctx, pos, goal_xy)
+            if det and len(det) >= 2:
+                r2 = fog_route.Route(_dense(det), [3.0] * len(_dense(det)))
+                if safe.path_clearance(r2.pts, skip_tail=stop_m + 2.0)[0] > d_clear:
+                    r = r2
+    drv = LaneDriver(r, ctx.wb, v_cap=4.6, stop_xy=stop_xy, stop_m=stop_m)
+    ctx.note("  [nav] -> (%.1f,%.1f) %d wp %.0f m"
+             % (goal_xy[0], goal_xy[1], len(r.pts), r.length()))
+    got = None
+    last = 0.0
+    last_guard = 0.0
+    stall_t0 = None
+    n_unstick = 0
+    while time.time() - ctx.t0 < seconds:
+        pos, yaw, speed = pose_of(ctx.api, vid)
+        now = time.time()
+        ctx.poll_events_throttled()
+        if abs(speed) < 0.15:
+            if stall_t0 is None:
+                stall_t0 = now
+            elif now - stall_t0 > 1.2:
+                n_unstick += 1
+                if n_unstick > 5:
+                    ctx.note("    %s 倒车 5 次仍走不动，放弃这一段" % vid)
+                    break
+                ctx.note("    %s [stuck] %.1fs 不动 @(%.1f,%.1f)，倒车脱困（第 %d 次）"
+                         % (vid, now - stall_t0, pos[0], pos[1], n_unstick))
+                unstick(ctx, vid, seconds, back_s=1.1 + 0.2 * n_unstick,
+                        steer=0.25 if n_unstick % 2 else -0.25)
+                drv.reset_heading()
+                stall_t0 = None
+                continue
+        else:
+            stall_t0 = None
+        for v in ctx.vids:
+            if v != vid:
+                _ctrl(ctx, v, 0.0, 0.35, 0.0)
+        thr, brk, steer = drv.step(pos, yaw, speed, 0.1)
+        if safe is not None:
+            thr, brk, steer, (gap, oid) = safe.guard(
+                pos[0], pos[1], yaw, speed, thr, brk, steer,
+                horizon=0.6 if getattr(ctx, "no_bias", False) else 1.0,
+                allow_bias=not getattr(ctx, "no_bias", False))
+            if gap < SAFE_GAP and now - last_guard > 3.0:
+                last_guard = now
+                ctx.note("    %s [safe] 净空 %.2f m（%s）→ 限速/让开" % (vid, gap, oid))
+        _ctrl(ctx, vid, thr, brk, steer)
+        _send(ctx, {})
+        ob = to_plain(ctx.api.get_observation(vid))
+        if poll is not None:
+            got = poll(pos, speed, ob)
+            if got is not None:
+                break
+        if time.time() - ctx.t0 - last > 8.0:
+            last = time.time() - ctx.t0
+            ctx.note("    %s (%.1f,%.1f) v=%.2f seg=%d/%d"
+                     % (vid, pos[0], pos[1], speed, drv.i, len(drv.pts)))
+        if drv.done:
+            break
+        time.sleep(0.1)
+    if got is not None:
+        pos, _y, speed = pose_of(ctx.api, vid)
+        return True, pos, speed, got
+    settle(ctx, 0.50, seconds=0.9)
+    pos, _y, speed = pose_of(ctx.api, vid)
+    return drv.done, pos, speed, got
+
+
+def drive_polyline(ctx, vid, pts, seconds, poll=None, v_cap=3.8):
+    """沿给定折线开（含防撞 + 卡住倒车）。"""
+    safe = getattr(ctx, "safety", None)
+    if len(pts) < 2:
+        pts = [pts[0], (pts[0][0] + 0.1, pts[0][1])]
+    if safe is not None:
+        d_clear, at_c, oid_c = safe.path_clearance(pts, skip_tail=2.0)
+        ctx.note("  [safe] 折线 %d 点，最近 %.2f m（%s @(%.1f,%.1f)）"
+                 % (len(pts), d_clear, oid_c, at_c[0], at_c[1]))
+    dense = _dense(pts)
+    drv = LaneDriver(fog_route.Route(dense, [v_cap] * len(dense)), ctx.wb, v_cap=v_cap)
+    got = None
+    last = 0.0
+    last_guard = 0.0
+    stall_t0 = None
+    n_unstick = 0
+    while time.time() - ctx.t0 < seconds:
+        pos, yaw, speed = pose_of(ctx.api, vid)
+        now = time.time()
+        ctx.poll_events_throttled()
+        if abs(speed) < 0.15:
+            if stall_t0 is None:
+                stall_t0 = now
+            elif now - stall_t0 > 1.2:
+                n_unstick += 1
+                if n_unstick > 5:
+                    ctx.note("    %s 倒车 5 次仍走不动，放弃" % vid)
+                    break
+                ctx.note("    %s [stuck] @(%.1f,%.1f) seg=%d/%d 倒车脱困（第 %d 次）"
+                         % (vid, pos[0], pos[1], drv.i, len(drv.pts), n_unstick))
+                unstick(ctx, vid, seconds, back_s=1.1 + 0.2 * n_unstick,
+                        steer=0.25 if n_unstick % 2 else -0.25)
+                drv.reset_heading()
+                stall_t0 = None
+                continue
+        else:
+            stall_t0 = None
+        for v in ctx.vids:
+            if v != vid:
+                _ctrl(ctx, v, 0.0, 0.35, 0.0)
+        thr, brk, steer = drv.step(pos, yaw, speed, 0.1)
+        if safe is not None:
+            thr, brk, steer, (gap, oid) = safe.guard(
+                pos[0], pos[1], yaw, speed, thr, brk, steer,
+                horizon=0.6 if getattr(ctx, "no_bias", False) else 1.0,
+                allow_bias=not getattr(ctx, "no_bias", False))
+            if gap < SAFE_GAP and now - last_guard > 3.0:
+                last_guard = now
+                ctx.note("    %s [safe] 净空 %.2f m（%s）→ 限速/让开" % (vid, gap, oid))
+        _ctrl(ctx, vid, thr, brk, steer)
+        _send(ctx, {})
+        ob = to_plain(ctx.api.get_observation(vid))
+        if poll is not None:
+            got = poll(pos, speed, ob)
+            if got is not None:
+                break
+        if time.time() - ctx.t0 - last > 10.0:
+            last = time.time() - ctx.t0
+            ctx.note("    %s (%.1f,%.1f) v=%.2f seg=%d/%d"
+                     % (vid, pos[0], pos[1], speed, drv.i, len(drv.pts)))
+        if drv.done:
+            break
+        time.sleep(0.1)
+    # 收尾也斜坡刹车：一帧 0→0.35/0.45 会判一次加速度超限（17:38 / 18:07 两局都有）
+    if got is None:
+        settle(ctx, 0.50, seconds=0.8)
+    return got
+
+
+def arc_scan(ctx, vid, sig_id, seconds, rounds=4, arc_s=2.4):
+    """边走小弧边读观测，一出现带 KEY 的 hint 就地提交（不依赖航向）。"""
+    for k in range(rounds):
+        if time.time() - ctx.t0 > seconds - 5.0:
+            return ""
+        sdir = 0.6 if k % 2 == 0 else -0.6
+        t_end = time.time() + arc_s
+        thr_a = 0.08                      # 斜坡起步：0.22 一脚踩下去就是一次加速度违规
+        while time.time() < t_end:
+            _ctrl(ctx, vid, thr_a, 0.0, sdir)
+            _send(ctx, {})
+            thr_a = min(0.22, thr_a + 0.03)
+            d, st, key = sig_state(ctx, vid, sig_id)
+            if key:
+                res = to_plain(ctx.api.interact(vid, sig_id, "submit_key", {"key": key}))
+                ctx.note("    弧线提交 %s %s d=%.1f -> %s %s"
+                         % (sig_id, key, d, res.get("granted"), res.get("message")))
+                if res.get("granted"):
+                    return key
+            time.sleep(0.1)
+        ctx.note("    弧线 %d/%d 没读到 %s" % (k + 1, rounds, sig_id))
+    return ""
+
+
+def stage_signals(ctx, seconds):
+    """三个现场信号：滑行中提交，失败就小弧扫描补。"""
+    ok = {}
+    for sig_id, sig_xy in SIGNALS:
+        if time.time() - ctx.t0 > seconds:
+            ctx.note("time up before %s" % sig_id)
+            break
+        ctx.note("  --- %s -> (%.1f,%.1f)" % (sig_id, sig_xy[0], sig_xy[1]))
+        state = {"tries": 0}
+
+        def poll(pos, speed, ob, _sig=sig_id, _st=state):
+            for it in (ob.get("visible_objects") or []):
+                if str(it.get("object_id") or "") != _sig:
+                    continue
+                m = KEY_RE.search(it.get("hint") or "")
+                key = m.group(0).replace(" ", "") if m else ""
+                st = it.get("state") or ""
+                d = it.get("distance_m") or 999.0
+                if key and st == "key_visible":
+                    if _st["tries"] < 4:
+                        _st["tries"] += 1
+                        res = to_plain(ctx.api.interact("Car_C", _sig, "submit_key",
+                                                        {"key": key}))
+                        ctx.note("    submit %s %s d=%.1f v=%.2f -> %s %s"
+                                 % (_sig, key, d, speed, res.get("granted"),
+                                    res.get("message")))
+                        if res.get("granted"):
+                            _st["key"] = key
+                            return key
+            return None
+
+        drive_to(ctx, "Car_C", sig_xy, seconds, stop_xy=sig_xy, stop_m=STOP_FAR,
+                 poll=poll)
+        if state.get("key"):
+            ok[sig_id] = state["key"]
+        else:
+            for attempt in range(3):
+                d, st, key = sig_state(ctx, "Car_C", sig_id)
+                ctx.note("    重试 %d: %s d=%.1f state=%s key=%s"
+                         % (attempt + 1, sig_id, d, st, key or "-"))
+                if d < 900 and d > 3.4:
+                    creep_to(ctx, "Car_C", sig_xy, seconds, max(3.4, d - 0.8), v_cap=1.0)
+                hold_still(ctx, "Car_C", seconds=1.2)
+                d, st, key = sig_state(ctx, "Car_C", sig_id)
+                if key:
+                    res = to_plain(ctx.api.interact("Car_C", sig_id, "submit_key",
+                                                    {"key": key}))
+                    ctx.note("    submit %s %s d=%.1f -> %s %s"
+                             % (sig_id, key, d, res.get("granted"), res.get("message")))
+                    if res.get("granted"):
+                        ok[sig_id] = key
+                        break
+            if sig_id not in ok:
+                key = arc_scan(ctx, "Car_C", sig_id, seconds)
+                if key:
+                    ok[sig_id] = key
+                else:
+                    ctx.note("  !! %s 仍未通过" % sig_id)
+        ts = to_plain(ctx.api.get_task_state())
+        ctx.note("  signals=%s/%s phase=%s"
+                 % (ts.get("verified_signal_count"), ts.get("total_signal_count"),
+                    ts.get("phase")))
+    return ok
+
+
+def cross_one(ctx, car, seconds):
+    """一辆车过闸口：到南侧待命 → 申请 → 穿闸 → 出口 release（0.5 m 细扫 + 横向搜索）。"""
+    note = ctx.note
+    api = ctx.api
+    pos0, _y, _v = pose_of(ctx.api, car)
+    detour = nav_path(ctx, pos0, (728.8, -55.0))
+    note("[cross] %s 栅格规划 %d 点 → (728.8,-55.0)" % (car, len(detour)))
+    drive_polyline(ctx, car, detour, seconds, v_cap=4.0)
+    granted = [False]
+
+    def poll(pos, speed, _a=None):
+        if granted[0] or speed < 0.8:
+            return None
+        try:
+            r = to_plain(api.interact(car, "Intersection_Center", "request_entry"))
+        except Exception:                                      # noqa: BLE001
+            return None
+        if r.get("granted"):
+            granted[0] = True
+            note("[cross] %s GRANTED @(%.1f,%.1f) v=%.2f" % (car, pos[0], pos[1], speed))
+            return "granted"
+        return None
+
+    ctx.no_bias = True
+    # 闸口两墙 x=726.26 / 731.32，正中是 728.79。之前这里写 729.0（右偏 0.21 m），
+    # 17:38 那局 Car_B 就在 (729.4,-17) 蹭到 Port_PassageBarrier_1_2。
+    corridor_run(ctx, car, 728.79, 8.0, v_tgt=1.6, poll=poll, seconds=seconds)
+    ctx.no_bias = False
+    if not granted[0]:
+        note("[cross] %s 未获批，跳过" % car)
+        return False
+
+    tried = [None]
+
+    def relpoll(pos, speed, _a=None):
+        y = pos[1]
+        if not (-18.0 <= y <= -2.0):
+            return None
+        mark = int(math.floor(y / 0.1))   # 出口窗只有 ~1 m 宽，0.5 m 一格容易整格跳过去
+        if tried[0] == mark:
+            return None
+        tried[0] = mark
+        try:
+            r = to_plain(api.interact(car, "Intersection_Center", "release"))
+        except Exception as e:                                 # noqa: BLE001
+            r = {"granted": False, "message": "ERR %s" % e}
+        note("[rel] %s @(%.1f,%.1f) mark=%.1f -> %s | %s"
+             % (car, pos[0], pos[1], y, r.get("granted"), str(r.get("message"))[:40]))
+        return "released" if r.get("granted") else None
+
+    # 闸口两墙在 x=726.26/731.32，中心线 x=728.79；车宽 2.45 只能走中心线。
+    # 出口判定是一个**极窄的点**（实测 −11.3 能过、−11.4 就报 not reached），
+    # 所以分成两段：主段 1.6 m/s，接近出口窗（y −14~−6）降到 0.5 m/s，
+    # 采样标记也从 0.2 m 收到 0.1 m —— 1.6 m/s 时一帧就跨 0.15 m，整个窗会被跳过去。
+    gate_fast = [(728.79, -31.0), (728.79, -24.0), (728.79, -14.0)]
+    got = drive_polyline(ctx, car, gate_fast, seconds, v_cap=1.6, poll=relpoll)
+    ok = (got == "released")
+    if not ok:
+        gate_slow = [(728.79, -14.0), (728.79, -11.4), (728.79, -10.6),
+                     (728.79, -9.4), (728.79, -6.0)]
+        got = drive_polyline(ctx, car, gate_slow, seconds, v_cap=0.5, poll=relpoll)
+        ok = (got == "released")
+    if not ok:
+        # 还不行就在出口点周围做小网格补扫（通行权还在自己手里，别开出互斥区）
+        ok = _release_sweep(ctx, car, seconds)
+    note("[cross] %s 通行 %s" % (car, "成功" if ok else "失败"))
+    return ok
+
+
+def _release_sweep(ctx, car, seconds, max_s=30.0):
+    """出口 release 补扫：在 (728.79,−11) 附近按小网格逐点试。
+
+    实测出口是**很窄的一段**：y 在 −12~−10、x 必须贴着中心线 728.79。
+    17:32 / 18:54 两局 B 都是从窗口边上一擦而过（x=728.5、y=−11.4 报
+    `has not reached a connected intersection exit`），然后一路开到 y=+20 就回不来了。
+    所以这里不再"往北扫"，而是在窗口附近横竖各试几个点。
+    """
+    api = ctx.api
+    t_end = min(time.time() + max_s, ctx.t0 + seconds - 6.0)
+    grid = [(728.79, -13.0), (728.79, -11.0), (728.79, -10.0),
+            (729.10, -11.0), (728.50, -11.0),
+            (728.79, -12.0), (728.79, -9.5), (728.79, -8.0)]
+    asked = False
+    for (px, py) in grid:
+        if time.time() > t_end:
+            break
+        pos = pose_of(api, car)[0]
+        try:
+            drive_polyline(ctx, car, [(pos[0], pos[1]), (px, py)],
+                           seconds, v_cap=0.8)
+        except Exception as exc:                               # noqa: BLE001
+            ctx.note("[cross] %s 挪到出口点异常 %s" % (car, exc))
+        for _k in range(2):
+            try:
+                r = to_plain(api.interact(car, "Intersection_Center", "release"))
+            except Exception as e:                             # noqa: BLE001
+                r = {"granted": False, "message": "ERR %s" % e}
+            pos = pose_of(api, car)[0]
+            ctx.note("[rel] %s @(%.1f,%.1f) sweep(%.1f,%.1f) -> %s | %s"
+                     % (car, pos[0], pos[1], px, py, r.get("granted"),
+                        str(r.get("message"))[:36]))
+            if r.get("granted"):
+                return True
+            time.sleep(0.3)
+        if not asked and time.time() - ctx.t0 > 0:
+            asked = True
+            try:
+                r2 = to_plain(api.interact(car, "Intersection_Center", "request_entry"))
+                ctx.note("[cross] %s 重新申请通行权 -> %s"
+                         % (car, str(r2.get("message"))[:40]))
+            except Exception:                                  # noqa: BLE001
+                pass
+    return False
+
+
+GATE_READY = (728.8, -55.0)      # 闸口南侧待命点（request_entry 从这里起步最顺）
+GATE_HOLD = (728.8, -74.0)       # B 的备用待命点：在 A 后面 19 m，避免两车抢同一个点
+
+
+def _job(ctx, vid, goal, v_cap=3.7, stop_m=2.0, limit=140.0, avoid=None, delay=0.0):
+    """给 drive_parallel 造一条活：栅格 A* 从当前位姿规划到 goal。
+    已经在 goal 3 m 内就返回 None（省一次规划，也避免零长路径把 LaneDriver 搞乱）。"""
+    pos = pose_of(ctx.api, vid)[0]
+    if math.hypot(goal[0] - pos[0], goal[1] - pos[1]) < 3.0:
+        ctx.note("    [pre] %s 已在 (%.1f,%.1f)，跳过" % (vid, pos[0], pos[1]))
+        return None
+    pts = nav_path(ctx, pos, goal, avoid=avoid)
+    if not pts or len(pts) < 2:
+        pts = [pos, goal]
+    return {"vid": vid, "pts": pts, "v_cap": v_cap, "stop_xy": goal,
+            "stop_m": stop_m, "limit": limit, "delay": delay}
+
+
+def _pre(ctx, jobs, seconds, tag):
+    """把闲置的车提前送出去（和主车并跑一段），全部到位或超时后返回。"""
+    jobs = [j for j in jobs if j]
+    if not jobs:
+        return
+    ctx.note("[pre] %s → %s" % (tag, " / ".join(
+        "%s(%.0f,%.0f)%d点" % (j["vid"], j["stop_xy"][0], j["stop_xy"][1],
+                               len(j["pts"])) for j in jobs)))
+    try:
+        drive_parallel(ctx, jobs, seconds)
+    except Exception as exc:                                   # noqa: BLE001
+        ctx.note("[pre] %s 异常 %s: %s" % (tag, type(exc).__name__, exc))
+
+
+def stage_cross(ctx, seconds):
+    """A 过闸 → **立刻交付泊位 A**（D 已提前就位）→ B 过闸 → B/C 去泊位 B。
+
+    按 HANDOFF 第 8 节方案①重排。原来 A 的交付排在 B 过闸之后（B 泊位只剩 40~60 s，
+    近 8 局里 4 局卡在这里超时）；顺带修两个真 bug：
+    ① 14:39 那版把 Car_D 的 parallel job 整段删掉只剩一行 note，它从开局一直待在
+       (622,121)，直到 409.7 s 才被派活，跑 278 m 用掉 84 s，A 的观测被拖到 497 s；
+    ② "C 去 B 的同时送 D" 那段写进了第 259 行的旧 stage_signals（已被 1653 行覆盖），
+       从来没执行过 —— 现在改成在闸口这一阶段正面派出。
+    """
+    note = ctx.note
+    note("=== 阶段 3：两辆运输车通行中央路口 ===")
+    ca = _berth_center(ctx, "Berth_A", (630.97, -65.72))
+    cb = _berth_center(ctx, "Berth_B", (834.47, -65.72))
+    # 3.0 先把扫到的动态路障记成禁区：后面每辆车、每条路线都会自动绕开它
+    sync_dyn_avoid(ctx)
+    # 3.0b Car_C 扫完路障就留在原地：阶段 3 之后没人给它发指令，它最后一条指令是
+    #     扫描时的油门，会自己继续乱窜（16:29 那局 175~430 s 又撞又刷加速度违规）。
+    settle(ctx, 0.60, seconds=0.8)
+    _send(ctx, {})
+    # 3.1 A/B 提前出发：A 去闸口待命、B 去后方 19 m 的备用待命点（错峰 8 s，别挤同一条车道），
+    #     同时把闲置的 Car_D 送到泊位 A 北侧见证位（278 m / 约 85 s）
+    _pre(ctx, [_job(ctx, "Car_A", GATE_READY, 4.0, 2.0, 130.0),
+               _job(ctx, "Car_B", GATE_HOLD, 4.0, 2.0, 150.0, delay=8.0),
+               _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 4.2, 2.0, 175.0)],
+         seconds, "A→闸口待命，B→备用待命点，D→泊位 A 见证位")
+    # 3.2 A 过闸
+    ok_a = cross_one(ctx, "Car_A", seconds)
+    crossed = getattr(ctx, "crossed", None)
+    if crossed is None:
+        crossed = ctx.crossed = {}
+    crossed["Car_A"] = bool(ok_a)
+    if not ok_a:
+        # 通行权还在 A 手里，B 这时进互斥区就是 `unauthorized_intersection_entry`
+        # （19:15 那局就是这样把整局判掉的）。所以 A 没出闸就到此为止。
+        crossed["Car_B"] = False
+        note("[cross] Car_A 没能出闸，通行权还在它手里 → B 不再申请，直接收尾")
+        return
+    # 3.3 A 去泊位南侧 → 立刻观测 + 交付（不等 B）
+    if ok_a:
+        _pre(ctx, [_job(ctx, "Car_A", (ca[0], ca[1] - 28.0), 4.0, 2.0, 130.0)],
+             seconds, "A→泊位 A 南侧（22 m 助跑位）")
+        _deliver_one(ctx, "Berth_A", "Car_A", "Car_D", ca, seconds)
+    # 3.4 B 过闸（B 早就在闸口待命）
+    ok_b = cross_one(ctx, "Car_B", seconds)
+    crossed = getattr(ctx, "crossed", None)
+    if crossed is None:
+        crossed = ctx.crossed = {}
+    crossed["Car_A"] = bool(ok_a)
+    crossed["Car_B"] = bool(ok_b)
+    if not ok_b:
+        note("[cross] Car_B 没过闸，跳过 B 泊位"
+             "（没进互斥区还往东开，18:54 那局撞了 24 次场院隔离柱）")
+        return
+    # 3.5 B 去泊位南侧；见证用交付完闲着的 Car_A（从北侧，正好顺着它去东边）
+    #     Car_C 扫完路障就贴在路障边上，无论绕还是倒，近两局都刷了 20~60 条
+    #     collision（Roadblock_East / QuayCrane_3 / Port_Lighthouse_Terminal），
+    #     所以让它就地停住，不再参与后续阶段。
+    _ctrl(ctx, "Car_C", 0.0, 0.6, 0.0)
+    _send(ctx, {})
+    # 见证车用 Car_D：A 交付完就停在泊位旁边不动，D 从它北侧一路向东去 B 泊位。
+    # （17:32 那局让 A 自己跑去 B 见证位，A 从 (629,-67) 向东正好撞上停在
+    #   (631,-54) 的 D，`[collision] Car_A 与 Car_D`。）
+    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 4.0, 2.0, 130.0),
+               _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 4.2, 2.0, 175.0)],
+         seconds, "B→泊位 B 南侧（22 m 助跑位），D→泊位 B 北侧见证位")
+    # 3.6 B 交付
+    _deliver_one(ctx, "Berth_B", "Car_B", "Car_D", cb, seconds)
+
+
+def _berth_center(ctx, name, fallback):
+    ts = to_plain(ctx.api.get_task_state())
+    for o in ts.get("shared_task_objects") or []:
+        if str(o.get("object_id") or "") != name:
+            continue
+        unc = o.get("uncertainty_region") or {}
+        mn, mx = unc.get("minimum") or {}, unc.get("maximum") or {}
+        if mn and mx:
+            return (0.5 * (mn["x"] + mx["x"]), 0.5 * (mn["y"] + mx["y"]))
+    return fallback
+
+
+def _stage_at(ctx, vid, outer, inner, seconds, tol=2.5, rounds=3, budget=80.0,
+              face=None):
+    """把车摆到 inner（从 outer 那一侧、沿着轴线正着开进去），并且车头要朝着 face。
+
+    只许用直连折线，**不许在最后这段用 A***：车一旦贴到建筑（落在膨胀后的禁区里），
+    栅格 A* 的起点会被 `_nearest_free` 挪到几十米外的空格子，规划出来的是一条
+    40 m 的绕圈路线 —— 15:27 那局 Car_A 就是这样绕着 EastBulkCargoWarehouse
+    一圈一圈地撞。而 outer→inner 这十几米是直的，纯跟踪自己会拉直。
+
+    姿势不对（车头差 >40°）时再来一轮助跑：实测第二轮一定能把车头摆正
+    （15:45 那局第一轮 yaw=27 看不见泊位，第二轮 yaw=83 就看见了）。
+    """
+    t_end = min(time.time() + budget, ctx.t0 + seconds - 20.0)
+
+    def _eval():
+        pos, dyaw, _sp = pose_of(ctx.api, vid)
+        d_in = math.hypot(pos[0] - inner[0], pos[1] - inner[1])
+        err = 0.0
+        if face is not None:
+            want = math.degrees(math.atan2(face[1] - pos[1], face[0] - pos[0]))
+            # 用**位移航向**判断：ori_z 在这台车上不可靠（16:46 那局 A 的 ori_z=-18、
+            # 位移航向却是北；而 D 在泊位北侧朝南、ori_z 却报 87）。
+            # 这一路上都在正着开，位移航向是干净的。
+            err = (dyaw - want + 540.0) % 360.0 - 180.0
+        return pos, d_in, err
+
+    for k in range(rounds):
+        pos, d_in, err = _eval()
+        if d_in <= tol and abs(err) <= 40.0:
+            return True
+        if time.time() > t_end:
+            ctx.note("[deliver] %s 就位超时 d=%.1f m 车头差 %.0f° @(%.1f,%.1f)"
+                     % (vid, d_in, err, pos[0], pos[1]))
+            return False
+        try:
+            if d_in > 6.0 or abs(err) > 40.0:
+                route = [(pos[0], pos[1]), outer, inner]   # 先到远端拉直再进
+            else:
+                route = [(pos[0], pos[1]), inner]          # 已在门口：别再跑一趟远端
+            drive_polyline(ctx, vid, route, seconds, v_cap=1.4)
+        except Exception as exc:                               # noqa: BLE001
+            ctx.note("[deliver] %s 就位异常 %s" % (vid, exc))
+        pos, d_in, err = _eval()
+        ctx.note("[deliver] %s 就位第 %d 轮 d=%.1f m 车头差 %.0f° @(%.1f,%.1f)"
+                 % (vid, k + 1, d_in, err, pos[0], pos[1]))
+        if d_in <= tol and abs(err) <= 40.0:
+            return True
+    return False
+
+
+def _sees(ctx, vid, name):
+    """这辆车眼下能不能看见目标（观测只在 30 m / 前方 120° 内给）。"""
+    try:
+        ob = to_plain(ctx.api.get_observation(vid))
+    except Exception:                                          # noqa: BLE001
+        return False
+    for it in (ob.get("visible_objects") or []):
+        if str(it.get("object_id") or "") == name:
+            return True
+    return False
+
+
+def _true_yaw(ctx, vid):
+    """读 ori_z 真航向（先 reset_pose，否则拿到的是被倒车污染 180° 的位移航向）。"""
+    reset_pose(vid)
+    _p, yaw, _s = pose_of(ctx.api, vid)
+    return yaw
+
+
+def _reverse_sign(ctx, vid, seconds):
+    """探一次"倒车 +0.5 舵时 yaw 往哪走"，记在 ctx 上（同一车型只需探一次）。
+    读角度前必须 reset_pose：pose_of 的航向是位移法算的，倒车会让它整体翻 180°。"""
+    cache = getattr(ctx, "rev_sign", None)
+    if cache is None:
+        cache = ctx.rev_sign = {}
+    if vid in cache:
+        return cache[vid]
+    y0 = _true_yaw(ctx, vid)
+    veh = VehicleControl(throttle=0.14, brake=0.0, steering=0.5)
+    try:
+        veh.gear = GearMode.REVERSE
+    except Exception:                                          # noqa: BLE001
+        pass
+    ctx.ctl[vid] = veh
+    for _ in range(4):
+        _send(ctx, {})
+        time.sleep(0.1)
+    _ctrl(ctx, vid, 0.0, 0.45, 0.0)
+    _send(ctx, {})
+    time.sleep(0.4)
+    y1 = _true_yaw(ctx, vid)
+    dy = (y1 - y0 + 540.0) % 360.0 - 180.0
+    s = 1.0 if dy > 0 else -1.0
+    cache[vid] = s
+    ctx.note("[turn] %s 倒车 +0.5 舵 → yaw %+.1f°（转向符号 %+0.0f）" % (vid, dy, s))
+    return s
+
+
+def _turn_to_face(ctx, vid, tgt_xy, seconds, tol=12.0, max_s=10.0):
+    """把车头转到对着 tgt_xy —— **用倒车满舵**（正走约 2~3°/s，倒走约 50°/s）。
+    只在 `_stage_at` 三轮回不来时才用；能用"重新走一趟助跑"解决就别倒车（倒车冲得远）。"""
+    s = _reverse_sign(ctx, vid, seconds)
+    t_end = min(time.time() + max_s, ctx.t0 + seconds - 6.0)
+    p0 = pose_of(ctx.api, vid)[0]
+    while time.time() < t_end:
+        pos, _yaw, _sp = pose_of(ctx.api, vid)
+        yaw = _true_yaw(ctx, vid)
+        want = math.degrees(math.atan2(tgt_xy[1] - pos[1], tgt_xy[0] - pos[0]))
+        err = (want - yaw + 540.0) % 360.0 - 180.0
+        if abs(err) < tol:
+            break
+        steer = clip(s * 0.65 * (1.0 if err > 0 else -1.0), -0.7, 0.7)
+        safe = getattr(ctx, "safety", None)
+        if safe is not None:
+            bx = pos[0] - 2.2 * math.cos(math.radians(yaw))
+            by = pos[1] - 2.2 * math.sin(math.radians(yaw))
+            gap, oid, _ = safe.gap(bx, by)
+            if gap < 0.40:
+                ctx.note("[turn] %s 车后有东西（%.2f m %s），不敢再倒" % (vid, gap, oid))
+                break
+        veh = VehicleControl(throttle=0.12, brake=0.0, steering=steer)
+        try:
+            veh.gear = GearMode.REVERSE
+        except Exception:                                      # noqa: BLE001
+            pass
+        ctx.ctl[vid] = veh
+        _send(ctx, {})
+        if math.hypot(pos[0] - p0[0], pos[1] - p0[1]) > 8.0:
+            break
+        time.sleep(0.1)
+    _ctrl(ctx, vid, 0.0, 0.5, 0.0)
+    _send(ctx, {})
+    time.sleep(0.3)
+    pos = pose_of(ctx.api, vid)[0]
+    yaw = _true_yaw(ctx, vid)
+    want = math.degrees(math.atan2(tgt_xy[1] - pos[1], tgt_xy[0] - pos[0]))
+    err = (want - yaw + 540.0) % 360.0 - 180.0
+    ctx.note("[turn] %s 摆头后 yaw=%.0f 目标方位=%.0f 差=%.0f @(%.1f,%.1f)"
+             % (vid, yaw, want, err, pos[0], pos[1]))
+    return abs(err) < max(tol, 35.0)
+
+
+def _dump_vis(ctx, tag):
+    """把每辆车眼下的可见列表、位姿打出来（排查"到了却看不见"用）。"""
+    for v in ctx.vids:
+        try:
+            ob = to_plain(ctx.api.get_observation(v))
+            pos = pose_of(ctx.api, v)[0]
+            yaw = _true_yaw(ctx, v)
+            vis = ["%s@%.1f" % (str(it.get("object_id")),
+                                it.get("distance_m") or -1)
+                   for it in (ob.get("visible_objects") or [])]
+            ctx.note("[vis] %s %s (%.1f,%.1f) yaw=%.0f 可见=%s"
+                     % (tag, v, pos[0], pos[1], yaw, vis[:6] or "[]"))
+        except Exception as exc:                               # noqa: BLE001
+            ctx.note("[vis] %s %s 读取失败 %s" % (tag, v, exc))
+
+
+def _wait_visible(ctx, vid, name, seconds, tries=25, pause=0.4):
+    """反复读观测，等目标出现在 visible_objects 里。
+
+    这个接口的头几次回包经常是空快照（同一位置、同一朝向，隔一两秒就出现了），
+    所以"看不见"先等一等，别急着开车调整 —— 16:07 那局为了摆车头白烧了 70 s。
+    """
+    for _k in range(tries):
+        if _sees(ctx, vid, name):
+            return True
+        if time.time() - ctx.t0 > seconds - 10.0:
+            return False
+        time.sleep(pause)
+    return _sees(ctx, vid, name)
+
+
+def _make_visible(ctx, vid, spots, name, seconds):
+    """先在标准观测点死等（这个接口的空快照是随机出现的），再换两个斜向点。
+
+    同一个点同一次停靠，有时 `visible=['Berth_A']`、有时 `visible=[]`；
+    同一时刻北侧的 Car_D 却稳定看得见（16:46 那局的 dump：A 在 (631.1,-78.0)
+    可见列表整个是空的，D 在 (631.0,-53.6) 稳定拿到 Berth_A 和 token）。
+    所以先多等几秒（便宜），再换点（贵）。
+    """
+    if _wait_visible(ctx, vid, name, seconds, tries=30):
+        return True
+    for k, spot in enumerate(spots):
+        pos = pose_of(ctx.api, vid)[0]
+        drive_polyline(ctx, vid, [(pos[0], pos[1]), spot], seconds, v_cap=1.3)
+        pos = pose_of(ctx.api, vid)[0]
+        ctx.note("[look] %s 换观测点 %d/%d (%.1f,%.1f) 现在 (%.1f,%.1f)"
+                 % (vid, k + 1, len(spots), spot[0], spot[1], pos[0], pos[1]))
+        if _wait_visible(ctx, vid, name, seconds, tries=12):
+            return True
+    _dump_vis(ctx, "看不见" + name)
+    return False
+
+
+def _obs_spots(cx, cy, side):
+    """两个斜向候选观测点：正面那个已经试过了，这里只放左右斜前方。"""
+    sy = -1.0 if side < 0 else 1.0
+    return [(cx - 7.0, cy + sy * 9.0), (cx + 7.0, cy + sy * 9.0)]
+
+
+def _aim_at(ctx, vid, center, name, seconds, spots):
+    """观测前的准备：先把两个航向都打出来，然后换观测点试。
+
+    不在这里硬摆车头 —— 17:03 那局 `_turn_to_face` 确实把 ori_z 从 -21 转到 83，
+    可车头"对着泊位"之后 A 依旧 `visible=[]`，说明 ori_z 并不是可靠的航向
+    （这台车的位移航向和 ori_z 会差到 100° 以上）。观测本身交给多点轮试。
+    """
+    pos = pose_of(ctx.api, vid)[0]
+    dyaw = pose_of(ctx.api, vid)[1]
+    oyaw = _true_yaw(ctx, vid)
+    want = math.degrees(math.atan2(center[1] - pos[1], center[0] - pos[0]))
+    err = (want - dyaw + 540.0) % 360.0 - 180.0
+    ctx.note("[aim] %s (%.1f,%.1f) 位移航向=%.0f ori_z=%.0f 泊位方位=%.0f 差=%.0f"
+             % (vid, pos[0], pos[1], dyaw, oyaw, want, err))
+    if _wait_visible(ctx, vid, name, seconds, tries=5):
+        return True
+    return _make_visible(ctx, vid, spots, name, seconds)
+
+
+def deliver_berth(ctx, name, carrier, witness, center, seconds):
+    """两车一南一北各 12 m 观察 → lv3 → 入位 deliver。"""
+    cx, cy = center
+    for attempt in range(3):
+        _stage_at(ctx, carrier, (cx, cy - 24.0), (cx, cy - 12.0), seconds, face=center)
+        _stage_at(ctx, witness, (cx, cy + 24.0), (cx, cy + 12.0), seconds, face=center)
+        for who, side in ((carrier, -1), (witness, +1)):
+            if not _aim_at(ctx, who, center, name, seconds,
+                           _obs_spots(cx, cy, side)):
+                ctx.note("[deliver] %s 仍然看不见 %s" % (who, name))
+        hold_still(ctx, carrier, seconds=0.6)
+        a = _report(ctx, carrier, name, verbose=(attempt == 0))
+        d = _report(ctx, witness, name, verbose=(attempt == 0))
+        lv = level_of(ctx, name)
+        ctx.note("[deliver] %s 第%d次观测：%s=%s %s=%s lv=%s"
+                 % (name, attempt + 1, carrier, a, witness, d, lv))
+        if lv >= 3:
+            break
+    if level_of(ctx, name) < 3:
+        ctx.note("[deliver] %s 观测没到 lv3，放弃" % name)
+        return False
+    tgt = precise_point(ctx, name, (cx, cy))
+    ctx.note("[deliver] %s 精确点 (%.2f,%.2f)" % (name, tgt[0], tgt[1]))
+    try:
+        q = nav_path(ctx, pose_of(ctx.api, carrier)[0], tgt)
+        drive_polyline(ctx, carrier, q, seconds, v_cap=1.6)
+        creep_into(ctx, carrier, tgt, seconds, tol=0.9)
+    except Exception as exc:                                   # noqa: BLE001
+        ctx.note("[deliver] %s 入位异常 %s" % (name, exc))
+    park_and_hold(ctx, carrier, seconds)
+    for k in range(6):
+        try:
+            r = to_plain(ctx.api.interact(carrier, name, "deliver"))
+        except Exception as exc:                               # noqa: BLE001
+            ctx.note("[deliver] %s deliver 异常 %s" % (name, exc))
+            break
+        ctx.note("[deliver] %s deliver(%d) granted=%s | %s"
+                 % (name, k + 1, r.get("granted"), r.get("message")))
+        if r.get("granted"):
+            return True
+        park_and_hold(ctx, carrier, seconds, need_s=1.2)
+    return False
+
+
+def _deliver_one(ctx, name, carrier, witness, center, seconds):
+    """一个泊位的完整交付：就位 → 双车观测到 lv3 → 入位 → park → deliver。
+    成功后在 ctx.done_berths 里记一笔，阶段 4 兜底时跳过。"""
+    note = ctx.note
+    done = getattr(ctx, "done_berths", None)
+    if done is None:
+        done = ctx.done_berths = set()
+    if name in done:
+        note("[deliver] %s 之前已交付，跳过" % name)
+        return True
+    left = seconds - (time.time() - ctx.t0)
+    if left < 70:
+        note("[deliver] %s 时间不够（剩 %.0f s），跳过" % (name, left))
+        return False
+    center = _berth_center(ctx, name, center)     # 模糊区会缩，交付前再读一次
+    note("[deliver] %s 中心 (%.1f,%.1f)，%s 交付 / %s 见证，剩 %.0f s"
+         % (name, center[0], center[1], carrier, witness, left))
+    try:
+        ok = deliver_berth(ctx, name, carrier, witness, center, seconds)
+    except Exception as exc:                                   # noqa: BLE001
+        note("[deliver] %s 异常 %s: %s" % (name, type(exc).__name__, exc))
+        ok = False
+    note("[deliver] %s %s（%.1f s）" % (name, "交付成功" if ok else "交付失败",
+                                       time.time() - ctx.t0))
+    if ok:
+        done.add(name)
+        try:
+            back_out(ctx, carrier, seconds, dist_m=8.0)
+        except Exception:                                      # noqa: BLE001
+            pass
+    return ok
+
+
+def stage_deliver_v2(ctx, seconds):
+    """阶段 4：兜底。阶段 3 已按"A 先交付 → B 过闸 → B 交付"重排，
+    这里只补还没交付的泊位（正常情况一条都不会跑）。"""
+    note = ctx.note
+    note("=== 阶段 4：泊位交付兜底 ===")
+    done = getattr(ctx, "done_berths", None)
+    if done is None:
+        done = ctx.done_berths = set()
+    plan = [("Berth_A", "Car_A", "Car_D", (630.97, -65.72)),
+            ("Berth_B", "Car_B", "Car_D", (834.47, -65.72))]
+    crossed = getattr(ctx, "crossed", None) or {}
+    todo = [p for p in plan
+            if p[0] not in done and crossed.get(p[1], True)]
+    if not todo:
+        note("[deliver] 两个泊位都已在阶段 3 交付完，跳过")
+        return
+    for name, carrier, witness, fb in todo:
+        center = _berth_center(ctx, name, fb)
+        _deliver_one(ctx, name, carrier, witness, center, seconds)
+
+
+def drive_parallel(ctx, jobs, seconds):
+    """单线程多车并行（每帧一次批量下发，避免多线程打同一条 socket）。"""
+    safe = getattr(ctx, "safety", None)
+    for j in jobs:
+        dense = _dense(j["pts"])
+        j["drv"] = LaneDriver(fog_route.Route(dense, [j.get("v_cap", 4.0)] * len(dense)),
+                              ctx.wb, v_cap=j.get("v_cap", 4.0),
+                              stop_xy=j.get("stop_xy"), stop_m=j.get("stop_m", 0.0))
+        j["t_start"] = time.time()
+        j["limit"] = float(j.get("limit", 110.0))
+        j["t_log"] = 0.0
+        j["stall"] = None
+        j["n_unstick"] = 0
+        j["done"] = False
+        j["got"] = None
+    while time.time() - ctx.t0 < seconds:
+        ctrls = {}
+        alive = 0
+        for j in jobs:
+            vid = j["vid"]
+            if j["done"]:
+                _ctrl(ctx, vid, 0.0, 0.4, 0.0)
+                continue
+            pos, yaw, speed = pose_of(ctx.api, vid)
+            ctx.poll_events_throttled()
+            if time.time() - j["t_start"] < float(j.get("delay", 0.0)):
+                # 错峰出发：先让前面的车站住，别一起挤进同一条车道
+                _ctrl(ctx, vid, 0.0, 0.4, 0.0)
+                alive += 1
+                continue
+            if time.time() - j["t_start"] > j["limit"]:
+                ctx.note("    [pre] %s 超时 %.0fs，先停下" % (vid, j["limit"]))
+                j["done"] = True
+                _ctrl(ctx, vid, 0.0, 0.5, 0.0)
+                continue
+            if abs(speed) < 0.15:
+                j["stall"] = j["stall"] or time.time()
+                if time.time() - j["stall"] > 1.2:
+                    j["n_unstick"] += 1
+                    if j["n_unstick"] > 4:
+                        ctx.note("    [pre] %s 倒车 4 次无效，放弃" % vid)
+                        j["done"] = True
+                        continue
+                    ctx.note("    [pre] %s 卡住 @(%.1f,%.1f) 倒车脱困" % (vid, pos[0], pos[1]))
+                    unstick(ctx, vid, seconds, back_s=1.4)
+                    j["drv"].reset_heading()
+                    j["stall"] = None
+                    continue
+            else:
+                j["stall"] = None
+            thr, brk, steer = j["drv"].step(pos, yaw, speed, 0.1)
+            if safe is not None:
+                thr, brk, steer, _g = safe.guard(
+                    pos[0], pos[1], yaw, speed, thr, brk, steer,
+                    horizon=0.6 if getattr(ctx, "no_bias", False) else 1.0,
+                    allow_bias=not getattr(ctx, "no_bias", False))
+            _ctrl(ctx, vid, thr, brk, steer)
+            if j.get("poll"):
+                ob = to_plain(ctx.api.get_observation(vid))
+                g = j["poll"](pos, speed, ob)
+                if g is not None:
+                    j["got"] = g
+                    j["done"] = True
+            if j["drv"].done:
+                j["done"] = True
+            if time.time() - j["t_log"] > 8.0:
+                j["t_log"] = time.time()
+                ctx.note("    [pre] %s (%.1f,%.1f) v=%.1f seg=%d/%d"
+                         % (vid, pos[0], pos[1], speed, j["drv"].i, len(j["drv"].pts)))
+            alive += 1
+        _send(ctx, ctrls)
+        if alive == 0:
+            break
+        time.sleep(0.1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--seconds", type=float, default=620.0)
+    ap.add_argument("--probe", type=int, default=0)
+    ap.add_argument("--cross", type=int, default=1)
+    ap.add_argument("--deliver", type=int, default=0)
+    ap.add_argument("--probe2", type=int, default=0)
+    ap.add_argument("--probe3", type=int, default=0)
+    args = ap.parse_args()
+    os.makedirs(args.out, exist_ok=True)
+    api = connect_retry()
+    log = open(os.path.join(args.out, "run.log"), "w", encoding="utf-8")
+    t0 = time.time()
+
+    def note(msg):
+        line = "[%6.1f] %s" % (time.time() - t0, msg)
+        print(line, flush=True)
+        log.write(line + "\n")
+        log.flush()
+
+    vids = []
+    try:
+        static = to_plain(api.get_scene_static_data())
+        graph = RoadGraph(static)
+        specs = {v["vehicle_id"]: v for v in static.get("vehicles", [])}
+        vids = list(api.get_vehicle_ids())
+        wb = WHEELBASE_RATIO * float(specs["Car_C"].get("length_m") or 4.81)
+        ctx = Ctx(api, vids, graph, wb, args.out, t0, note)
+        ctx.safety = Safety(static)
+        ctx.ctl = {v: VehicleControl(throttle=0.0, brake=0.0, steering=0.0)
+                   for v in vids}
+        # ↑ 开局别一上来就踩 0.35 的刹车：实测每局 2.2 s 都会因为这一下判一次
+        #   `[excessive_acceleration] Car_D`（那辆车根本没动过）。静止的车不需要刹车。
+        note("vehicles=%s  防撞层：实体障碍 %d 个" % (vids, len(ctx.safety.objs)))
+
+        note("=== 阶段 0：三个现场信号 ===")
+        got = stage_signals(ctx, args.seconds)
+        note("signals ok=%s" % json.dumps(got, ensure_ascii=False))
+        dump_state(ctx, "after_signals")
+
+        note("=== 阶段 1：路障扫描 ===")
+        scanned = stage_scan(ctx, args.seconds)
+        dump_state(ctx, "after_scan")
+
+        if args.probe:
+            stage_probe(ctx, args.seconds)
+        elif scanned:
+            if args.cross:
+                stage_cross(ctx, args.seconds)
+            if args.deliver:
+                stage_deliver_v2(ctx, args.seconds)
+        try:
+            for cmd in ("get_score", "get_run_report", "get_task_state"):
+                try:
+                    raw = api._request({"command": cmd})
+                except Exception as exc:                           # noqa: BLE001
+                    note("[score] %s 失败 %s" % (cmd, exc))
+                    continue
+                note("[score] %s -> %s" % (cmd, json.dumps(raw, ensure_ascii=False)[:700]))
+        except Exception as exc:                               # noqa: BLE001
+            pass
+        try:
+            for cmd in ("get_score", "get_run_report", "get_task_state"):
+                try:
+                    raw = api._request({"command": cmd})
+                except Exception as exc:                           # noqa: BLE001
+                    note("[score] %s 失败 %s" % (cmd, exc))
+                    continue
+                note("[score] %s -> %s" % (cmd, json.dumps(raw, ensure_ascii=False)[:700]))
+        except Exception as exc:                               # noqa: BLE001
+            pass
+    finally:
+        try:
+            api.set_vehicle_controls({v: VehicleControl(throttle=0.0, brake=0.6,
+                                                        steering=0.0) for v in vids})
+        except Exception:                                      # noqa: BLE001
+            pass
+        log.close()
+        try:
+            api.close()
+        except Exception:                                      # noqa: BLE001
             pass
 
 
