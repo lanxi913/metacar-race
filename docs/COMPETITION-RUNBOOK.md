@@ -7,6 +7,9 @@
 
 ## 0. 赛前 10 分钟（只做一次）
 
+> **赛题场景赛前起不来**：2026-11-01 05:51 实测，在「比赛列表」里点赛题场景的「启动场景」，
+> 平台回 `HTTP/1.1 400 Bad Request`，控制器连不上 5061。09:30 之前只能跑训练场景。
+
 ```powershell
 # 1) 确认环境
 .venv\Scripts\python.exe check_env.py
@@ -47,6 +50,8 @@ Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | 
 
 ### 1.3 VLA 文本导航与规范停车（满分 1000，约 3 分钟）
 
+**训练场景**（锦汇华庭，验证过 1000）：
+
 ```powershell
 & .\tools\run_scene.ps1 -Slug vla_TextNavParking_02 `
     -PythonArgs "tools/vla_text_nav.py --vmax 3.8 --ocr-window 8 --max-seconds 155" `
@@ -54,10 +59,20 @@ Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | 
 .venv\Scripts\python.exe tools\last_run.py vla_TextNavParking_02 1 --det   # 期望 1000.00
 ```
 
-- 指令是「**找到空的停车位**」变体时 → 1000（实测 run 83574/83575 两次）。
-- 指令是「**到达 X 栋 Y 单元门口**」变体时 → 目前跑不完（100 s 只够开 150 m 里的 100 m），
-  100 s 到点平台会把车瞬移回起点重来。看到日志里 `目标 … 模式=building` 就是这种局。
-- 平台会随机出这两种指令，**每种都跑一局**是正常的（同一局里不会换）。
+**赛题场景（09:30 之后才能起）**：
+
+```powershell
+& .\tools\run_scene.ps1 -Slug ius_vla_text `
+    -PythonArgs "tools/vla_text_nav.py --vmax 3.8 --ocr-window 8 --max-seconds 155" `
+    -MaxSeconds 200 -SettleSeconds 20
+.venv\Scripts\python.exe tools\last_run.py vla_TextNavParking_ius2026 1 --det
+```
+
+- 赛题题面是「147培训基地西入口 / 办公楼B西入口 / 147培训基地停车区01号停车位」，
+  指令措辞有 6 种（见 `docs/PROGRESS.md` 第 0.4 节），代码已按这些措辞适配并离线单测；
+  **只有 9:30 后才能真机验证**。
+- 指令是「找到并停入…停车位」变体时 → 走绝对车位；是「…XX西入口」变体时 → 直接去那栋楼
+  西面外 6 m（跳过巡航找门牌）。
 
 ### 1.4 VLA 停车区违规检测 / 功能区合规检测（各 1000，目前没有可用的实现）
 

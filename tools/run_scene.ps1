@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 <#
 .SYNOPSIS
     One-shot scene runner: kill stale scene -> start controller -> click "启动场景" -> wait -> report.
@@ -34,6 +34,11 @@ $py = Join-Path $root '.venv\Scripts\python.exe'
 $sceneMap = Get-Content -Path (Join-Path $PSScriptRoot 'scenes.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $launchButton = $sceneMap._meta.launch_button     # Chinese label kept out of this ASCII file
 $currentPageGlob = $sceneMap._meta.current_page
+$detailLink = $sceneMap._meta.detail_link
+$competitionTab = $sceneMap._meta.competition_tab
+$competitionName = $sceneMap._meta.competition_name
+$competitionSceneTab = $sceneMap._meta.competition_scene_tab
+$isCompetition = [bool]$sceneMap.$Slug.competition
 if (-not $sceneMap.PSObject.Properties.Name.Contains($Slug)) { Write-Host "!! unknown slug $Slug"; exit 2 }
 $title = $sceneMap.$Slug.title
 $page = [int]$sceneMap.$Slug.page
@@ -72,12 +77,109 @@ function Get-ClientWindow {
                                 [System.Windows.Automation.Condition]::TrueCondition).Count
                 if ($n -gt $bestN) { $bestN = $n; $best = $w }
             }
-            if ($best -and $bestN -gt 5) { return $best }
+            if ($best -and $bestN -gt 5) {
+                # 最小化/被挡住的窗口 UIA 矩形是 Empty，坐标点击会全打到屏幕外：
+                # 每次拿到窗口先 SW_RESTORE + 提到前台。
+                Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int c); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);' -Name UWin -Namespace W -ErrorAction SilentlyContinue
+                try {
+                    [void][W.UWin]::ShowWindow($proc.MainWindowHandle, 9)
+                    Start-Sleep -Milliseconds 400
+                    [void][W.UWin]::SetForegroundWindow($proc.MainWindowHandle)
+                    Start-Sleep -Milliseconds 300
+                } catch { }
+                return $best
+            }
         }
         Write-Host ("   waiting for client window (try {0})" -f $try)
         Start-Sleep -Seconds 2
     }
     return $null
+}
+
+function Click-At([int]$x, [int]$y) {
+    # 比赛卡片没有 InvokePattern（纯 div），只能真点一下鼠标
+    Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y); [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint dx,uint dy,uint d,int e);' -Name UClick -Namespace W -ErrorAction SilentlyContinue
+    [void][W.UClick]::SetCursorPos($x, $y)
+    Start-Sleep -Milliseconds 150
+    [W.UClick]::mouse_event(0x0002, 0, 0, 0, 0)
+    Start-Sleep -Milliseconds 90
+    [W.UClick]::mouse_event(0x0004, 0, 0, 0, 0)
+}
+
+function Select-Tab($win, [string]$name) {
+    $els = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition)
+    $tab = $els | Where-Object {
+        $_.Current.ControlType.ProgrammaticName -eq 'ControlType.TabItem' -and
+        $_.Current.Name -eq $name } | Select-Object -First 1
+    if (-not $tab) { return $false }
+    $sel = $null
+    if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sel)) {
+        try { $sel.Select() } catch { }
+    }
+    Start-Sleep -Milliseconds 1800
+    return $true
+}
+
+function Ensure-CompetitionSceneList($win) {
+    # 比赛场景不在「场景训练」列表里：比赛列表 → 点比赛卡片进详情 → 场景列表
+    [void](Select-Tab $win $competitionTab)
+    $els = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition)
+    $sceneLabel = $els | Where-Object { $_.Current.Name -eq $title -and
+                                        $_.Current.BoundingRectangle.Width -gt 0 } | Select-Object -First 1
+    if (-not $sceneLabel) {
+        $card = $els | Where-Object { $_.Current.Name -eq $competitionName -and
+                                      $_.Current.BoundingRectangle.Width -gt 0 } | Select-Object -First 1
+        if (-not $card) {
+            # 可能已经在比赛详情页：直接切场景列表
+            [void](Select-Tab $win $competitionSceneTab)
+        } else {
+            $r = $card.Current.BoundingRectangle
+            Write-Host ("   click competition card at ({0},{1})" -f [int]($r.X + $r.Width / 2), [int]($r.Y + 20))
+            Click-At ([int]($r.X + $r.Width / 2)) ([int]($r.Y + 20))
+            Start-Sleep -Seconds 3
+            [void](Select-Tab $win $competitionSceneTab)
+        }
+    }
+    $els = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition)
+    return [bool]($els | Where-Object { $_.Current.Name -eq $title -and
+                                        $_.Current.BoundingRectangle.Width -gt 0 })
+}
+
+function Launch-CompetitionScene($win) {
+    [void](Ensure-CompetitionSceneList $win)
+    for ($try = 1; $try -le 8; $try++) {
+        $els = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                            [System.Windows.Automation.Condition]::TrueCondition)
+        $label = $els | Where-Object { $_.Current.Name -eq $title -and
+                                       $_.Current.BoundingRectangle.Width -gt 0 } | Select-Object -First 1
+        $btns = @($els | Where-Object { $_.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and
+                                        $_.Current.Name -eq $launchButton })
+        if ($label -and $btns.Count -gt 0) {
+            $lr = $label.Current.BoundingRectangle
+            $best = $null; $bestD = 1e9
+            foreach ($b in $btns) {
+                $r = $b.Current.BoundingRectangle
+                $dx = $r.X - $lr.X
+                $dy = $r.Y - $lr.Y
+                if ($dx -lt 20 -or $dx -gt 420 -or $dy -lt 150 -or $dy -gt 520) { continue }
+                $d = [Math]::Abs($dx - 215) + [Math]::Abs($dy - 310)
+                if ($d -lt $bestD) { $bestD = $d; $best = $b }
+            }
+            if ($best) {
+                if (Invoke-El $best) { Write-Host "   clicked 启动场景 on the competition scene list"; return $true }
+                $r = $best.Current.BoundingRectangle
+                Click-At ([int]($r.X + $r.Width / 2)) ([int]($r.Y + $r.Height / 2))
+                Write-Host "   clicked 启动场景 by mouse"
+                return $true
+            }
+        }
+        Write-Host ("   comp try {0}: label={1} btns={2}" -f $try, [bool]$label, $btns.Count)
+        Start-Sleep -Seconds 1
+    }
+    return $false
 }
 
 function Ensure-TrainingTab($win) {
@@ -200,14 +302,24 @@ if ($SceneFirst) {
     $win = Get-ClientWindow
     if (-not $win) { Write-Host "!! client window not found"; if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }; exit 3 }
     Write-Host ("client window: " + $win.Current.Name)
-    if (-not (Ensure-TrainingTab $win)) { Write-Host "!! could not get to the training scene list" }
 
-    if (-not (Launch-Scene $win $title $page)) {
-        Write-Host "!! could not click launch for $title"
-        if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
-        exit 4
+    if ($isCompetition) {
+        # 比赛场景：比赛列表 → 点比赛卡片 → 场景列表 → 启动场景
+        if (-not (Launch-CompetitionScene $win)) {
+            Write-Host "!! could not launch the competition scene $title"
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            exit 4
+        }
+    } else {
+        if (-not (Ensure-TrainingTab $win)) { Write-Host "!! could not get to the training scene list" }
+
+        if (-not (Launch-Scene $win $title $page)) {
+            Write-Host "!! could not click launch for $title"
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            exit 4
+        }
+        Write-Host "clicked launch"
     }
-    Write-Host "clicked launch"
 
     # wait for the controller to report a connection
     $connected = $false

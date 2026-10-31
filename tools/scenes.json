@@ -143,6 +143,33 @@
   "launch_button": "启动场景",
   "current_page": "Page *, Current page",
   "training_tab": "场景训练",
-  "competition_tab": "比赛列表"
+  "competition_tab": "比赛列表",
+  "detail_link": "查看详情",
+  "competition_name": "2026智能无人系统算法挑战赛（邀请赛）",
+  "competition_scene_tab": "场景列表"
+ },
+ "ius_lianxu1": {
+  "title": "连续场景1（邀请赛2026）",
+  "competition": true
+ },
+ "ius_lianxu4": {
+  "title": "连续场景4（邀请赛2026）",
+  "competition": true
+ },
+ "ius_vla_text": {
+  "title": "文本导航与规范停车任务（邀请赛2026）",
+  "competition": true
+ },
+ "ius_vla_parking": {
+  "title": "停车区违规检测任务（邀请赛2026）",
+  "competition": true
+ },
+ "ius_vla_zone": {
+  "title": "功能区合规检测任务（邀请赛2026）",
+  "competition": true
+ },
+ "ius_port": {
+  "title": "港口迷雾（邀请赛2026）",
+  "competition": true
  }
 }

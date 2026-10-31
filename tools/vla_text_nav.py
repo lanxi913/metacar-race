@@ -717,7 +717,14 @@ def main():
                 print(f"目标 {target[0]:.1f},{target[1]:.1f} 模式={tmode} "
                       f"直线距离={math.hypot(target[0]-x, target[1]-y):.1f} m", flush=True)
                 is_slot_target = (tmode == "slot")
-                want_scan = bool(args.scan) and tmode.startswith("building") and std_name
+                # 指令点了方位（"147培训基地西入口"/"办公楼B西入口"）时，坐标已经落在那一面，
+                # 不需要再沿楼面巡航找黄色门牌——正式赛题换了园区，门牌长什么样、有没有都不确定，
+                # 而 100 s 预算光巡航就吃掉 45 s。没点方位的老题面（"X栋Y单元门口"）仍旧巡航找门。
+                _has_compass = any(w in info["place"] for w in
+                                   ("西入口", "东入口", "南入口", "北入口",
+                                    "西门", "东门", "南门", "北门"))
+                want_scan = (bool(args.scan) and tmode.startswith("building")
+                             and std_name and not _has_compass)
                 if want_scan:
                     # 模板吸附可能把楼名改成 JSON 里不存在的名字，next() 会抛 StopIteration
                     # 直接把整局打死；读不到就退回最近的一栋楼（行为与"无匹配"时一致）。
