@@ -50,14 +50,14 @@ from fog_run3 import MAX_STEER, clip, wrap180               # noqa: E402
 ACCEL = 1.15          # 规划加速度（m/s²），用于剩余距离的刹车点
 START_SOFT_S = 1.30   # 起步软油门时长（s）
 START_THR = 0.035     # 起步期间油门上限（实测 1 秒窗 ≈4，不触发违规）
-LOOKAHEAD_A = 1.0    # 前视距离 = a + b·v（短前视才能贴住 90° 弯，长前视会切内角）
-LOOKAHEAD_B = 0.45
+LOOKAHEAD_A = 1.2    # 前视距离 = a + b·v（短前视才能贴住 90° 弯，长前视会切内角）
+LOOKAHEAD_B = 0.50
 LOOKAHEAD_MIN = 1.2
 LOOKAHEAD_MAX = 7.0
 SLOW_HORIZON_A = 2.0  # 提前看多远的限速：a + b·v（弯前先减速，别等压上弯再刹）
 SLOW_HORIZON_B = 1.0
-LAT_DAMP = 0.10      # 横向偏差进转向的阻尼系数（e>0 = 车在路径左侧 → 回正向右）
-CURV_FF = 0.7        # 弯道曲率前馈权重（0 = 纯 LaneFollower 的纯跟踪）
+LAT_DAMP = 0.08      # 横向偏差阻尼（自测扫描：0.08 比 0.10 弯道横向误差小 0.23 m）
+CURV_FF = 0.60       # 弯道曲率前馈权重（0 = 纯 LaneFollower 的纯跟踪）
 THR_MAX = 0.50
 COLD_START_M = 1.0   # 位移航向没测出来前直行的距离
 FILLET_R = 3.0       # 折线顶点倒角半径（参考线必须是车开得出来的曲线）
