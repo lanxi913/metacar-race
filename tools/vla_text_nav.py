@@ -109,6 +109,32 @@ class GridPlanner:
         s_ij, g_ij = to_cell(start_xy), to_cell(goal_xy)
         s_ij = (min(max(s_ij[0], 0), nx - 1), min(max(s_ij[1], 0), ny - 1))
         g_ij = (min(max(g_ij[0], 0), nx - 1), min(max(g_ij[1], 0), ny - 1))
+
+        # 目标点常常落在"建筑外扩后的禁区"里（想让车贴到楼面/门口时尤其常见）。
+        # 原来的做法是强拆目标格的 blocked 标记，A* 就从禁区里穿过去，执行时直接顶墙
+        # （2026-11-01 06:02 那局：目标 (555,73) 在 C 栋外扩盒里，车一头撞上 D 栋南墙）。
+        # 这里把被挡的目标/起点吸附到最近的空格子，路径就完全走在可通行区。
+        def snap_free(ij):
+            if not blocked[ij[0]][ij[1]]:
+                return ij
+            best, bestd = ij, None
+            for r in range(1, 13):
+                for di in range(-r, r + 1):
+                    for dj in range(-r, r + 1):
+                        if max(abs(di), abs(dj)) != r:
+                            continue
+                        i2, j2 = ij[0] + di, ij[1] + dj
+                        if not (0 <= i2 < nx and 0 <= j2 < ny) or blocked[i2][j2]:
+                            continue
+                        d = di * di + dj * dj
+                        if bestd is None or d < bestd:
+                            best, bestd = (i2, j2), d
+                if bestd is not None:
+                    return best
+            return ij
+
+        g_ij = snap_free(g_ij)
+        s_ij = snap_free(s_ij)
         blocked[s_ij[0]][s_ij[1]] = False
         blocked[g_ij[0]][g_ij[1]] = False
 
@@ -152,7 +178,8 @@ class GridPlanner:
         chain.reverse()
         pts = [Pt(*to_world(ij)) for ij in chain]
         pts[0] = Pt(*start_xy)
-        pts[-1] = Pt(*goal_xy)
+        # 末点用吸附后的目标：原目标落在外扩禁区里时，最后一段不能再往楼里开
+        pts[-1] = Pt(*to_world(g_ij))
 
         out = [pts[0]]
         for i in range(1, len(pts) - 1):
@@ -1033,6 +1060,11 @@ def main():
                 stuck_t = 0.0
                 unstick_until = now + 1.2
                 print(f"[{now:5.1f}s] 卡住 2.5 s（mode={mode}），倒车脱困", flush=True)
+                # 只倒车不重规划的话，松手还按原路走 → 又顶同一面墙。
+                # 把卡死点记成一个 6x6 的障碍块（A* 会绕开），再回决策分支重新规划。
+                boxes.append((x, y, 6.0, 6.0, 0.0))
+                mode = "ocr"
+                follower = None
                 vc = VehicleControl(gear=GearMode.REVERSE, throttle=0.012, brake=0.0, steering=0.0)
         else:
             stuck_t = 0.0
