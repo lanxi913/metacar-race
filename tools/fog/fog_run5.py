@@ -188,6 +188,7 @@ class LaneDriver(object):
         self._mh = None
         self._cold = 0.0
         self._stall = 0.0
+        self._vds = None          # v_des 的一阶滤波状态
 
     # ------------------------------------------------------------ 工具
     def reset_heading(self):
@@ -246,13 +247,13 @@ class LaneDriver(object):
 
     def _speed_ctrl(self, speed, v_des, dt):
         dv = v_des - abs(speed)
-        if dv > 0.10:
+        if dv > 0.12:
             t = clip(0.08 + 0.28 * dv, 0.08, THR_MAX)
             self.brk = max(0.0, self.brk - 0.05)
             self.thr = min(t, self.thr + 0.03)          # 10 Hz 下 0.2/s
             if self.brk > 1e-6:
                 self.thr = 0.0
-        elif dv < -0.25:
+        elif dv < -0.15:
             # 刹车上限从 THR_MAX(0.50) 放到 0.90：v_cap=4.0 的车实测会冲到 5.4 m/s
             # （长直道下坡），0.50 的刹车按不住，超速之后又只能硬刹，两头都挨违规
             b = clip(0.10 + 0.40 * (-dv - 0.25), 0.10, 0.90)
@@ -313,7 +314,13 @@ class LaneDriver(object):
             if abs(self._curv_ff(s)) > 0.5:
                 v_des = min(v_des, 1.1)
 
-        self._speed_ctrl(speed, v_des, dt)
+        # 目标速度一阶滤波：目标别一跳一跳（跳变 = 加速度尖峰）
+        if self._vds is None:
+            self._vds = v_des
+        else:
+            self._vds += 0.35 * (v_des - self._vds)
+            self._vds = clip(self._vds, 0.0, max(v_des, self.v_cap))
+        self._speed_ctrl(speed, self._vds, dt)
 
         if goal <= 0.7 or (self.stop_xy is None and rem <= 0.5):
             self.done = True
