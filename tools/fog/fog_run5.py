@@ -48,8 +48,6 @@ from metacar_race.config import LANE_STEER_LIMIT            # noqa: E402
 from fog_run3 import MAX_STEER, clip, wrap180               # noqa: E402
 
 ACCEL = 1.15          # 规划加速度（m/s²），用于剩余距离的刹车点
-BRK_CAP = 0.15        # 速度环刹车上限：实测 >0.15 时 1 秒窗加速度超 5 m/s²，必记违规
-APPROACH_DECEL = 3.0  # 接近段规划减速度：必须≈实际刹车能力(0.15→4.5)，否则会早停再蹭
 LOOKAHEAD_A = 1.0    # 前视距离 = a + b·v（短前视才能贴住 90° 弯，长前视会切内角）
 LOOKAHEAD_B = 0.45
 LOOKAHEAD_MIN = 1.2
@@ -190,7 +188,6 @@ class LaneDriver(object):
         self._mh = None
         self._cold = 0.0
         self._stall = 0.0
-        self._vds = None          # v_des 的一阶滤波状态
 
     # ------------------------------------------------------------ 工具
     def reset_heading(self):
@@ -249,17 +246,16 @@ class LaneDriver(object):
 
     def _speed_ctrl(self, speed, v_des, dt):
         dv = v_des - abs(speed)
-        if dv > 0.12:
+        if dv > 0.10:
             t = clip(0.08 + 0.28 * dv, 0.08, THR_MAX)
             self.brk = max(0.0, self.brk - 0.05)
             self.thr = min(t, self.thr + 0.03)          # 10 Hz 下 0.2/s
             if self.brk > 1e-6:
                 self.thr = 0.0
-        elif dv < -0.15:
+        elif dv < -0.25:
             # 刹车上限从 THR_MAX(0.50) 放到 0.90：v_cap=4.0 的车实测会冲到 5.4 m/s
             # （长直道下坡），0.50 的刹车按不住，超速之后又只能硬刹，两头都挨违规
-            # 实测（ACCEL_RESPONSE.md）：5.2 m/s 起刹，0.15 → 1 秒窗 4.5（不记），0.20 → 5.8（记）
-            b = clip(0.10 + 0.40 * (-dv - 0.25), 0.10, BRK_CAP)
+            b = clip(0.10 + 0.40 * (-dv - 0.25), 0.10, 0.90)
             self.thr = max(0.0, self.thr - 0.04)
             self.brk = min(b, self.brk + 0.03) if self.thr <= 1e-6 else 0.0
         else:
@@ -312,23 +308,17 @@ class LaneDriver(object):
                 steer = 0.0
             steer = clip(steer, -LANE_STEER_LIMIT, LANE_STEER_LIMIT)
             v_des = min(self.v_cap, self._cap_ahead(s, speed),
-                        math.sqrt(max(2.0 * APPROACH_DECEL * max(goal - 0.4, 0.0), 0.0)))
+                        math.sqrt(max(2.0 * self.accel * max(goal - 0.4, 0.0), 0.0)))
             # 大转角处再压一档速度：满舵半径由 v 决定，慢下来才转得进去
             if abs(self._curv_ff(s)) > 0.5:
                 v_des = min(v_des, 1.1)
 
-        # 目标速度一阶滤波：目标别一跳一跳（跳变 = 加速度尖峰）
-        if self._vds is None:
-            self._vds = v_des
-        else:
-            self._vds += 0.35 * (v_des - self._vds)
-            self._vds = clip(self._vds, 0.0, max(v_des, self.v_cap))
-        self._speed_ctrl(speed, self._vds, dt)
+        self._speed_ctrl(speed, v_des, dt)
 
         if goal <= 0.7 or (self.stop_xy is None and rem <= 0.5):
             self.done = True
             self.thr = 0.0
-            self.brk = min(0.25, self.brk + 0.05)   # 实测口径：>0.15 就可能记违规
+            self.brk = min(0.50, self.brk + 0.06)   # 别一帧 0→0.35（会判一次加速度超限）
         return self.thr, self.brk, steer
 
 
