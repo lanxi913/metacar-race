@@ -152,7 +152,9 @@ class Safety(object):
         need = (sg - gap) / max(sg - sl, 1e-3)          # 0（刚进警告区）~1（快贴墙）
         need = 0.0 if need < 0.0 else (1.0 if need > 1.0 else need)
         if gap <= sl:
-            return 0.0, max(brk, 0.45 + 0.45 * need), steer, (gap, oid)
+            # 急刹封顶 0.30：实测（ACCEL_RESPONSE.md）刹车 >0.15 时 1 秒窗就超 5 m/s²，
+            # 0.30 在能停住和不记违规之间；真正的避碰靠提前减速，不靠这一脚。
+            return 0.0, min(max(brk, 0.45 + 0.45 * need), 0.30), steer, (gap, oid)
         new_steer = steer
         if allow_bias and gap <= STEER_GAP and abs(lateral) > 0.05:
             bias = 0.20 if lateral > 0 else -0.20

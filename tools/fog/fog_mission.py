@@ -1534,20 +1534,39 @@ def _brake_others(ctx, keep):
 
 
 def park_car(ctx, vid, brk=1.0):
-    """把一辆车彻底停住并登记力度（之后 _brake_others 会一直用这个力度按住）。"""
+    """把一辆车彻底停住并登记力度（之后 _brake_others 会一直用这个力度按住）。
+
+    实测口径（`ACCEL_RESPONSE.md`）：平台算的是"1 秒内速度变化 > 5 m/s"，所以
+    **还在滚的时候不能一脚踩死**。做法：先用 ≤0.30 的软刹把车压停，等它真的
+    静止（|v| < 0.05 连续读到）再踩死 —— 静止时踩死不产生 Δv，不会被记违规。
+    """
     hold = getattr(ctx, "hold_brk", None)
     if hold is None:
         hold = ctx.hold_brk = {}
     hold[vid] = float(brk)
-    cur = 0.15
-    while cur < float(brk):
+    soft = min(float(brk), 0.30)
+    cur = 0.06
+    while cur < soft - 1e-9:                  # 逐帧往上爬（注意别写成 <=，会死循环）
         _ctrl(ctx, vid, 0.0, cur, 0.0)
         _send(ctx, {})
-        cur = min(float(brk), cur + 0.15)
         time.sleep(0.1)
-    _ctrl(ctx, vid, 0.0, float(brk), 0.0)
+        cur = min(soft, cur + 0.05)
+    _ctrl(ctx, vid, 0.0, soft, 0.0)
     _send(ctx, {})
-    ctx.note("[park] %s 驻车（刹车 %.1f，斜坡踩上去）" % (vid, brk))
+    t_end = time.time() + 3.0
+    while time.time() < t_end:
+        _ctrl(ctx, vid, 0.0, soft, 0.0)
+        _send(ctx, {})
+        try:
+            sp = float(getattr(ctx.api.get_vehicle_state(vid), "speed_mps", 0.0) or 0.0)
+        except Exception:                                      # noqa: BLE001
+            sp = 0.0
+        if abs(sp) < 0.05:
+            break
+        time.sleep(0.1)
+    _ctrl(ctx, vid, 0.0, float(brk), 0.0)      # 停稳之后再踩死
+    _send(ctx, {})
+    ctx.note("[park] %s 驻车（软刹 0.30 停稳 → 踩 %.1f 按住）" % (vid, brk))
 
 
 def settle(ctx, brk=0.50, seconds=0.6):
