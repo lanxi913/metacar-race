@@ -25,12 +25,36 @@ import re
 # 动作词（按长度从长到短匹配，避免"去"先吃掉"去到"）
 _ACTIONS = ("去到", "到达", "抵达", "前往", "找到", "开到", "驶到", "去", "到")
 
-_TIME_RE = re.compile(r"(?:在|限时|于)?\s*\d+\s*(?:秒|分钟|min|s)\s*(?:内|以内)?")
+_TIME_RE = re.compile(
+    r"(?:最迟在|最迟|在|限时|于)?\s*\d+\s*(?:秒|分钟|min|s)\s*(?:时间限制|限制)?\s*(?:内|以内)?"
+)
 
 # 行动里常见的"限速尾巴"，从它开始一直到句尾都算行动段。
-# 容忍"并X全程"这种 OCR 把"且"认成别的字的情况（实测出现过 并日/并巳/并旦），
-# 否则尾巴切不出来，地点段会被整段吞掉（SimLocation 掉到 40/80）。
-_TAIL_RE = re.compile(r"[，,]?\s*(?:并|且)?\s*.{0,2}?(?:行驶)?全程.*$", re.S)
+# 正式赛题（邀请赛）的牌子至少有四种措辞（从场景包里读出来的）：
+#   …停车，并且全程不得超过30km/h
+#   …停车，行驶全程时速小于等于30km/h
+#   …停车，途中最高车速须小于等于30km/h      ← 没有"全程"，旧正则切不出来
+#   …停车，并全程控制时速小于等于30km/h
+# 旧实现用一条正则找尾巴，`[，,]?` 是可选的，`.` 又能吃掉逗号，于是会从
+# "…入口停车，行驶全程…" 的"车"字开始匹配，把"车，"切进行动段（实测
+# place='…西入口停' / action='抵达车,…'）。改成"按逗号切句、取最后一个含限速
+# 关键字的从句"，不再依赖正则的回溯。
+_TAIL_KEYS = ("全程", "时速", "km/h", "KM/H", "最高车速", "不得超过", "小于等于")
+
+
+def _split_tail(rest: str) -> tuple[str, str]:
+    """把"地点句 + 限速从句"拆开，返回 (head, tail)；没有限速从句时 tail 为空。"""
+    if not rest:
+        return rest, ""
+    clauses = re.split(r"[，,]", rest)
+    for i in range(len(clauses) - 1, 0, -1):
+        if any(k in clauses[i] for k in _TAIL_KEYS):
+            # 用 ASCII 逗号拼接：normalize() 已经把逗号统一成 "，"→","，
+            # 1000 分那几局提交的也是 "," 形态，别改回中文逗号。
+            head = ",".join(clauses[:i])
+            tail = "," + ",".join(clauses[i:])
+            return head, tail
+    return rest, ""
 
 
 def normalize(text: str) -> str:
@@ -62,12 +86,8 @@ def split_instruction(text: str) -> dict:
     time_phrase = m_time.group(0) if m_time else ""
     rest = ocr_text.replace(time_phrase, "", 1) if time_phrase else ocr_text
 
-    # 2) 限速尾巴：从"，并且全程…" / "，行驶全程…" 这类开始一直到句尾
-    m_tail = _TAIL_RE.search(rest)
-    if m_tail:
-        head, tail = rest[: m_tail.start()], m_tail.group(0)
-    else:
-        head, tail = rest, ""
+    # 2) 限速尾巴：从最后一个含"全程/时速/最高车速"的从句开始一直到句尾
+    head, tail = _split_tail(rest)
 
     # 3) 动词 + 地点
     verb, verb_at = "", -1
@@ -82,6 +102,17 @@ def split_instruction(text: str) -> dict:
 
     remainder = head[verb_at + len(verb):].strip(" ,.;")
     action_extra = ""
+    # 动词后面紧跟的"并停入/并驶入/并停车"要算进行动段，不能留在地点里。
+    # 正式赛题的停车位变体就是这种写法："100秒内找到并停入147培训基地停车区01号停车位，…"
+    for pre in ("并停入", "并驶入", "并进入", "停入", "驶入", "进入"):
+        if remainder.startswith(pre):
+            action_extra = "并" + pre.lstrip("并")
+            remainder = remainder[len(pre):].strip(" ,.;")
+            break
+    if remainder.startswith("并"):
+        action_extra = action_extra or "并"
+        remainder = remainder[1:].strip(" ,.;")
+    # 结尾的"停车"是动作（"…门口停车"），而"停车位"是地点的一部分，两者别搞混
     if remainder.endswith("停车"):
         remainder = remainder[: -len("停车")].strip(" ,.;")
         action_extra = "并停车"
