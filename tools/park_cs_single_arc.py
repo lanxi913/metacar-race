@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 r"""连续场景 · 垂直泊车 · 单圆弧移植版。
 
 策略直接照搬已在单场景拿到 200 分的 chang-kou 基线（提交 5f72206）：
@@ -78,11 +78,27 @@ def wrap_deg(angle: float) -> float:
     return (angle + 180.0) % 360.0 - 180.0
 
 
-def find_slot(obstacles):
-    for obstacle in obstacles:
-        if int(obstacle.type.value) == PARKING_SLOT_TYPE:
-            return obstacle
-    return None
+def find_slot(obstacles, x=None, y=None):
+    """取停车位；视野里有多个时取离自车最近的（原来直接取第一个，双车位场景会选错）。
+
+    type 判据兼容 枚举/整数 两种写法（SDK 现在是 ObstacleType.PARKING_SLOT = 30）。
+    """
+    found = []
+    for obstacle in obstacles or ():
+        t = getattr(obstacle, "type", None)
+        v = getattr(t, "value", t)
+        try:
+            ok = int(v) == PARKING_SLOT_TYPE
+        except (TypeError, ValueError):
+            ok = "PARKING_SLOT" in str(v).upper()
+        if ok:
+            found.append(obstacle)
+    if not found:
+        return None
+    if x is not None and y is not None and len(found) > 1:
+        print(f"[slot] 视野里 {len(found)} 个车位，按最近距离选", flush=True)
+        found.sort(key=lambda o: (float(o.pos_x) - x) ** 2 + (float(o.pos_y) - y) ** 2)
+    return found[0]
 
 
 def slot_axes(slot):
@@ -125,7 +141,7 @@ def slot_metrics(pose, slot, length, width):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="连续场景垂直泊车单圆弧移植")
-    parser.add_argument("--skip-to-index", type=int, default=5,
+    parser.add_argument("--skip-to-index", type=int, default=0,
                         help="只跑第 N 个元素（垂直泊车=5），其余自动 skip_level")
     parser.add_argument("--vmax", type=float, default=8.0, help="沿路线行驶的最高速度")
     parser.add_argument("--stage-past", type=float, default=STAGE_PAST_M)
@@ -156,11 +172,18 @@ def main() -> int:
 
     api.set_vehicle_control = _send_ramp
     static = api.get_scene_static_data()
-    print(f"已连接。元素 {len(static.sub_scenes)} 个，赛道 {len(static.route)} 点", flush=True)
+    _subs = len(getattr(static, "sub_scenes", None) or [])
+    _route = list(getattr(static, "route", None) or [])
+    print(f"已连接。元素 {_subs} 个，赛道 {len(_route)} 点", flush=True)
+    if len(_route) < 2:
+        # 没有参考路径（VLA / 空场景）：驻车并退出，别在第一帧就 IndexError 崩掉
+        print("!! static.route 不足 2 点，无法循迹：驻车退出", flush=True)
+        api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+        return 1
 
     target = ""
     elem_start = None
-    if 1 <= args.skip_to_index <= len(static.sub_scenes):
+    if 1 <= args.skip_to_index <= _subs:
         _elem = static.sub_scenes[args.skip_to_index - 1]
         target = _elem.name
         if _elem.start_point is not None:
@@ -234,7 +257,7 @@ def main() -> int:
                     pursuit.sync(x, y, max_jump_m=1.0)
                 print(f"进入 {sub}，开始沿路线接近车位", flush=True)
 
-            slot_now = find_slot(msg.obstacles)
+            slot_now = find_slot(msg.obstacles, x, y)
             if slot is None and slot_now is not None:
                 slot = slot_now
             if slot is None:
@@ -271,7 +294,11 @@ def main() -> int:
             car_len = float(getattr(car, "length", 0) or 0) or 4.814
             car_wid = float(getattr(car, "width", 0) or 0) or 2.180
             met = slot_metrics(pose, slot, car_len, car_wid)
-            heading_error = wrap_deg(float(slot.ori_z) - yaw)
+            # 进库朝向按 ±180 取近的：原来只认 slot.ori_z，若从车位另一头进库，
+            # 航向误差恒 ≈180°，倒车段的 8° 判据永远不满足，会一直倒到超时。
+            _he_a = wrap_deg(float(slot.ori_z) - yaw)
+            _he_b = wrap_deg(float(slot.ori_z) + 180.0 - yaw)
+            heading_error = _he_a if abs(_he_a) <= abs(_he_b) else _he_b
 
             # 倒车准备点：车位中心沿"出库方向"5.64 m、沿行进方向再退 5.57 m（与基线同构）
             ux, uy, vx, vy = slot_axes(slot)
