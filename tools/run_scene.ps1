@@ -19,6 +19,10 @@ param(
     [int]$MaxSeconds = 240,
     [int]$BootSeconds = 6,
     [int]$ConnectTimeoutSeconds = 90,
+    [int]$SettleSeconds = 20,
+    [switch]$SceneFirst,
+    [int]$SceneFirstPort = 9100,
+    [string]$WorkDir = "",
     [switch]$KeepScene
 )
 
@@ -50,10 +54,46 @@ function Kill-Stale {
 }
 
 function Get-ClientWindow {
-    $cw = Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue |
-          Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-    if (-not $cw) { return $null }
-    return [System.Windows.Automation.AutomationElement]::FromHandle($cw.MainWindowHandle)
+    # The client keeps several top-level windows (the real WebView2 UI plus hidden helper
+    # windows such as "com.i-mylab.metapower-desktop-siw" with an empty tree). Pick the one
+    # that actually has UI elements, otherwise the launcher silently sees zero buttons.
+    $proc = Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+    if (-not $proc) { return $null }
+    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
+    $wins = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+    $best = $null; $bestN = -1
+    foreach ($w in $wins) {
+        $n = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition).Count
+        if ($n -gt $bestN) { $bestN = $n; $best = $w }
+    }
+    if ($best -and $bestN -gt 5) { return $best }
+    return $null
+}
+
+function Ensure-TrainingTab($win) {
+    for ($i = 0; $i -lt 10; $i++) {
+        $els = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                            [System.Windows.Automation.Condition]::TrueCondition)
+        $tabs = $els | Where-Object { $_.Current.ControlType.ProgrammaticName -eq 'ControlType.TabItem' }
+        $tab = $tabs | Where-Object { $_.Current.Name -eq $sceneMap._meta.training_tab } | Select-Object -First 1
+        if ($tab) {
+            $sel = $null
+            if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$sel)) {
+                try { $sel.Select() } catch { }
+            }
+            Start-Sleep -Milliseconds 1200
+            $els2 = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                                 [System.Windows.Automation.Condition]::TrueCondition)
+            $btns = @($els2 | Where-Object { $_.Current.Name -eq $launchButton })
+            if ($btns.Count -gt 0) { return $true }
+        }
+        Start-Sleep -Milliseconds 800
+    }
+    return $false
 }
 
 function Invoke-El($el) {
@@ -121,31 +161,58 @@ Kill-Stale
 
 $argList = @('-u') + ($PythonArgs -split '\s+' | Where-Object { $_ -ne '' })
 $env:PYTHONIOENCODING = 'utf-8'
-$proc = Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $root `
-    -RedirectStandardOutput $log -RedirectStandardError $errlog -PassThru -WindowStyle Hidden
-Write-Host "controller pid=$($proc.Id)"
+$runDir = if ($WorkDir) { $WorkDir } else { $root }
+$proc = $null
 
-Start-Sleep -Seconds $BootSeconds
+if ($SceneFirst) {
+    # 多车场景（港口迷雾）反过来：场景是服务端（9100），算法是客户端，必须先起场景。
+    $win = Get-ClientWindow
+    if (-not $win) { Write-Host "!! client window not found"; exit 3 }
+    Write-Host ("client window: " + $win.Current.Name)
+    [void](Ensure-TrainingTab $win)
+    if (-not (Launch-Scene $win $title $page)) { Write-Host "!! could not click launch for $title"; exit 4 }
+    Write-Host "clicked launch (scene first)"
+    $up = $false
+    for ($i = 0; $i -lt 150; $i++) {
+        Start-Sleep -Seconds 1
+        if (Get-NetTCPConnection -State Listen -LocalPort $SceneFirstPort -ErrorAction SilentlyContinue) {
+            $up = $true
+            Write-Host ("port {0} up after {1}s" -f $SceneFirstPort, $i)
+            break
+        }
+    }
+    if (-not $up) { Write-Host "!! scene port never opened"; exit 5 }
+    $proc = Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $runDir `
+        -RedirectStandardOutput $log -RedirectStandardError $errlog -PassThru -WindowStyle Hidden
+    Write-Host "controller pid=$($proc.Id)"
+} else {
+    $proc = Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $runDir `
+        -RedirectStandardOutput $log -RedirectStandardError $errlog -PassThru -WindowStyle Hidden
+    Write-Host "controller pid=$($proc.Id)"
+    Start-Sleep -Seconds $BootSeconds
 
-$win = Get-ClientWindow
-if (-not $win) { Write-Host "!! client window not found"; if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }; exit 3 }
+    $win = Get-ClientWindow
+    if (-not $win) { Write-Host "!! client window not found"; if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }; exit 3 }
+    Write-Host ("client window: " + $win.Current.Name)
+    if (-not (Ensure-TrainingTab $win)) { Write-Host "!! could not get to the training scene list" }
 
-if (-not (Launch-Scene $win $title $page)) {
-    Write-Host "!! could not click launch for $title"
-    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
-    exit 4
+    if (-not (Launch-Scene $win $title $page)) {
+        Write-Host "!! could not click launch for $title"
+        if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+        exit 4
+    }
+    Write-Host "clicked launch"
+
+    # wait for the controller to report a connection
+    $connected = $false
+    for ($i = 0; $i -lt $ConnectTimeoutSeconds; $i++) {
+        Start-Sleep -Seconds 1
+        if ($proc.HasExited) { break }
+        $est = Get-NetTCPConnection -State Established -LocalPort 5061 -ErrorAction SilentlyContinue
+        if ($est) { $connected = $true; break }
+    }
+    if ($connected) { Write-Host "controller connected" } else { Write-Host "!! no connection detected" }
 }
-Write-Host "clicked launch"
-
-# wait for the controller to report a connection
-$connected = $false
-for ($i = 0; $i -lt $ConnectTimeoutSeconds; $i++) {
-    Start-Sleep -Seconds 1
-    if ($proc.HasExited) { break }
-    $est = Get-NetTCPConnection -State Established -LocalPort 5061 -ErrorAction SilentlyContinue
-    if ($est) { $connected = $true; break }
-}
-if ($connected) { Write-Host "controller connected" } else { Write-Host "!! no connection detected" }
 
 $t0 = Get-Date
 while (-not $proc.HasExited) {
@@ -160,6 +227,11 @@ $code = if ($proc.HasExited) { $proc.ExitCode } else { -1 }
 Write-Host "controller exit code=$code"
 
 if (-not $KeepScene) {
+    # The client needs the scene process alive to collect the run report and POST the
+    # record. Killing it immediately after the controller exits loses the score (seen on
+    # long scenes), so give it a few seconds to settle.
+    Write-Host ("settling {0}s before closing the scene" -f $SettleSeconds)
+    Start-Sleep -Seconds $SettleSeconds
     Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 

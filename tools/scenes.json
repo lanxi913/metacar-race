@@ -141,6 +141,8 @@
  },
  "_meta": {
   "launch_button": "启动场景",
-  "current_page": "Page *, Current page"
+  "current_page": "Page *, Current page",
+  "training_tab": "场景训练",
+  "competition_tab": "比赛列表"
  }
 }
