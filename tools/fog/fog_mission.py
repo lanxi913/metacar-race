@@ -2163,9 +2163,9 @@ def stage_cross(ctx, seconds):
     park_car(ctx, "Car_C", 1.0)
     # 3.1 A/B 提前出发：A 去闸口待命、B 去后方 19 m 的备用待命点（错峰 8 s，别挤同一条车道），
     #     同时把闲置的 Car_D 送到泊位 A 北侧见证位（278 m / 约 85 s）
-    _pre(ctx, [_job(ctx, "Car_A", gate_ready(ctx), 6.5, 2.0, 130.0),
-               _job(ctx, "Car_B", gate_hold(ctx), 6.5, 2.0, 150.0, delay=8.0),
-               _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 5.5, 2.0, 175.0)],
+    _pre(ctx, [_job(ctx, "Car_A", gate_ready(ctx), 4.8, 2.0, 130.0),
+               _job(ctx, "Car_B", gate_hold(ctx), 4.8, 2.0, 150.0, delay=8.0),
+               _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 4.6, 2.0, 175.0)],
          seconds, "A→闸口待命，B→备用待命点，D→泊位 A 见证位")
     # 3.2 A 过闸
     ok_a = cross_one(ctx, "Car_A", seconds)
@@ -2181,7 +2181,7 @@ def stage_cross(ctx, seconds):
         return
     # 3.3 A 去泊位南侧 → 立刻观测 + 交付（不等 B）
     if ok_a:
-        _pre(ctx, [_job(ctx, "Car_A", (ca[0], ca[1] - 28.0), 6.5, 2.0, 130.0)],
+        _pre(ctx, [_job(ctx, "Car_A", (ca[0], ca[1] - 28.0), 4.8, 2.0, 130.0)],
              seconds, "A→泊位 A 南侧（22 m 助跑位）")
         _deliver_one(ctx, "Berth_A", "Car_A", "Car_D", ca, seconds)
     # 3.4 B 过闸（B 早就在闸口待命）
@@ -2204,8 +2204,8 @@ def stage_cross(ctx, seconds):
     # 见证车用 Car_D：A 交付完就停在泊位旁边不动，D 从它北侧一路向东去 B 泊位。
     # （17:32 那局让 A 自己跑去 B 见证位，A 从 (629,-67) 向东正好撞上停在
     #   (631,-54) 的 D，`[collision] Car_A 与 Car_D`。）
-    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 5.5, 2.0, 130.0),
-               _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 5.5, 2.0, 175.0)],
+    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 4.8, 2.0, 130.0),
+               _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 4.6, 2.0, 175.0)],
          seconds, "B→泊位 B 南侧（22 m 助跑位），D→泊位 B 北侧见证位")
     # 3.6 B 交付
     _deliver_one(ctx, "Berth_B", "Car_B", "Car_D", cb, seconds)
@@ -2550,7 +2550,6 @@ def drive_parallel(ctx, jobs, seconds):
                               ctx.wb, v_cap=j.get("v_cap", 4.0),
                               stop_xy=j.get("stop_xy"), stop_m=j.get("stop_m", 0.0))
         j["drv"].vid = j.get("vid", "")
-        j["_n_dyn"] = len(getattr(ctx, "dyn_avoid", None) or [])
         j["t_start"] = time.time()
         j["limit"] = float(j.get("limit", 110.0))
         j["t_log"] = 0.0
@@ -2571,31 +2570,16 @@ def drive_parallel(ctx, jobs, seconds):
                 continue
             pos, yaw, speed = pose_of(ctx.api, vid)
             ctx.poll_events_throttled()
-            # 每 1 s 检查一次：新路障 或 前方 3 m 内有实体 → 立刻把这条腿重规划
-            if time.time() - float(j.get("_t_chk", 0.0)) > 1.0:
+            # 每 2 s 看一眼动态障碍表：出现新路障就地把这条腿重规划
+            if time.time() - float(j.get("_t_chk", 0.0)) > 2.0:
                 j["_t_chk"] = time.time()
                 try:
+                    n0 = len(getattr(ctx, "dyn_avoid", None) or [])
                     sync_dyn_avoid(ctx)
                     n1 = len(getattr(ctx, "dyn_avoid", None) or [])
-                    blocked = False
-                    extra = None
-                    if safe is not None:
-                        try:
-                            gap, oid, _info = safe.nearest(pos[0], pos[1])
-                            # 只认三种同时成立：贴着东西(<2 m) + 车在动 + 4 s 内没重算过
-                            if (oid and gap < 2.0 and abs(speed) > 0.8
-                                    and time.time() - float(j.get("_t_replan", 0.0)) > 4.0):
-                                blocked = True
-                                extra = (oid, gap)
-                        except Exception:                      # noqa: BLE001
-                            blocked = False
-                    if n1 > int(j.get("_n_dyn", 0)) or blocked:
+                    if n1 > n0:
                         goal = j.get("stop_xy") or j["pts"][-1]
-                        avoid2 = list(getattr(ctx, "dyn_avoid", None) or [])
-                        if extra:
-                            ctx.note("    [replan] %s 前方 %.1f m 有 %s → 重算路线"
-                                     % (vid, extra[1], extra[0]))
-                        seg = nav_path(ctx, pos, goal, avoid=avoid2)
+                        seg = nav_path(ctx, pos, goal)
                         if seg and len(seg) >= 2:
                             dense = _dense(seg)
                             j["drv"] = LaneDriver(
@@ -2605,8 +2589,6 @@ def drive_parallel(ctx, jobs, seconds):
                             j["drv"].vid = vid
                             j["drv"].reset_heading()
                             j["pts"] = list(seg)
-                            j["_t_replan"] = time.time()
-                            j["_n_dyn"] = n1
                             ctx.note("    [replan] 新路障 → %s 就地重规划（%d 点，去 (%.1f,%.1f)）"
                                      % (vid, len(dense), goal[0], goal[1]))
                 except Exception as exc:                       # noqa: BLE001
@@ -2696,54 +2678,6 @@ def main():
             pass
 
     atexit.register(_dump_trace)
-
-    # 测试钩子：FOG_FAKE_BLOCK="x,y,r,delay" —— 开局 delay 秒后注入一个假路障
-    _fake = os.environ.get("FOG_FAKE_BLOCK")
-    if _fake:
-        try:
-            parts = [v.strip() for v in _fake.split(",")]
-            def _inject():
-                time.sleep(float(parts[-1]))
-                lst = getattr(ctx, "dyn_avoid", None)
-                if lst is None:
-                    lst = ctx.dyn_avoid = []
-                if parts[0] == "ahead":
-                    # 在"正在行驶的那辆车"前方 drop 米处丢一个圆盘，保证压在它路线上
-                    drop = float(parts[1])
-                    rr = float(parts[2])
-                    best = None
-                    for vid in vids:
-                        st = to_plain(api.get_vehicle_state(vid))
-                        sp = float(st.get("speed_mps") or 0.0)
-                        if sp < 1.0:
-                            continue
-                        pose = st.get("pose") or {}
-                        if not isinstance(pose, dict):
-                            continue
-                        x = float(pose.get("pos_x") or 0.0)
-                        y = float(pose.get("pos_y") or 0.0)
-                        ori = float(pose.get("ori_z") or 0.0)
-                        if best is None or sp > best[0]:
-                            best = (sp, vid, x, y, ori)
-                    if best is None:
-                        ctx.note("[test] 注入失败：没有车在动")
-                        return
-                    sp, vid, x, y, ori = best
-                    rad = math.radians(ori)
-                    bx = x + drop * math.cos(rad)
-                    by = y + drop * math.sin(rad)
-                    lst.append((bx, by, rr))
-                    ctx.note("[test] 在 %s 前方 %.0f m 注入假路障 (%.1f,%.1f) r=%.1f"
-                             " → 之后应看到 [replan]" % (vid, drop, bx, by, rr))
-                else:
-                    fx, fy, fr = float(parts[0]), float(parts[1]), float(parts[2])
-                    lst.append((fx, fy, fr))
-                    ctx.note("[test] 注入假路障 (%.1f,%.1f) r=%.1f → 之后应看到 [replan]"
-                             % (fx, fy, fr))
-            import threading
-            threading.Thread(target=_inject, daemon=True).start()
-        except Exception as exc:                               # noqa: BLE001
-            print("FOG_FAKE_BLOCK 解析失败:", exc)
 
     def note(msg):
         line = "[%6.1f] %s" % (time.time() - t0, msg)
