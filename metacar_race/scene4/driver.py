@@ -134,7 +134,15 @@ class Driver:
 
     # ------------------------------------------------------------------ 准备
     def _prepare(self, static) -> None:
-        route = list(static.route)
+        # 泛化兜底：正式赛题的路线可能读不到（VLA 场景 route 就是空列表，或者平台这一帧
+        # 没给静态数据）。没有参考路径就驻车收工，绝不抛异常——异常会让车带着上一帧的
+        # 油门继续跑（车库里没有刹车守护）。
+        route = list(getattr(static, "route", None) or [])
+        if len(route) < 2:
+            self._say(f"[init]!! static.route 只有 {len(route)} 点，无法循迹：驻车并退出")
+            self.session.park()
+            self.n = 0
+            return
         self.track = RouteTrack(route)
         # 信号灯闸门要按里程盯「前方最近的停止线」，track 在 __init__ 时还没有
         self.light_gate.track = self.track
@@ -175,6 +183,10 @@ class Driver:
     def run(self) -> int:
         static = self.session.connect()
         self._prepare(static)
+        if getattr(self, "track", None) is None:
+            # _prepare 已经驻车 + 打过日志：没有路线就不进主循环（当作正常结束，不抛异常）
+            self.log.close()
+            return 0
         # 注意：**不要**在 main_loop() 之前发控制帧。SDK 的 main_loop() 第一件事才是发
         # Code2 告诉场景「算法就绪」；先发 Code4 会让场景在收到 code2 之前收到控制量，
         # 2026-10-25 12:33 那次 0 帧直接 ended 就是这么来的（旧 park_cs4.py 也从不这么做）。

@@ -65,6 +65,7 @@ class ElementRouter:
         self.current: Span | None = None
         self.strategy: Strategy | None = None
         self.disabled: set[str] = set()
+        self.unmatched: set[str] = set()
         self.frames_owned = 0
         self.last_log_t = -99.0
 
@@ -94,6 +95,13 @@ class ElementRouter:
             kind = kind_of(span.name)
         cls = STRATEGY_BY_KIND.get(kind)
         if cls is None:
+            # 正式赛题的子场景名可能换一种叫法（"直线行驶" 而不是 "直行"），
+            # kind_of 的关键字匹配就落空，该元素整段退回基线：一挡 4.78 m/s 跑
+            # 1000 m 级元素必然撞时限，而且日志里只有一行"进入元素"，很难发现。
+            if span.name not in self.unmatched:
+                self.unmatched.add(span.name)
+                self.log(f"[elem] '{span.name}' 没匹配到策略关键字，整段走基线"
+                         f"（新场景要在 strategies.kind_of 里补映射）")
             return None
         if span.name in self.disabled:
             return None
