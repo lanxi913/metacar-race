@@ -48,6 +48,8 @@ from metacar_race.config import LANE_STEER_LIMIT            # noqa: E402
 from fog_run3 import MAX_STEER, clip, wrap180               # noqa: E402
 
 ACCEL = 1.15          # 规划加速度（m/s²），用于剩余距离的刹车点
+START_SOFT_S = 1.30   # 起步软油门时长（s）
+START_THR = 0.035     # 起步期间油门上限（实测 1 秒窗 ≈4，不触发违规）
 LOOKAHEAD_A = 1.0    # 前视距离 = a + b·v（短前视才能贴住 90° 弯，长前视会切内角）
 LOOKAHEAD_B = 0.45
 LOOKAHEAD_MIN = 1.2
@@ -248,6 +250,9 @@ class LaneDriver(object):
         dv = v_des - abs(speed)
         if dv > 0.10:
             t = clip(0.08 + 0.28 * dv, 0.08, THR_MAX)
+            if self.t < START_SOFT_S:
+                # 起步 1.3 s 内限幅：实测 0.02~0.035 时 1 秒窗只有 2.8~4，不会记违规
+                t = min(t, START_THR)
             self.brk = max(0.0, self.brk - 0.05)
             self.thr = min(t, self.thr + 0.03)          # 10 Hz 下 0.2/s
             if self.brk > 1e-6:
@@ -266,8 +271,10 @@ class LaneDriver(object):
         if abs(speed) < 0.10 and self.thr > 0.05:
             self._stall += dt
             if self._stall > 1.2:
-                # 一帧 0.1→0.42 会被判 excessive_acceleration，改成一帧 +0.07 往上爬
-                self.thr = min(0.42, self.thr + 0.07)
+                # 一帧 0.1→0.42 会被判 excessive_acceleration，改成一帧 +0.07 往上爬；
+                # 起步 1.3 s 内要守软油门上限，否则一踢就回到 0.42。
+                cap = START_THR if self.t < START_SOFT_S else 0.42
+                self.thr = min(cap, self.thr + 0.07)
                 if self._stall > 2.6:
                     self._stall = 0.0
         else:
