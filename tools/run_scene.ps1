@@ -57,20 +57,26 @@ function Get-ClientWindow {
     # The client keeps several top-level windows (the real WebView2 UI plus hidden helper
     # windows such as "com.i-mylab.metapower-desktop-siw" with an empty tree). Pick the one
     # that actually has UI elements, otherwise the launcher silently sees zero buttons.
-    $proc = Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-    if (-not $proc) { return $null }
-    $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
-    $cond = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
-    $wins = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
-    $best = $null; $bestN = -1
-    foreach ($w in $wins) {
-        $n = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-                        [System.Windows.Automation.Condition]::TrueCondition).Count
-        if ($n -gt $bestN) { $bestN = $n; $best = $w }
+    # Right after a run ends the window handle can be 0 for a few seconds -> retry.
+    for ($try = 1; $try -le 15; $try++) {
+        $proc = Get-Process -Name metapower_desktop -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+        if ($proc) {
+            $rootEl = [System.Windows.Automation.AutomationElement]::RootElement
+            $cond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
+            $wins = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+            $best = $null; $bestN = -1
+            foreach ($w in $wins) {
+                $n = $w.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                                [System.Windows.Automation.Condition]::TrueCondition).Count
+                if ($n -gt $bestN) { $bestN = $n; $best = $w }
+            }
+            if ($best -and $bestN -gt 5) { return $best }
+        }
+        Write-Host ("   waiting for client window (try {0})" -f $try)
+        Start-Sleep -Seconds 2
     }
-    if ($best -and $bestN -gt 5) { return $best }
     return $null
 }
 
