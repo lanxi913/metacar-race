@@ -1654,6 +1654,7 @@ def drive_to(ctx, vid, goal_xy, seconds, stop_xy=None, stop_m=STOP_FAR,
                 if safe.path_clearance(r2.pts, skip_tail=stop_m + 2.0)[0] > d_clear:
                     r = r2
     drv = LaneDriver(r, ctx.wb, v_cap=4.6, stop_xy=stop_xy, stop_m=stop_m)
+    drv.vid = vid
     ctx.note("  [nav] -> (%.1f,%.1f) %d wp %.0f m"
              % (goal_xy[0], goal_xy[1], len(r.pts), r.length()))
     got = None
@@ -2478,6 +2479,7 @@ def drive_parallel(ctx, jobs, seconds):
         j["drv"] = LaneDriver(fog_route.Route(dense, [j.get("v_cap", 4.0)] * len(dense)),
                               ctx.wb, v_cap=j.get("v_cap", 4.0),
                               stop_xy=j.get("stop_xy"), stop_m=j.get("stop_m", 0.0))
+        j["drv"].vid = j.get("vid", "")
         j["t_start"] = time.time()
         j["limit"] = float(j.get("limit", 110.0))
         j["t_log"] = 0.0
@@ -2565,6 +2567,24 @@ def main():
     api = connect_retry()
     log = open(os.path.join(args.out, "run.log"), "w", encoding="utf-8")
     t0 = time.time()
+    # 10 Hz 轨迹记录（量化画龙：转向抖动 / 横向摆动），退出时落盘
+    import atexit
+    import fog_run5 as _fr5
+    _fr5.TRACE = []
+
+    def _dump_trace():
+        rows = getattr(_fr5, "TRACE", None) or []
+        if not rows:
+            return
+        try:
+            with open(os.path.join(args.out, "trace.csv"), "w", encoding="utf-8") as fh:
+                fh.write("t,vid,x,y,steer,thr,brk,speed\n")
+                for r in rows:
+                    fh.write("%.2f,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n" % r)
+        except Exception:                                  # noqa: BLE001
+            pass
+
+    atexit.register(_dump_trace)
 
     def note(msg):
         line = "[%6.1f] %s" % (time.time() - t0, msg)

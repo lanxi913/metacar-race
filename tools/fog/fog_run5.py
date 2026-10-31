@@ -47,17 +47,18 @@ from metacar_race.config import LANE_STEER_LIMIT            # noqa: E402
 
 from fog_run3 import MAX_STEER, clip, wrap180               # noqa: E402
 
+TRACE = None          # 置成 list 就开始记 10 Hz 轨迹（t, vid, x, y, steer, thr, brk, speed）
 ACCEL = 1.15          # 规划加速度（m/s²），用于剩余距离的刹车点
 START_SOFT_S = 1.30   # 起步软油门时长（s）
 START_THR = 0.035     # 起步期间油门上限（实测 1 秒窗 ≈4，不触发违规）
-LOOKAHEAD_A = 1.2    # 前视距离 = a + b·v（短前视才能贴住 90° 弯，长前视会切内角）
-LOOKAHEAD_B = 0.50
+LOOKAHEAD_A = 1.0    # 前视距离 = a + b·v（短前视才能贴住 90° 弯，长前视会切内角）
+LOOKAHEAD_B = 0.45
 LOOKAHEAD_MIN = 1.2
 LOOKAHEAD_MAX = 7.0
 SLOW_HORIZON_A = 2.0  # 提前看多远的限速：a + b·v（弯前先减速，别等压上弯再刹）
 SLOW_HORIZON_B = 1.0
-LAT_DAMP = 0.08      # 横向偏差阻尼（自测扫描：0.08 比 0.10 弯道横向误差小 0.23 m）
-CURV_FF = 0.60       # 弯道曲率前馈权重（0 = 纯 LaneFollower 的纯跟踪）
+LAT_DAMP = 0.10      # 横向偏差阻尼（自测扫描：0.08 比 0.10 弯道横向误差小 0.23 m）
+CURV_FF = 0.70       # 弯道曲率前馈权重（0 = 纯 LaneFollower 的纯跟踪）
 THR_MAX = 0.50
 COLD_START_M = 1.0   # 位移航向没测出来前直行的距离
 FILLET_R = 3.0       # 折线顶点倒角半径（参考线必须是车开得出来的曲线）
@@ -66,6 +67,8 @@ FILLET_R = 3.0       # 折线顶点倒角半径（参考线必须是车开得出
 #   steer=+0.6 → 航向 180.0→165.5（−14.5°），即 **+1 是右舵**（航向减小）。
 # 控制器内部一律用"航向增大为正"的数学约定，只在输出时乘这个符号翻转。
 STEER_SIGN = -1.0
+STEER_GAIN = 0.60    # 转向总增益：现场 trace 平均 |steer| 0.53~0.60 长期贴满舵（上限 0.6），
+                     # 降到 0.60 后离线自测仍全 PASS（直线 0.11m / 直角弯 1.35m）
 
 
 def collapse(pts, tol=5.0):
@@ -308,7 +311,7 @@ class LaneDriver(object):
             bear = math.degrees(math.atan2(cy - y, cx - x))
             alpha = math.radians(wrap180(bear - heading))
             delta = math.atan2(2.0 * self.wb * math.sin(alpha), ld)
-            steer = STEER_SIGN * (delta / MAX_STEER
+            steer = STEER_GAIN * STEER_SIGN * (delta / MAX_STEER
                                   + CURV_FF * clip(self._curv_ff(s), -1.0, 1.0)
                                   - LAT_DAMP * clip(e, -3.0, 3.0))
             if not math.isfinite(steer):
@@ -321,6 +324,14 @@ class LaneDriver(object):
                 v_des = min(v_des, 1.1)
 
         self._speed_ctrl(speed, v_des, dt)
+
+        if TRACE is not None:
+            try:
+                TRACE.append((self.t, getattr(self, "vid", ""), x, y,
+                              float(steer), float(self.thr), float(self.brk),
+                              float(speed)))
+            except Exception:                                  # noqa: BLE001
+                pass
 
         if goal <= 0.7 or (self.stop_xy is None and rem <= 0.5):
             self.done = True
