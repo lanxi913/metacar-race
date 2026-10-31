@@ -2163,9 +2163,9 @@ def stage_cross(ctx, seconds):
     park_car(ctx, "Car_C", 1.0)
     # 3.1 A/B 提前出发：A 去闸口待命、B 去后方 19 m 的备用待命点（错峰 8 s，别挤同一条车道），
     #     同时把闲置的 Car_D 送到泊位 A 北侧见证位（278 m / 约 85 s）
-    _pre(ctx, [_job(ctx, "Car_A", gate_ready(ctx), 3.7, 2.0, 130.0),
-               _job(ctx, "Car_B", gate_hold(ctx), 3.7, 2.0, 150.0, delay=8.0),
-               _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 3.9, 2.0, 175.0)],
+    _pre(ctx, [_job(ctx, "Car_A", gate_ready(ctx), 4.8, 2.0, 130.0),
+               _job(ctx, "Car_B", gate_hold(ctx), 4.8, 2.0, 150.0, delay=8.0),
+               _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 4.6, 2.0, 175.0)],
          seconds, "A→闸口待命，B→备用待命点，D→泊位 A 见证位")
     # 3.2 A 过闸
     ok_a = cross_one(ctx, "Car_A", seconds)
@@ -2181,7 +2181,7 @@ def stage_cross(ctx, seconds):
         return
     # 3.3 A 去泊位南侧 → 立刻观测 + 交付（不等 B）
     if ok_a:
-        _pre(ctx, [_job(ctx, "Car_A", (ca[0], ca[1] - 28.0), 3.7, 2.0, 130.0)],
+        _pre(ctx, [_job(ctx, "Car_A", (ca[0], ca[1] - 28.0), 4.8, 2.0, 130.0)],
              seconds, "A→泊位 A 南侧（22 m 助跑位）")
         _deliver_one(ctx, "Berth_A", "Car_A", "Car_D", ca, seconds)
     # 3.4 B 过闸（B 早就在闸口待命）
@@ -2204,8 +2204,8 @@ def stage_cross(ctx, seconds):
     # 见证车用 Car_D：A 交付完就停在泊位旁边不动，D 从它北侧一路向东去 B 泊位。
     # （17:32 那局让 A 自己跑去 B 见证位，A 从 (629,-67) 向东正好撞上停在
     #   (631,-54) 的 D，`[collision] Car_A 与 Car_D`。）
-    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 4.1, 2.0, 130.0),
-               _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 3.9, 2.0, 175.0)],
+    _pre(ctx, [_job(ctx, "Car_B", (cb[0], cb[1] - 28.0), 4.8, 2.0, 130.0),
+               _job(ctx, "Car_D", (cb[0], cb[1] + 22.0), 4.6, 2.0, 175.0)],
          seconds, "B→泊位 B 南侧（22 m 助跑位），D→泊位 B 北侧见证位")
     # 3.6 B 交付
     _deliver_one(ctx, "Berth_B", "Car_B", "Car_D", cb, seconds)
@@ -2570,6 +2570,29 @@ def drive_parallel(ctx, jobs, seconds):
                 continue
             pos, yaw, speed = pose_of(ctx.api, vid)
             ctx.poll_events_throttled()
+            # 每 2 s 看一眼动态障碍表：出现新路障就地把这条腿重规划
+            if time.time() - float(j.get("_t_chk", 0.0)) > 2.0:
+                j["_t_chk"] = time.time()
+                try:
+                    n0 = len(getattr(ctx, "dyn_avoid", None) or [])
+                    sync_dyn_avoid(ctx)
+                    n1 = len(getattr(ctx, "dyn_avoid", None) or [])
+                    if n1 > n0:
+                        goal = j.get("stop_xy") or j["pts"][-1]
+                        seg = nav_path(ctx, pos, goal)
+                        if seg and len(seg) >= 2:
+                            dense = _dense(seg)
+                            j["drv"] = LaneDriver(
+                                fog_route.Route(dense, [j.get("v_cap", 4.0)] * len(dense)),
+                                ctx.wb, v_cap=j.get("v_cap", 4.0),
+                                stop_xy=j.get("stop_xy"), stop_m=j.get("stop_m", 0.0))
+                            j["drv"].vid = vid
+                            j["drv"].reset_heading()
+                            j["pts"] = list(seg)
+                            ctx.note("    [replan] 新路障 → %s 就地重规划（%d 点，去 (%.1f,%.1f)）"
+                                     % (vid, len(dense), goal[0], goal[1]))
+                except Exception as exc:                       # noqa: BLE001
+                    ctx.note("    [replan] %s 重规划失败 %s" % (vid, exc))
             if time.time() - j["t_start"] < float(j.get("delay", 0.0)):
                 # 错峰出发：先让前面的车站住，别一起挤进同一条车道
                 _ctrl(ctx, vid, 0.0, 0.4, 0.0)

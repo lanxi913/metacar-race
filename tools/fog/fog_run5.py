@@ -49,7 +49,7 @@ from fog_run3 import MAX_STEER, clip, wrap180               # noqa: E402
 
 TRACE = None          # 置成 list 就开始记 10 Hz 轨迹（t, vid, x, y, steer, thr, brk, speed）
 ACCEL = 1.15          # 规划加速度（m/s²），用于剩余距离的刹车点
-START_SOFT_S = 1.30   # 起步软油门时长（s）
+START_SOFT_S = 0.00   # 起步软油门时长（明天以速度优先，取消软起步）
 START_THR = 0.035     # 起步期间油门上限（实测 1 秒窗 ≈4，不触发违规）
 LOOKAHEAD_A = 1.0    # 前视距离 = a + b·v（短前视才能贴住 90° 弯，长前视会切内角）
 LOOKAHEAD_B = 0.45
