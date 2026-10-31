@@ -622,6 +622,11 @@ def main():
     log_t = -1.0
     shot_t = -99.0
     arrive_t = None
+    # 卡死自救：给了油门却不动 = 顶到墙/柱子上了。VLA 场景里车会被墙怼住整局不动
+    # （2026-11-01 05:06 那局在 (708.4,46.1) 卡了 47 s，楼名变体整局白跑）。
+    stuck_t = 0.0
+    unstick_until = None
+    prev_now = 0.0
     hold_t0 = -1.0
     desired_yaw = None
     bld = None
@@ -994,6 +999,24 @@ def main():
                                       (0.07 if abs(v) > 0.06 else 0.0), steering=0.0)
         else:
             vc = VehicleControl(gear=GearMode.PARKING, brake=1.0, throttle=0.0, steering=0.0)
+
+        # ---- 卡死自救（只影响"顶住不动"这一种情况）-------------------------
+        # 判据：不在 hold/recenter 阶段、给了油门、车速却连续 2.5 s < 0.15 m/s → 判定顶墙，
+        # 倒车 1.2 s 让它脱离，然后继续按原路径跟（follower 会自动重新对齐）。
+        # 倒车油门 0.012 是实测的最小有效值（离合器门槛约 0.007），1.2 s 只退 0.4~0.8 m。
+        dt_f = max(0.02, min(0.5, now - prev_now))
+        prev_now = now
+        if unstick_until is not None and now < unstick_until:
+            vc = VehicleControl(gear=GearMode.REVERSE, throttle=0.012, brake=0.0, steering=0.0)
+        elif mode in ("drive", "scan") and vc.throttle > 0.0 and v < 0.15:
+            stuck_t += dt_f
+            if stuck_t > 2.5:
+                stuck_t = 0.0
+                unstick_until = now + 1.2
+                print(f"[{now:5.1f}s] 卡住 2.5 s（mode={mode}），倒车脱困", flush=True)
+                vc = VehicleControl(gear=GearMode.REVERSE, throttle=0.012, brake=0.0, steering=0.0)
+        else:
+            stuck_t = 0.0
 
         api.set_vehicle_control(vc, vla_extension=payload)
         if payload is not None:
