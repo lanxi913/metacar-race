@@ -110,7 +110,9 @@ class Grid:
         gx, gy = self.to_cell(*goal_xy)
         sx, sy = self._nearest_free(sx, sy)
         gx, gy = self._nearest_free(gx, gy)
-        if (sx, sy) is None or (gx, gy) is None:
+        # `_nearest_free` 找不到空格子时返回 (None, None)；原来写 `(sx, sy) is None` 永远
+        # 不成立（tuple 不是 None），会把 None 带进 A* 直接 TypeError 崩掉整局。逐元素判空。
+        if sx is None or sy is None or gx is None or gy is None:
             return None
         start = (sx, sy)
         goal = (gx, gy)

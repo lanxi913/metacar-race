@@ -453,10 +453,23 @@ def drive_polyline(ctx, vid, pts, seconds, poll=None, v_cap=3.8):
 
 
 def stage_scan(ctx, seconds):
-    ts = to_plain(ctx.api.get_task_state())
+    # `get_task_state` 会随机回空快照（同一位置隔一两秒就正常，见 _wait_visible 的注释），
+    # 空快照里 roadblock_active 是缺省的 False —— 只读一次就会误判成"这一局没有路障"。
+    ts = {}
+    for _k in range(6):
+        try:
+            ts = to_plain(ctx.api.get_task_state()) or {}
+        except Exception:                                          # noqa: BLE001
+            ts = {}
+        if ts.get("shared_task_objects") or ts.get("phase"):
+            break
+        time.sleep(0.4)
     if not ts.get("roadblock_active"):
-        ctx.note("[scan] roadblock 未激活，跳过")
-        return False
+        # 没有动态路障 = 这一阶段不需要做，但**不是失败**：main() 用 `elif scanned:`
+        # 当作后面"过闸 + 泊位交付"的总开关，返回 False 会把这两段整段吞掉
+        # （泛化场景若没有路障，8 项成果就只剩信号那 3 项，而且日志只有一行"跳过"）。
+        ctx.note("[scan] roadblock 未激活，跳过扫描（后续过闸/交付照常执行）")
+        return True
     zones = []
     for o in ts.get("shared_task_objects") or []:
         if o.get("object_type") != "static_task_obstacle":
