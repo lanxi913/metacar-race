@@ -31,3 +31,6 @@ scenes/
 
 # local secrets / helper data
 tools/.mylab_token
+
+# 本地临时产物（OCR 截图、路径图等）
+tmp/
