@@ -23,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from metacar import GearMode, SceneAPI, VehicleControl  # noqa: E402
 
+from metacar_race.scene_ctx import SceneCtx  # noqa: E402
+
 LOOKAHEAD = 5.0
 XTRACK_K = 0.0        # 横向误差增益
 XTRACK_OFFSET = 0.0   # 参考路径横向偏置（米），正=向左
@@ -63,6 +65,8 @@ def main() -> int:
                     help="终点区内允许轻刹（覆盖 --nobrake，上限 0.2）")
     ap.add_argument("--steerat", type=float, default=1.0,
                     help="方向盘每帧最大变化量，用来压横向加速度")
+    ap.add_argument("--offsetauto", action="store_true",
+                    help="横向偏置按车道宽度与车宽自动推导（0.5*(车道宽-车宽)），忽略 --offset")
     args = ap.parse_args()
 
     print("等待场景连接...")
@@ -70,9 +74,23 @@ def main() -> int:
     api.connect()
     print("已连接。")
 
-    static = api.get_scene_static_data()
-    route = [(p.x, p.y) for p in static.route]
-    print(f"路线点 {len(route)}  子场景 {[s.name for s in static.sub_scenes]}")
+    ctx = SceneCtx.from_api(api)
+    route = list(ctx.route)
+    print(f"路线点 {len(route)}  子场景 {ctx.sub_scenes}  车道宽 {ctx.lane_width():.2f} m")
+    if len(route) < 2:
+        print("[warn] 参考路径不足 2 点，无法循迹 → 驻车保底（不判负总比乱开撞墙好）", flush=True)
+        api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+        return 0
+
+    offset = float(args.offset)
+    if args.offsetauto:
+        # 横向偏置的物理含义：车在弯里会切内道，把参考线往外推半个车宽余量。
+        # 训练场景实测 u 型弯 0.8 m（车道约 3.5 m、车宽约 1.8 m），公式给出 0.85 m，吻合。
+        car_w = 1.8   # 车宽兜底（MainVehicleInfo.width 约 1.8~2.2，这里只用于算偏置，差 0.2 m 影响 <0.1 m）
+        offset = max(0.3, min(1.4, 0.5 * (ctx.lane_width() - car_w)))
+        print(f"[auto] 横向偏置 {offset:+.2f} m（车道 {ctx.lane_width():.2f} m，车宽 {car_w:.2f} m）",
+              flush=True)
+    args.offset = offset
 
     curv = [0.0] * len(route)
     for i in range(1, len(route) - 1):

@@ -1,0 +1,146 @@
+{
+ "straight": {
+  "title": "车辆直行",
+  "page": 1
+ },
+ "stop": {
+  "title": "车辆停止",
+  "page": 1
+ },
+ "follow": {
+  "title": "车辆跟随",
+  "page": 1
+ },
+ "emergencystop": {
+  "title": "车辆紧急停止",
+  "page": 1
+ },
+ "rightangleturn": {
+  "title": "直角转弯",
+  "page": 1
+ },
+ "uxingwan": {
+  "title": "u型弯",
+  "page": 1
+ },
+ "lianxuzhuanwan": {
+  "title": "连续转弯",
+  "page": 1
+ },
+ "huanxingzhuanwan": {
+  "title": "环形转弯",
+  "page": 1
+ },
+ "zadaoxingshi": {
+  "title": "匝道行驶",
+  "page": 1
+ },
+ "xiansuxingshi": {
+  "title": "限速行驶",
+  "page": 1
+ },
+ "cheliangbiandao": {
+  "title": "车辆变道",
+  "page": 1
+ },
+ "huandaoshirushichu": {
+  "title": "环岛驶入、驶出",
+  "page": 1
+ },
+ "zuocechedaochaoche": {
+  "title": "左侧车道超车",
+  "page": 2
+ },
+ "fulushirushichu": {
+  "title": "辅路驶入、驶出",
+  "page": 2
+ },
+ "fuzalukuangchaoche": {
+  "title": "复杂路况超车",
+  "page": 2
+ },
+ "dingzilukoutongxing": {
+  "title": "丁字路口通行",
+  "page": 2
+ },
+ "shizilukoutongxing": {
+  "title": "十字路口通行",
+  "page": 2
+ },
+ "wubaohuzuozhuan": {
+  "title": "无保护左转",
+  "page": 2
+ },
+ "youxingrenyouzhuan": {
+  "title": "有行人右转",
+  "page": 2
+ },
+ "chunzhichedaoboche": {
+  "title": "垂直车道泊车",
+  "page": 2
+ },
+ "pingxingchedaoboche": {
+  "title": "平行车道泊车",
+  "page": 2
+ },
+ "yixingchedaoboche": {
+  "title": "异形车道泊车",
+  "page": 2
+ },
+ "xiepoboche": {
+  "title": "斜坡泊车",
+  "page": 2
+ },
+ "lvdengjinxing": {
+  "title": "绿灯禁行",
+  "page": 3
+ },
+ "chelianghuiru": {
+  "title": "车辆汇入",
+  "page": 3
+ },
+ "cheliangqiechu": {
+  "title": "车辆切出",
+  "page": 3
+ },
+ "lianxu": {
+  "title": "连续场景1",
+  "page": 3
+ },
+ "lianxu4": {
+  "title": "连续场景4",
+  "page": 3
+ },
+ "vla_TextNavParking": {
+  "title": "文本导航与规范停车任务",
+  "page": 3
+ },
+ "vla_IllegalParkingDetection": {
+  "title": "停车区违规检测任务",
+  "page": 3
+ },
+ "vla_ZoneComplianceCheck": {
+  "title": "功能区合规检测任务",
+  "page": 3
+ },
+ "vla_TextNavParking_02": {
+  "title": "文本导航与规范停车任务（二）",
+  "page": 3
+ },
+ "vla_IllegalParkingDetection_02": {
+  "title": "停车区违规检测任务（二）",
+  "page": 4
+ },
+ "vla_ZoneComplianceCheck_02": {
+  "title": "功能区合规检测任务(二）",
+  "page": 4
+ },
+ "PORT-FOG-01": {
+  "title": "港口迷雾",
+  "page": 4
+ },
+ "_meta": {
+  "launch_button": "启动场景",
+  "current_page": "Page *, Current page"
+ }
+}

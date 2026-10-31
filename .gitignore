@@ -28,3 +28,6 @@ scenes/
 # 本地配置
 .env
 *.local
+
+# local secrets / helper data
+tools/.mylab_token
