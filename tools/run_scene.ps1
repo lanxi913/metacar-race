@@ -277,9 +277,15 @@ if ($SceneFirst) {
     $win = Get-ClientWindow
     if (-not $win) { Write-Host "!! client window not found"; exit 3 }
     Write-Host ("client window: " + $win.Current.Name)
-    [void](Ensure-TrainingTab $win)
-    if (-not (Launch-Scene $win $title $page)) { Write-Host "!! could not click launch for $title"; exit 4 }
-    Write-Host "clicked launch (scene first)"
+    if ($isCompetition) {
+        # 赛题的港口迷雾在「比赛列表」里，走同一条比赛启动路径
+        if (-not (Launch-CompetitionScene $win)) { Write-Host "!! could not launch the competition scene $title"; exit 4 }
+        Write-Host "clicked launch (scene first, competition)"
+    } else {
+        [void](Ensure-TrainingTab $win)
+        if (-not (Launch-Scene $win $title $page)) { Write-Host "!! could not click launch for $title"; exit 4 }
+        Write-Host "clicked launch (scene first)"
+    }
     $up = $false
     for ($i = 0; $i -lt 150; $i++) {
         Start-Sleep -Seconds 1

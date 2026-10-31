@@ -85,13 +85,22 @@ Get-Process -Name SmartCar, UnityCrashHandler64 -ErrorAction SilentlyContinue | 
 ### 1.5 港口迷雾（满分 1000，约 11 分钟）
 
 **顺序和单车场景相反：先起场景，再跑脚本**（场景是 9100 服务端，算法是客户端）。
+`-SceneFirst` 已经处理好了，06:18 用训练版实测过一次（点启动 → 3 s 后 9100 起来 → 跑任务）。
 
 ```powershell
+# 训练版
 & .\tools\run_scene.ps1 -Slug PORT-FOG-01 -SceneFirst `
     -PythonArgs "fog_mission.py --out `"$env:TEMP\fog_run`" --seconds 620 --cross 1 --deliver 1" `
     -WorkDir "C:\Users\lanxi\Documents\deepseek-harness\default-workspace\.train\fog800\tools\fog" `
     -MaxSeconds 700 -SettleSeconds 25
 .venv\Scripts\python.exe tools\last_run.py PORT-FOG-01 1 --det        # 期望 900~950
+
+# 赛题版（09:30 之后）
+& .\tools\run_scene.ps1 -Slug ius_port -SceneFirst `
+    -PythonArgs "fog_mission.py --out `"$env:TEMP\fog_run_ius`" --seconds 620 --cross 1 --deliver 1" `
+    -WorkDir "C:\Users\lanxi\Documents\deepseek-harness\default-workspace\.train\fog800\tools\fog" `
+    -MaxSeconds 700 -SettleSeconds 25
+.venv\Scripts\python.exe tools\last_run.py PORT-FOG-01_ius2026 1 --det
 ```
 
 跑完用 `fog_report.py` 一屏看 8 项成果（**必须设 UTF-8**）：
