@@ -501,12 +501,19 @@ def resolve_target(place, msg, vla, x, y, yaw, args):
     p = normalize(place)
 
     # 指令里点了楼名 → 去那栋楼；点了"停车位/车位" → 去场景给的绝对停车位。
-    # 正式赛题的停车位变体写作"…找到并停入147培训基地停车区01号停车位…"，里面**也带楼名**
-    # （147培训基地），所以不能只看"有没有楼名"，要先看有没有"停车位/车位"。
-    _named = [b for b in vla.buildings
-              if normalize(getattr(b, "name", "") or "")
-              and normalize(b.name) in p]
+    # 判据不用"楼名原样子串"也不用相似度门限：OCR 常把楼名认错一个字
+    # （实测 06:08 那局 锦汇华庭→锦汇华避，子串判据落空、相似度只剩 0.377），
+    # 但"栋/单元/入口/门口"这些地点标记不会一起认错。所以：
+    #   ① 指令里有"停车位/车位" → 车位变体；
+    #   ② 否则有"栋/单元/入口/门口/大门" → 楼门口变体（用 match_place 模糊选楼）；
+    #   ③ 都没有 → 兜底去车位（老行为）。
     _wants_slot = ("停车位" in p) or ("车位" in p)
+    _place_marker = any(k in p for k in ("栋", "单元", "入口", "门口", "大门"))
+    _ranked_place = match_place(p, list(vla.buildings))
+    _named = [b for s, b in _ranked_place[:1]] if (_place_marker and not _wants_slot) else []
+    if _place_marker and not _wants_slot and _ranked_place:
+        print(f"   地点判定：楼门口变体 → 最像 {_ranked_place[0][1].name}"
+              f"（score={_ranked_place[0][0]:.3f}）", flush=True)
 
     # 绝对停车位置优先：只要指令要的是车位、且场景给了 PARKING_SLOT，就去它。
     # （用户指示：不要再管"楼门口 8x8"，就去那个绝对停车位置。）
