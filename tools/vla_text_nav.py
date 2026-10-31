@@ -448,6 +448,24 @@ def door_side_point(b, along, side, args):
 
 
 
+_DOOR_NEG = ("100", "秒", "全程", "超过", "km/h", "KM/H", "并且", "并目", "并日",
+             "任务", "禁止", "要求")
+
+
+def looks_like_door_plate(txt: str) -> bool:
+    """判断 OCR 文本像不像"楼门牌"，而不是开局那块黄色任务牌。
+
+    实测 2026-11-01：楼面巡航把任务牌（"在100秒内到达锦汇华庭B栋一单元门口停车…"）
+    当成了门牌，于是"门定位 x≈637"（正是起点），车停在 (637,59) 而不是 B 栋门口，
+    整局判未完成、100 s 到点被瞬移回起点。门牌是短文本（"B栋一单元"），
+    任务牌照面很长且一定含时限/限速。
+    """
+    t = (txt or "").strip()
+    if not t or len(t) > 14:
+        return False
+    return not any(k in t for k in _DOOR_NEG)
+
+
 def resolve_target(place, msg, vla, x, y, yaw, args):
     """地点片段 -> (目标点, 模式)。模式为 building / slot / manual。"""
     if args.target_x is not None and args.target_y is not None:
@@ -455,9 +473,18 @@ def resolve_target(place, msg, vla, x, y, yaw, args):
 
     p = normalize(place)
 
-    # 绝对停车位置优先：只要场景给了 PARKING_SLOT，一律去它，不看指令文本怎么写。
+    # 指令里点了楼名 → 必须去那栋楼的门口（"到达X栋Y单元门口停车"）；
+    # 只有"找到空的停车位"这类**没有楼名**的指令才走绝对停车位。
+    # 实测 2026-11-01 03:41 与 04:56 两局：指令是"到达锦汇华庭G栋二单元门口停车"，
+    # 车却开去绝对车位 (723,25)（那是 E 栋门口），平台判未完成 → 100 s 到点把车瞬移
+    # 回起点重来，整局白跑（日志里能看到 [reset] 瞬移 (723,25) -> (637,-3)）。
+    _named = [b for b in vla.buildings
+              if normalize(getattr(b, "name", "") or "")
+              and normalize(b.name) in p]
+
+    # 绝对停车位置优先：只要场景给了 PARKING_SLOT 且指令没点楼名，一律去它。
     # （用户指示：不要再管"楼门口 8x8"，就去那个绝对停车位置。）
-    if args.target_x is None:
+    if args.target_x is None and not _named:
         slots = [o for o in msg.obstacles
                  if int(getattr(getattr(o, "type", 0), "value", -1)) == 30]
         if slots:
@@ -802,7 +829,8 @@ def main():
                     # 没抓到黄牌就退回 OCR（慢，但兜底）
                     last_scan_ocr = now
                     txt = read_text(frames[0].frame, scale=1.0)
-                    if txt and ("单元" in txt or (bld is not None and bld.name[-2:] in txt)):
+                    if looks_like_door_plate(txt) and (
+                            "单元" in txt or (bld is not None and bld.name[-2:] in txt)):
                         door_hits.append(x)
                         print(f"[{now:5.1f}s] OCR 见到门牌 {txt!r} @x={x:.1f}", flush=True)
             if follower.remaining() <= 1.0 or now >= args.ocr_window + 45.0:
@@ -833,7 +861,7 @@ def main():
             if want_letter and not door_found and frames and now - last_plate_ocr >= 0.35:
                 last_plate_ocr = now
                 plate = find_door_plate(frames[0].frame, want_letters=want_letter)
-                if plate is not None:
+                if plate is not None and looks_like_door_plate(plate[2]):
                     cx, frac, stext = plate
                     door_found = True
                     door_hits = [x]
