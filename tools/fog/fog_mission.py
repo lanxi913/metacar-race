@@ -1880,7 +1880,7 @@ def cross_one(ctx, car, seconds):
     note = ctx.note
     api = ctx.api
     pos0, _y, _v = pose_of(ctx.api, car)
-    detour = nav_path(ctx, pos0, (728.8, -55.0))
+    detour = nav_path(ctx, pos0, gate_ready(ctx))
     note("[cross] %s 栅格规划 %d 点 → (728.8,-55.0)" % (car, len(detour)))
     drive_polyline(ctx, car, detour, seconds, v_cap=4.0)
 
@@ -1917,10 +1917,10 @@ def cross_one(ctx, car, seconds):
         if attempt == 1:
             note("[cross] %s 第一次没申请到，退回重进一次" % car)
             p_back = pose_of(api, car)[0]
-            drive_polyline(ctx, car, [(p_back[0], p_back[1]), (729.05, -46.0)],
+            drive_polyline(ctx, car, [(p_back[0], p_back[1]), gate_req_line(ctx, -46.0)],
                            seconds, v_cap=1.8)
         p_now = pose_of(api, car)[0]
-        drive_polyline(ctx, car, [(p_now[0], p_now[1]), (729.05, -30.0)],
+        drive_polyline(ctx, car, [(p_now[0], p_now[1]), gate_req_line(ctx, -30.0)],
                        seconds, v_cap=2.2, poll=reqpoll)
         # 到线还没批：再原地试 6 s（有时是刚过窗口，稍等会批）
         t_g = min(time.time() + 6.0, ctx.t0 + seconds - 10.0)
@@ -2053,6 +2053,75 @@ def _job(ctx, vid, goal, v_cap=3.7, stop_m=2.0, limit=140.0, avoid=None, delay=0
             "stop_m": stop_m, "limit": limit, "delay": delay}
 
 
+DEFAULT_GATE_X = 728.8          # 训练场景实测的闸口中线（两侧墙在 726.26 / 731.32）
+GATE_WARN_M = 3.0               # 推导值与写死值差超过这么多就告警（说明地图变了）
+
+
+def derive_gate(ctx):
+    """从路网自动找闸口中线：闸口是南北向的一对车道（E/W），取它们的 x 均值。
+
+    训练场景实测：E 车道 x=726.5、W 车道 x=731.0（y ∈ [-33,-15.5]），均值 728.75，
+    和写死的 728.8 只差 5 cm —— 所以这个推导可以作为地图变化时的兜底。
+    """
+    try:
+        roads = ctx.graph.roads
+    except Exception:                                          # noqa: BLE001
+        return None
+    xs = []
+    for rid, r in roads.items():
+        b, e = r["begin"], r["end"]
+        L = float(r.get("len") or 0.0)
+        if not (4.0 <= L <= 30.0):
+            continue
+        if abs(b[0] - e[0]) > 2.0:          # 只要竖直路（南北向车道）
+            continue
+        x = 0.5 * (b[0] + e[0])
+        if not (722.0 <= x <= 736.0):
+            continue
+        ylo, yhi = min(b[1], e[1]), max(b[1], e[1])
+        if yhi < -40.0 or ylo > -10.0:      # 位于闸口那一段
+            continue
+        xs.append(x)
+    if not xs:
+        return None
+    return {"x": sum(xs) / len(xs), "n": len(xs),
+            "lo": min(xs), "hi": max(xs)}
+
+
+def gate_ready(ctx):
+    """闸口南侧待命点（request_entry 从这里起步最顺）。"""
+    return (gate_x(ctx), -55.0)
+
+
+def gate_hold(ctx):
+    """B 的备用待命点：在 A 后面 19 m，避免两车抢同一个点。"""
+    return (gate_x(ctx), -74.0)
+
+
+def gate_req_line(ctx, y):
+    """申请线：中线 +0.25 m（实测靠左的 728.7 会判 not eligible）。"""
+    return (gate_x(ctx) + 0.25, y)
+
+
+def gate_x(ctx):
+    """闸口中线 x（带缓存 + 一次性自检日志）。"""
+    if getattr(ctx, "gate_x", None) is not None:
+        return ctx.gate_x
+    g = derive_gate(ctx)
+    if g is None:
+        ctx.gate_x = DEFAULT_GATE_X
+        ctx.note("[gate] 路网里没找到闸口 → 回退写死值 %.2f" % DEFAULT_GATE_X)
+        return ctx.gate_x
+    ctx.gate_x = float(g["x"])
+    d = abs(ctx.gate_x - DEFAULT_GATE_X)
+    ctx.note("[gate] 路网推导闸口中线 x=%.2f（%d 条竖直车道，x∈[%.1f,%.1f]），与写死值差 %.2f m"
+             % (g["x"], g["n"], g["lo"], g["hi"], d))
+    if d > GATE_WARN_M:
+        ctx.note("!! 闸口位置变了（差 %.1f m）—— 路线是按 x=%.1f 写的，"
+                 "申请/待命点会自动跟着走，但助跑与出闸路线需要人工复核" % (d, DEFAULT_GATE_X))
+    return ctx.gate_x
+
+
 def _pre(ctx, jobs, seconds, tag):
     """把闲置的车提前送出去（和主车并跑一段），全部到位或超时后返回。"""
     jobs = [j for j in jobs if j]
@@ -2087,14 +2156,15 @@ def stage_cross(ctx, seconds):
     cb = _berth_center(ctx, "Berth_B", (834.47, -65.72))
     # 3.0 先把扫到的动态路障记成禁区：后面每辆车、每条路线都会自动绕开它
     sync_dyn_avoid(ctx)
+    gate_x(ctx)                      # 自检：推导值 vs 写死值，差 >3 m 会告警
     # 3.0b Car_C 扫完路障就彻底驻车：
     #     ① 阶段 3 之后没人给它发指令，最后一条还是扫描时的油门，它会自己乱窜；
     #     ② 0.35 的刹车在缓坡上按不住，19:44 那局它 514 s 还在路障边上蹭（6 条 collision）。
     park_car(ctx, "Car_C", 1.0)
     # 3.1 A/B 提前出发：A 去闸口待命、B 去后方 19 m 的备用待命点（错峰 8 s，别挤同一条车道），
     #     同时把闲置的 Car_D 送到泊位 A 北侧见证位（278 m / 约 85 s）
-    _pre(ctx, [_job(ctx, "Car_A", GATE_READY, 3.7, 2.0, 130.0),
-               _job(ctx, "Car_B", GATE_HOLD, 3.7, 2.0, 150.0, delay=8.0),
+    _pre(ctx, [_job(ctx, "Car_A", gate_ready(ctx), 3.7, 2.0, 130.0),
+               _job(ctx, "Car_B", gate_hold(ctx), 3.7, 2.0, 150.0, delay=8.0),
                _job(ctx, "Car_D", (ca[0], ca[1] + 15.0), 3.9, 2.0, 175.0)],
          seconds, "A→闸口待命，B→备用待命点，D→泊位 A 见证位")
     # 3.2 A 过闸
