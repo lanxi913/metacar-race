@@ -158,6 +158,51 @@ def _score(text: str) -> float:
     return cjk * 2.0 - noise * 3.0 - text.count(" ") * 0.2
 
 
+def find_yellow_sign(bgr, pad: int = 10):
+    """把任务牌（亮黄色块）从画面里框出来。牌子在远处只占几十像素，
+    整幅图缩放 OCR 基本认不准；先框出来再放大，准确率高得多。"""
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+    if bgr is None or getattr(bgr, "size", 0) == 0:
+        return None
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([15, 70, 110], dtype=np.uint8)
+    upper = np.array([42, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 1500:
+        return None
+    x, y, w, h = cv2.boundingRect(c)
+    h_img, w_img = bgr.shape[:2]
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(w_img, x + w + pad), min(h_img, y + h + pad)
+    return bgr[y0:y1, x0:x1]
+
+
+def read_sign(bgr, lang: str = "zh-Hans-CN") -> str:
+    """优先对"框出来的牌子"做多尺度 OCR，失败再退回整幅图。"""
+    best, best_s = "", -1e18
+    crop = find_yellow_sign(bgr)
+    # 只要裁到牌子就只认这块（每次 OCR 约 0.6~1.5 s，多调几次会把 100 s 预算吃掉）
+    scales = (3.0, 2.0) if crop is not None else (2.5, 3.5)
+    img = crop if crop is not None else bgr
+    for sc in scales:
+        raw = read_text(img, lang=lang, scale=sc)
+        txt = clean(raw)
+        s = _score(txt)
+        if s > best_s:
+            best, best_s = txt, s
+        if best_s > 40:
+            break
+    return best
+
 def read_text_best(bgr, lang: str = "zh-Hans-CN", scales=(1.0, 2.0, 3.0)) -> str:
     """多尺度 OCR + 清洗 + 选优。任务牌字号未知，多试几个尺度更稳。"""
     best, best_s = "", -1e18
