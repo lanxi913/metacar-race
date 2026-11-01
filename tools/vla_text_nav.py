@@ -515,15 +515,19 @@ def resolve_target(place, msg, vla, x, y, yaw, args):
         print(f"   地点判定：楼门口变体 → 最像 {_ranked_place[0][1].name}"
               f"（score={_ranked_place[0][0]:.3f}）", flush=True)
 
-    # 绝对停车位置优先：只要指令要的是车位、且场景给了 PARKING_SLOT，就去它。
-    # （用户指示：不要再管"楼门口 8x8"，就去那个绝对停车位置。）
-    if args.target_x is None and (_wants_slot or not _named):
+    # 场景给了 PARKING_SLOT 就直接停进去，不管指令怎么措辞（用户 2026-11-01 10:04 明确指示：
+    # "你现在知道停车区在哪里吗，你直接停进去"）。赛题里唯一的 PARKING_SLOT 就摆在
+    # 147培训基地西入口门口（实测我们算的入口点 (197.5,-52.8) 与车位 (198.7,-58.0) 差 5.2 m），
+    # 而停在入口点旁边的草地上平台判 0 分（run 84049）。
+    # 只有场景根本没给车位时，才退回"按楼名+方位"的老逻辑。
+    if args.target_x is None:
         slots = [o for o in msg.obstacles
                  if int(getattr(getattr(o, "type", 0), "value", -1)) == 30]
         if slots:
             best = min(slots, key=lambda o: math.hypot(o.pos_x - x, o.pos_y - y))
-            print(f"   使用场景给的绝对停车位 ({best.pos_x:.1f},{best.pos_y:.1f}) "
-                  f"{best.length:.1f}x{best.width:.1f}", flush=True)
+            print(f"   使用场景给的停车位 ({best.pos_x:.1f},{best.pos_y:.1f}) "
+                  f"{best.length:.1f}x{best.width:.1f}（离车 {math.hypot(best.pos_x-x, best.pos_y-y):.1f} m）",
+                  flush=True)
             args.slot = best
             th_s = math.radians(best.ori_z)
             ax, ay = math.cos(th_s), math.sin(th_s)
@@ -578,6 +582,28 @@ def resolve_target(place, msg, vla, x, y, yaw, args):
     d_a = abs(((wall_a - yaw) + 180.0) % 360.0 - 180.0)
     d_b = abs(((wall_b - yaw) + 180.0) % 360.0 - 180.0)
     desired = wall_a if d_a <= d_b else wall_b
+
+    # 入口变体的"能停车的地方"就是场景给的停车位：赛题里 PARKING_SLOT 就摆在西入口门口
+    # （实测 147培训基地西入口：我们算的入口点 (197.5,-52.8)，车位 (198.7,-58.0)，只差 5.2 m）。
+    # 停在入口点旁边的草地上平台判 0 分（run 84049），所以只要车位离入口点足够近，
+    # 就直接改走车位——几何精确、也是唯一被场景承认的停车位置。
+    slots = [o for o in (msg.obstacles or [])
+             if int(getattr(getattr(o, "type", 0), "value", -1)) == 30]
+    if slots:
+        best = min(slots, key=lambda o: math.hypot(o.pos_x - tx, o.pos_y - ty))
+        gap = math.hypot(best.pos_x - tx, best.pos_y - ty)
+        if gap <= 20.0:
+            print(f"   入口旁有停车位 ({best.pos_x:.1f},{best.pos_y:.1f})，"
+                  f"离入口点 {gap:.1f} m → 直接停进车位", flush=True)
+            args.slot = best
+            th_s = math.radians(best.ori_z)
+            ax, ay = math.cos(th_s), math.sin(th_s)
+            proj = (x - best.pos_x) * ax + (y - best.pos_y) * ay
+            sig = 1.0 if proj >= 0 else -1.0
+            args.slot_approach = (best.pos_x + ax * sig * 14.0,
+                                  best.pos_y + ay * sig * 14.0)
+            args.slot_yaw = best.ori_z if sig > 0 else (best.ori_z + 180.0) % 360.0
+            return (best.pos_x, best.pos_y), "slot"
     return (tx, ty), f"building:{desired:.1f}|{b.name}"
 
 

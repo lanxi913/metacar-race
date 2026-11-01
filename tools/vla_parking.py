@@ -42,6 +42,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="VLA 停车区违规检测")
     ap.add_argument("--max-seconds", type=float, default=95.0)
     ap.add_argument("--dry-run", action="store_true", help="只打印不提交")
+    ap.add_argument("--shot", default="", help="把第 N 帧的 4 路相机存成 PNG（前缀）")
+    ap.add_argument("--goto", default="", help="开进指定点 X,Y（慢速，用来进停车场看 obstacles）")
     ap.add_argument("--drive", action="store_true",
                     help="边巡检边看：直行（0.3 油门）并每秒打印障碍物统计，"
                          "用来确认贴纸/车辆是否只有在靠近时才出现在 obstacles 里")
@@ -71,7 +73,36 @@ def main() -> int:
         if t0 is None:
             t0 = st.used_time
         pose = msg.pose_gnss
-        if args.drive:
+        if args.goto:
+            gx, gy = [float(t) for t in args.goto.split(",")]
+            dx, dy = gx - pose.pos_x, gy - pose.pos_y
+            dist = math.hypot(dx, dy)
+            # 场景 yaw 顺时针为正：航向 = -ori_z。用和 vla_text_nav.PathFollower 一致的
+            # 纯跟踪式（先转到车体坐标，再 -delta/MAX_STEER），符号不会搞反。
+            rad = math.radians(-float(pose.ori_z))
+            lx = dx * math.cos(rad) + dy * math.sin(rad)
+            ly = -dx * math.sin(rad) + dy * math.cos(rad)
+            if lx < 0:
+                steer = 1.0
+            else:
+                curv = 2.0 * ly / max(dist * dist, 1e-3)
+                steer = max(-1.0, min(1.0, -math.atan(curv * 2.6) / 0.6))
+            want = math.degrees(math.atan2(dy, dx))
+            err = ((want - (-float(pose.ori_z))) + 180.0) % 360.0 - 180.0
+            if dist < 3.0:
+                api.set_vehicle_control(VehicleControl(gear=GearMode.PARKING, brake=1.0))
+            else:
+                thr = 0.05 if abs(err) < 35.0 else 0.03
+                api.set_vehicle_control(VehicleControl(gear=GearMode.DRIVE, throttle=thr,
+                                                      brake=0.0, steering=steer))
+            if frame % 20 == 1:
+                from collections import Counter
+                cnt = Counter(getattr(getattr(o, "type", None), "name", str(o.type))
+                              for o in msg.obstacles)
+                print(f"[{st.used_time:5.1f}s] goto ({pose.pos_x:7.2f},{pose.pos_y:7.2f}) "
+                      f"d={dist:5.1f} v={float(msg.main_vehicle.speed):.2f} "
+                      f"obstacles={len(msg.obstacles)} {dict(cnt)}", flush=True)
+        elif args.drive:
             # 巡检模式：直行看 obstacles 会不会随靠近而出现
             api.set_vehicle_control(VehicleControl(gear=GearMode.DRIVE, throttle=0.30,
                                                   brake=0.0, steering=0.0))
@@ -108,6 +139,14 @@ def main() -> int:
                     break
         violating = sorted(set(violating))
 
+        if args.shot and frame in (150, 240, 330, 420, 540):
+            import cv2
+            for k, cf in enumerate(frames or []):
+                try:
+                    cv2.imwrite(f"{args.shot}_f{frame}_cam{k}.png", cf.frame)
+                except Exception as e:
+                    print("   shot err", e, flush=True)
+            print(f"[shot] 帧 {frame} 存了 {len(frames or [])} 路", flush=True)
         if frame % 30 == 1 or not reported:
             print(f"[{st.used_time:5.1f}s] pos=({pose.pos_x:.2f},{pose.pos_y:.2f}) "
                   f"violating={violating}", flush=True)
