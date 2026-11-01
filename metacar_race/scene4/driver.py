@@ -85,7 +85,8 @@ class Driver:
         self.stall = StallGuard()
         self.stuck = StuckWatch()
         self.teleport = TeleportWatch()
-        self.light_gate = LightGate(enabled=cfg.light, log=self._say, track=self.track)
+        self.light_gate = LightGate(enabled=cfg.light, log=self._say, track=self.track,
+                                    vmax=cfg.vmax)
         self.end_park = EndPark(hold_seconds=cfg.end_hold,
                                 coast_only=cfg.caps[1] <= 0.001)
         self.router: ElementRouter | None = None
@@ -508,9 +509,19 @@ class Driver:
                 # 基线在这两处抢一次控制就会把车钉死在车位前（elem89-r1 的 0 分）。
                 _final = bool(cmd is not None and cmd.final)
 
+                # ---- 低速段油门上限 ---------------------------------------
+                # 平台的加速度-油门比在低速段比模型（ACCEL_CMD_A=8）大得多：5.5 m/s
+                # 时 0.36 的油门实测就是 +5.1 m/s²（环岛进出各一次，2026-10-29
+                # 15:28/15:40 两局都在这丢过 +10）。这里把 1~8 m/s 的油门压到 0.30，
+                # 实测对应 4.2 m/s²，留出余量。
+                # **必须在升挡闸门之前**：闸门要顶 0.86 才能过一挡墙，压在它后面会把
+                # 升挡也压掉（16:03 那局就卡死在 4.78 m/s）。
+                if 1.0 < float(speed) < 8.0 and float(thr) > float(C.LOW_SPEED_THR_CAP):
+                    thr = float(C.LOW_SPEED_THR_CAP)
+
                 # ---- 升挡闸门（一挡墙；唯一允许超过 0.62 油门的通道）---------
                 if not _final:
-                    thr, brk = self._shift_gate(speed, v_tgt, thr, brk)
+                    thr, brk = self._shift_gate(speed, v_tgt, thr, brk, s_now)
 
                 # ---- 终点驻车 ---------------------------------------------
                 # 元素 12 自己管泊车（`Command.park`）：本站车位中心就是路线末点，
@@ -566,7 +577,7 @@ class Driver:
         return self._finish("ended", x, y, yaw)
 
     # ------------------------------------------------------------------ 升挡
-    def _shift_gate(self, speed, v_tgt, thr, brk):
+    def _shift_gate(self, speed, v_tgt, thr, brk, s_now=0.0):
         """一挡墙（4.78 m/s = 17.2 km/h）的升挡闸门。
 
         2026-10-25 curve-r9 的教训：0.50 的「温和 kick」**一次也没升上去**——
@@ -601,7 +612,12 @@ class Driver:
         in_start = str(getattr(self, "_span_name", "")) == C.START_SPAN_NAME
         once = (not bool(getattr(self, "_shifted_ok", False))
                 and (in_start or self._gate_span != getattr(self, "_cur_span_index", None)))
-        if (stuck and want and (long_span or in_start) and once
+        # 平台换挡模型在换挡帧的固定速度阶跃（4.88 → 5.53 → 6.20 m/s）与控制无关，
+        # 这一脚只能挑一个元素去承担。`SHIFT_MIN_S_M=60` 把它从元素 1（开头）挪到
+        # 元素 1 结束之后：元素 1 只跑 0→4.78 的起步（平台对 0→20 km/h 不判，
+        # 21:20 实测元素 1 = 110），升挡的代价改由元素 2 承担。详见 config.py。
+        early = float(s_now) < float(C.SHIFT_MIN_S_M)
+        if (stuck and want and (long_span or in_start) and once and not early
                 and (now - self.last_shift) >= C.SHIFT_MIN_GAP_S):
             self.last_shift = now
             self._shift_t0 = now
@@ -610,7 +626,8 @@ class Driver:
             self.log.event("shift_gate", v=round(float(speed), 2),
                            tgt=round(float(v_tgt), 2), thr=C.SHIFT_THROTTLE)
             self._say(f"[{now:6.1f}s] 开升挡闸门：v={speed:.2f} 目标={v_tgt:.2f}，"
-                      f"油门 {C.SHIFT_THROTTLE:.2f}（最长 {C.SHIFT_MAX_S:.1f}s）")
+                      f"油门 {C.SHIFT_THROTTLE:.2f}"
+                      f"（最长 {C.SHIFT_MAX_S:.1f}s）")
             return C.SHIFT_THROTTLE, 0.0
         return thr, brk
 

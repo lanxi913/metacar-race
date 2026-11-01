@@ -29,8 +29,9 @@ def check(ok, name, extra=""):
 
 
 def cap_of(gap: float) -> float:
-    """safety 里的允许车速曲线：sqrt(2·0.35·(gap − 0.8))。"""
-    return math.sqrt(2.0 * 0.35 * max(gap - 0.80, 0.0))
+    """safety 里的允许车速曲线：sqrt(2·0.35·(gap − LIGHT_STOP_AT_M))。"""
+    return math.sqrt(2.0 * C.LIGHT_COAST_DECEL_MS2
+                     * max(gap - C.LIGHT_STOP_AT_M, 0.0))
 
 
 def main() -> int:
@@ -93,17 +94,18 @@ def main() -> int:
           "hold=%s cap=%s gap=%s released=%s"
           % (d4.holding, d4.v_cap, d4.stop_gap, d4.released))
 
-    # 5) 红转绿：那一帧立即放行
-    g_green = groups_with(TrafficLightState.GREEN, 3.0)
+    # 5) 红转绿：绿灯够长（≥ 走完整组所需的 6.9 s + 1.5 s 余量）就立即放行
+    g_green = groups_with(TrafficLightState.GREEN, 9.0)
     d5 = gate.update(groups=g_green, roads=roads, x=399.9, y=0.0, yaw=0.0, speed=0.0)
     check(d5.released and not d5.waiting and d5.v_cap is None,
-          "红 → 绿的那一帧：立即放行（不看剩余时间）",
+          "红 → 绿且绿灯够走完整组：立即放行",
           "released=%s waiting=%s cap=%s" % (d5.released, d5.waiting, d5.v_cap))
 
-    # 6) 一直绿（没红过）不算放行
+    # 6) 一直绿（没红过）且绿灯够长 → 既不等也不触发 released
+    g_green_long = groups_with(TrafficLightState.GREEN, 9.0)
     gate6, _ = new_gate()
-    d6 = gate6.update(groups=g_green, roads=roads, x=399.4, y=0.0, yaw=0.0, speed=0.0)
-    check(not d6.released and not d6.waiting, "一直绿 → 既不等也不触发 released",
+    d6 = gate6.update(groups=g_green_long, roads=roads, x=399.4, y=0.0, yaw=0.0, speed=0.0)
+    check(not d6.released and not d6.waiting, "一直绿（够长）→ 既不等也不触发 released",
           "released=%s waiting=%s" % (d6.released, d6.waiting))
 
     # 7) 黄灯也算非绿：继续等
@@ -147,8 +149,10 @@ def main() -> int:
               for s in (400.0, 412.0, 424.0)]
 
     def groups3(state0):
+        # 绿灯给 12 s：从 40 m 外把整组（64 m）走完约需 7.4 s + 1.5 s 余量，够；
+        # 换成 8 s 就会判「不够」而改为等灯（见 4b/5b 的新口径）。
         return [types.SimpleNamespace(id="g9", traffic_lights=[
-            light("A", 400.0, state0, 8.0),
+            light("A", 400.0, state0, 12.0),
             light("B", 412.0, TrafficLightState.RED, 8.0),
             light("C", 424.0, TrafficLightState.RED, 8.0),
         ])]
@@ -181,6 +185,28 @@ def main() -> int:
                         x=380.0, y=0.0, yaw=0.0, speed=6.0)
     check(d12.waiting and d12.v_cap is not None and d12.v_cap <= 6.0,
           "组首红灯 → 照旧滑行等绿", "waiting=%s cap=%s" % (d12.waiting, d12.v_cap))
+
+    # 13) 回归：elem5-r2（2026-10-27）真实失败场景——
+    #     距组首 40 m、车速 6 m/s、绿灯只剩 3 s，走完整组（44 m）要 7.4 s + 1.5 s 余量，
+    #     所以**不能**放行，必须停在线前等下一次整灯（当时放行 → 闯红灯 −45、路口中间停车 −20）。
+    gate13, _ = new_gate()
+    gate13.update(groups=groups3(TrafficLightState.RED), roads=roads3,
+                  x=360.0, y=0.0, yaw=0.0, speed=6.0)
+    d13 = gate13.update(groups=[types.SimpleNamespace(id="g9", traffic_lights=[
+        light("A", 400.0, TrafficLightState.GREEN, 3.0),
+        light("B", 412.0, TrafficLightState.RED, 3.0),
+        light("C", 424.0, TrafficLightState.RED, 3.0),
+    ])], roads=roads3, x=360.0, y=0.0, yaw=0.0, speed=6.0)
+    check(d13.waiting and not d13.released and gate13._committed is None,
+          "绿灯只剩 3 s、还差 40 m：不放行、不承诺，滑行到线前等下一次",
+          "waiting=%s released=%s committed=%s" % (d13.waiting, d13.released, gate13._committed))
+
+    # 14) 越线之后（没承诺就进了组）不许再回头"等灯"（elem5-r2 的 −20 就是这里）
+    gate14, _ = new_gate()
+    d14 = gate14.update(groups=groups3(TrafficLightState.RED), roads=roads3,
+                        x=413.0, y=0.0, yaw=0.0, speed=8.0)
+    check(not d14.waiting and d14.stop_gap is None,
+          "已经越过组首 → 不再回头停车", "waiting=%s gap=%s" % (d14.waiting, d14.stop_gap))
 
     print()
     if FAILS:
