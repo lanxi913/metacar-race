@@ -160,3 +160,9 @@ metacar-race/
 - [连续场景1：元素、时限与跑法](docs/08-continuous-scene.md)
 - [连续场景1：加速度奖励的实测与取舍（630 分怎么来的）](docs/09-continuous-scene-parking-accel.md)
 - 参赛作战手册：`docs/2026智能无人系统算法挑战赛-参赛作战手册.docx`
+
+---
+
+## 10. 许可
+
+MIT License，见 [LICENSE](LICENSE)。代码可自由复用、修改、再分发，保留版权声明即可。
