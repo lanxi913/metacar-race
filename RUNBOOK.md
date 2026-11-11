@@ -20,7 +20,7 @@ git clone https://github.com/lanxi913/metacar-race.git
 cd metacar-race
 ```
 
-> 仓库是私有的，需要先接受邀请。没权限就先找队长加。
+> 仓库已公开，直接 clone 即可，不需要邀请。只想看代码不跑仿真的话到这里就够了。
 
 ## 2. 建虚拟环境
 
