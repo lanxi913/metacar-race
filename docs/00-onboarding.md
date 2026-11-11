@@ -1,6 +1,6 @@
 # 新人接入（复制即用）
 
-仓库：<https://github.com/lanxi913/metacar-race>（私有，已被邀请的话去 GitHub 通知里点「接受」）
+仓库：<https://github.com/lanxi913/metacar-race>（公开，直接 clone，无需邀请）
 
 ---
 
